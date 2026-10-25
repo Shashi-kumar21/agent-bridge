@@ -149,3 +149,22 @@ gh pr review <num> --approve --body "VERDICT: APPROVE"
 # Owner: merge
 gh pr merge <num> --squash --delete-branch
 ```
+
+## 9. `portable-pty` pin (do not forget)
+
+`portable-pty` is pinned to `0.8.1`: the 0.9 line returned no ConPTY output on
+Windows, so `RUSTSEC-2017-0008` (unmaintained `serial`, not vulnerable) is
+ignored in `deny.toml` with that reason.
+
+Run this smoke check on Windows before every release:
+
+```bash
+agent-bridge daemon start
+agent-bridge new smoke -- cmd.exe /c "echo conpty-ok"
+agent-bridge read smoke --lines 5      # must contain conpty-ok
+agent-bridge kill smoke --force
+agent-bridge daemon stop
+```
+
+If a 0.9.x release passes, upgrade, delete the advisory ignore from
+`deny.toml`, and confirm `serial` is gone from `Cargo.lock`.
