@@ -1,0 +1,32 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+
+# Local runtime state
+.agent-bridge/
+daemon.log
+*.sock
+
+# Coverage
+lcov.info
+tarpaulin-report.*
+coverage/
+
+# Node (future Tauri UI)
+node_modules/
+dist/
+
+# Env
+.env
+.env.*

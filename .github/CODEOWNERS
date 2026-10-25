@@ -1,0 +1,6 @@
+# Default owner: the human maintainer. Agents never merge.
+* @Shashi-kumar21
+
+# CI and release plumbing needs owner sign-off.
+/.github/ @Shashi-kumar21
+/deny.toml @Shashi-kumar21
