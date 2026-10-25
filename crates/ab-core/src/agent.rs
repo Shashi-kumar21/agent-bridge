@@ -392,7 +392,11 @@ pub fn resolve_program(program: &str) -> String {
                 .collect()
         };
         if let Some(path) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&path) {
+            let mut dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path).collect();
+            if let Ok(root) = std::env::var("SystemRoot") {
+                dirs.push(std::path::PathBuf::from(root).join("System32"));
+            }
+            for dir in dirs {
                 for extension in &extensions {
                     let candidate = dir.join(format!("{normalized}{extension}"));
                     if candidate.is_file() {
