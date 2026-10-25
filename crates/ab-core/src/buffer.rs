@@ -78,6 +78,9 @@ impl OutputBuffer {
 }
 
 /// Remove ANSI/VT escape sequences so output is safe to print as text.
+///
+/// Handles CSI (`ESC [`), OSC (`ESC ]`), DCS (`ESC P`), APC (`ESC _`), PM
+/// (`ESC ^`), SOS (`ESC X`) and the two-byte charset designators (`ESC (` ...).
 #[must_use]
 pub fn strip_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -91,12 +94,12 @@ pub fn strip_ansi(input: &str) -> String {
             Some('[') => {
                 chars.next();
                 for inner in chars.by_ref() {
-                    if ('@'..='~').contains(&inner) && !inner.is_ascii_digit() {
+                    if ('@'..='~').contains(&inner) {
                         break;
                     }
                 }
             }
-            Some(']') => {
+            Some(']' | 'P' | '_' | '^' | 'X') => {
                 chars.next();
                 while let Some(inner) = chars.next() {
                     if inner == '\u{7}' {
@@ -108,9 +111,14 @@ pub fn strip_ansi(input: &str) -> String {
                     }
                 }
             }
-            _ => {
+            Some('(' | ')' | '*' | '+') => {
+                chars.next();
                 chars.next();
             }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
         }
     }
     out
@@ -139,6 +147,16 @@ mod tests {
     fn strips_csi_and_osc() {
         assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
         assert_eq!(strip_ansi("a\u{1b}]0;title\u{7}b"), "ab");
+    }
+
+    #[test]
+    fn strips_dcs_apc_and_charset() {
+        // DCS payload, APC payload, charset designator, then plain text.
+        assert_eq!(strip_ansi("\u{1b}P1;2|payload\u{1b}\\ok"), "ok");
+        assert_eq!(strip_ansi("\u{1b}_apc\u{7}after"), "after");
+        assert_eq!(strip_ansi("\u{1b}(Btext"), "text");
+        // CSI with private markers must not leak digits.
+        assert_eq!(strip_ansi("\u{1b}[?25hvisible"), "visible");
     }
 
     const DEFAULT_TEST_CAPACITY: usize = 4096;

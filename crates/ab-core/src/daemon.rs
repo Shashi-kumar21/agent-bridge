@@ -67,7 +67,7 @@ impl Daemon {
     /// Bind the socket and serve connections until shutdown.
     pub fn run(self, on_ready: impl FnOnce()) -> Result<()> {
         let listener = transport::create_listener()?;
-        listener.set_nonblocking(interprocess::local_socket::ListenerNonblockingMode::Both)?;
+        listener.set_nonblocking(interprocess::local_socket::ListenerNonblockingMode::Accept)?;
         on_ready();
         info!(endpoint = %self.inner.endpoint, "daemon listening");
 
@@ -104,7 +104,8 @@ impl Inner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for agent in agents.values() {
-            let _ = agent.kill(true);
+            // Ctrl-C first so shells/agents can flush state, then force.
+            let _ = agent.kill(false);
         }
     }
 
@@ -169,16 +170,17 @@ impl Inner {
                 from,
             } => {
                 let agent = self.get(&target)?;
+                let enter = enter.unwrap_or(true);
+                let text = message.clone();
                 let mut payload = message.into_bytes();
-                if enter.unwrap_or(true) {
+                if enter {
                     payload.push(b'\r');
                 }
                 let bytes = agent.write_bytes(&payload)?;
                 let record = Message {
                     target: target.clone(),
                     from: from.clone(),
-                    text: String::from_utf8_lossy(&payload[..payload.len().saturating_sub(1)])
-                        .to_string(),
+                    text,
                     at: crate::now_ms(),
                 };
                 agent.record_message(record.clone());
@@ -361,6 +363,19 @@ fn stream_attach(
         }
     }
 
+    // An already exited agent must not wait for the heartbeat tick.
+    if !agent.is_running() {
+        let code = agent.info().exit_code;
+        write_frame(
+            &mut stream,
+            &Event::Exit {
+                agent: target.to_string(),
+                code,
+            },
+        )?;
+        return Ok(());
+    }
+
     let ticker = crossbeam_channel::tick(HEARTBEAT);
     let mut abandon = false;
     loop {
@@ -395,7 +410,10 @@ fn stream_attach(
 }
 
 fn write_frame<W: Write, T: serde::Serialize>(writer: &mut W, value: &T) -> std::io::Result<()> {
-    serde_json::to_writer(&mut *writer, value).map_err(std::io::Error::other)?;
-    writer.write_all(b"\n")?;
+    // Build the whole frame first: NDJSON framing must never interleave a
+    // newline with a partially written frame.
+    let mut frame = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    frame.push(b'\n');
+    writer.write_all(&frame)?;
     writer.flush()
 }

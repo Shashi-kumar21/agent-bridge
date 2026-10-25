@@ -22,6 +22,10 @@ const MAX_MESSAGES: usize = 500;
 /// disconnected instead of growing daemon memory without bound.
 pub const SUBSCRIBER_QUEUE: usize = 1024;
 
+/// Process-wide monotonic suffix so two agents created in the same millisecond
+/// still get distinct ids.
+static AGENT_SEQ: AtomicU64 = AtomicU64::new(1);
+
 /// Parameters for spawning an agent.
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
@@ -104,7 +108,11 @@ impl Agent {
         let reader = master.try_clone_reader()?;
 
         let agent = Arc::new(Self {
-            id: format!("{:x}", crate::now_ms()),
+            id: format!(
+                "{:x}-{:x}",
+                crate::now_ms(),
+                AGENT_SEQ.fetch_add(1, Ordering::Relaxed)
+            ),
             name: config.name.clone(),
             command: render_command(&config.command),
             cwd,

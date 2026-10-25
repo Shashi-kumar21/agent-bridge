@@ -257,6 +257,11 @@ pub enum Event {
         protocol: u32,
     },
     /// A chunk of terminal output.
+    ///
+    /// The daemon replays the retained buffer right after `Hello` and then
+    /// streams live chunks, so the same sequence number can be observed twice.
+    /// Clients **must** drop any `Output` frame whose `seq` is not greater than
+    /// the highest `seq` already seen.
     Output {
         /// Agent name.
         agent: String,

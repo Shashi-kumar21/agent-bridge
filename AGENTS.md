@@ -94,6 +94,11 @@ A PR is ready for QA only when **all** of these are true:
 * Never log message bodies at `info`; they may contain sensitive prompts.
 * Wire compatibility: `PROTOCOL_VERSION` in `crates/ab-core/src/protocol.rs`
   must change whenever `Request`/`Response` changes incompatibly.
+* Attach streams replay buffered output and then continue live, so the same
+  `seq` can arrive twice; clients must drop non-increasing `seq` frames.
+* Daemon lifecycle: a protocol-skew restart is allowed **only** when the daemon
+  owns no agent sessions. Never add a path that silently kills live agents
+  (a version bump is not a licence to destroy someone's terminal).
 * Keep the daemon single-binary and dependency-light; new deps need a
   justification in the PR.
 

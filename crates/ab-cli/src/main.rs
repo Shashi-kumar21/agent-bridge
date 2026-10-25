@@ -343,19 +343,37 @@ fn daemon_action(action: DaemonAction, json: bool) -> Result<()> {
 }
 
 fn ensure_daemon(auto_start: bool) -> Result<()> {
-    if let Ok(Response::Version { protocol, .. }) = client::request(&Request::Version) {
-        if protocol == agent_bridge_core::protocol::PROTOCOL_VERSION {
-            return Ok(());
+    match client::request(&Request::Version) {
+        Ok(Response::Version { protocol, .. }) => {
+            if protocol == agent_bridge_core::protocol::PROTOCOL_VERSION {
+                return Ok(());
+            }
+            // Never destroy live sessions implicitly: a version skew restart is
+            // only allowed when the daemon has no agent sessions at all.
+            let live = match client::request(&Request::List) {
+                Ok(Response::Agents { agents }) => agents.len(),
+                _ => 0,
+            };
+            if !skew_restart_is_safe(live) {
+                return Err(agent_bridge_core::BridgeError::Daemon(format!(
+                    "daemon protocol {protocol} does not match client {}, and {live} agent \
+                     session(s) are still managed by it; run `agent-bridge daemon restart` \
+                     when they are no longer needed",
+                    agent_bridge_core::protocol::PROTOCOL_VERSION
+                )));
+            }
+            eprintln!(
+                "warning: daemon protocol {protocol} does not match client {}; restarting idle daemon",
+                agent_bridge_core::protocol::PROTOCOL_VERSION
+            );
+            stop_daemon();
         }
-        eprintln!(
-            "warning: daemon protocol {protocol} does not match client {}; restarting daemon",
-            agent_bridge_core::protocol::PROTOCOL_VERSION
-        );
-        stop_daemon();
-    } else if !auto_start {
-        return Err(agent_bridge_core::BridgeError::DaemonNotRunning(
-            paths::socket_display(),
-        ));
+        _ if !auto_start => {
+            return Err(agent_bridge_core::BridgeError::DaemonNotRunning(
+                paths::socket_display(),
+            ));
+        }
+        _ => {}
     }
     start_daemon()
 }
@@ -423,4 +441,22 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+/// A version-skew restart is only safe when the daemon manages no sessions:
+/// stopping the daemon kills every agent it owns.
+fn skew_restart_is_safe(live_agents: usize) -> bool {
+    live_agents == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::skew_restart_is_safe;
+
+    #[test]
+    fn skew_restart_requires_idle_daemon() {
+        assert!(skew_restart_is_safe(0));
+        assert!(!skew_restart_is_safe(1));
+        assert!(!skew_restart_is_safe(7));
+    }
 }

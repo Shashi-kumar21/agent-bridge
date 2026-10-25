@@ -76,8 +76,9 @@ Every command supports `--json` for scripting and for the Tauri UI.
 
 Newline-delimited JSON over a local socket:
 
-* Unix: `~/.agent-bridge/daemon.sock` (filesystem socket)
-* Windows: `\\.\pipe\agent-bridge-<user>` (named pipe)
+* Unix: `~/.agent-bridge/daemon.sock` (filesystem socket, dir `0700` / socket
+  `0600`)
+* Windows: `\\.\pipe\agent-bridge-<user>` (named pipe with an owner-only DACL)
 
 Requests are tagged (`{"cmd":"send", ...}`), responses are tagged
 (`{"kind":"sent", ...}`) and `attach` streams `{"event":"output", ...}` frames
