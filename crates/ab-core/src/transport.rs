@@ -54,7 +54,16 @@ pub fn create_listener() -> io::Result<Listener> {
         let name = path
             .as_path()
             .to_fs_name::<interprocess::local_socket::GenericFilePath>()?;
-        ListenerOptions::new().name(name).create_sync()
+        let listener = ListenerOptions::new().name(name).create_sync();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if listener.is_ok() {
+                // Only the owning user may connect.
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        listener
     }
 }
 
