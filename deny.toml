@@ -30,4 +30,6 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 [advisories]
 yanked = "deny"
-ignore = []
+ignore = [
+  { id = "RUSTSEC-2017-0008", reason = "unmaintained `serial` crate is pulled in by portable-pty 0.8.1; portable-pty 0.9 regresses ConPTY output on Windows, so revisit when upstream fixes the 0.9 line" },
+]
