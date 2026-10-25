@@ -49,5 +49,13 @@ pub fn log_path() -> PathBuf {
 
 /// Create the state directory if it does not exist yet.
 pub fn ensure_base_dir() -> std::io::Result<()> {
-    std::fs::create_dir_all(base_dir())
+    let dir = base_dir();
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Runtime state (socket, logs) is private to the OS user.
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
 }

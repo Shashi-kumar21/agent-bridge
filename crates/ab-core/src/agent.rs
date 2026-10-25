@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use base64::Engine as _;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use tracing::{debug, warn};
 
@@ -17,6 +17,10 @@ use crate::error::{BridgeError, Result};
 use crate::protocol::{AgentInfo, AgentStatus, Event, Message, Millis};
 
 const MAX_MESSAGES: usize = 500;
+
+/// Per-subscriber event queue depth. A consumer that falls this far behind is
+/// disconnected instead of growing daemon memory without bound.
+pub const SUBSCRIBER_QUEUE: usize = 1024;
 
 /// Parameters for spawning an agent.
 #[derive(Debug, Clone)]
@@ -306,8 +310,11 @@ impl Agent {
     }
 
     /// Register a live event subscriber.
+    ///
+    /// The channel is bounded: a subscriber that cannot keep up is dropped
+    /// rather than letting the daemon grow without limit.
     pub fn subscribe(&self) -> Receiver<Event> {
-        let (tx, rx) = unbounded();
+        let (tx, rx) = bounded(SUBSCRIBER_QUEUE);
         let mut subscribers = self
             .subscribers
             .lock()
@@ -325,7 +332,14 @@ impl Agent {
             .subscribers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        subscribers.retain(|sender| sender.send(event.clone()).is_ok());
+        subscribers.retain(|sender| match sender.try_send(event.clone()) {
+            Ok(()) => true,
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                warn!(agent = %self.name, "dropping slow attach subscriber");
+                false
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
+        });
         self.subscriber_count
             .store(subscribers.len(), Ordering::SeqCst);
     }

@@ -343,10 +343,16 @@ fn daemon_action(action: DaemonAction, json: bool) -> Result<()> {
 }
 
 fn ensure_daemon(auto_start: bool) -> Result<()> {
-    if client::is_running() {
-        return Ok(());
-    }
-    if !auto_start {
+    if let Ok(Response::Version { protocol, .. }) = client::request(&Request::Version) {
+        if protocol == agent_bridge_core::protocol::PROTOCOL_VERSION {
+            return Ok(());
+        }
+        eprintln!(
+            "warning: daemon protocol {protocol} does not match client {}; restarting daemon",
+            agent_bridge_core::protocol::PROTOCOL_VERSION
+        );
+        stop_daemon();
+    } else if !auto_start {
         return Err(agent_bridge_core::BridgeError::DaemonNotRunning(
             paths::socket_display(),
         ));
