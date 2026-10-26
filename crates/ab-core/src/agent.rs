@@ -64,8 +64,9 @@ pub struct Agent {
     subscribers: Mutex<Vec<Sender<Event>>>,
     subscriber_count: AtomicUsize,
     seq: AtomicU64,
-    /// Holds the OS-level "die with the daemon" link; never read, only kept.
-    _reaper: Option<ProcessReaper>,
+    /// Holds the OS-level "die with the daemon" link; taken when the agent tree
+    /// is terminated on purpose.
+    reaper: Mutex<Option<ProcessReaper>>,
 }
 
 impl Agent {
@@ -138,7 +139,7 @@ impl Agent {
             subscribers: Mutex::new(Vec::new()),
             subscriber_count: AtomicUsize::new(0),
             seq: AtomicU64::new(0),
-            _reaper: process_reaper,
+            reaper: Mutex::new(process_reaper),
         });
 
         let pump = Arc::clone(&agent);
@@ -377,18 +378,25 @@ impl Agent {
     }
 
     /// Terminate the agent: Ctrl-C first, then a hard kill if needed.
+    ///
+    /// `force` skips the grace period and tears the agent's process tree down
+    /// (Windows: the whole job object; Unix: the agent's process group) instead
+    /// of only the PTY client. It also runs when the client has already exited
+    /// but its children have not - that is exactly the "descendants alive until
+    /// daemon exit" case.
     pub fn kill(&self, force: bool) -> Result<()> {
+        if force {
+            return self.kill_tree();
+        }
         if !self.is_running() {
             return Ok(());
         }
-        if !force {
-            let _ = self.write_bytes(b"\x03");
-            for _ in 0..10 {
-                if !self.is_running() {
-                    return Ok(());
-                }
-                thread::sleep(Duration::from_millis(50));
+        let _ = self.write_bytes(b"\x03");
+        for _ in 0..10 {
+            if !self.is_running() {
+                return Ok(());
             }
+            thread::sleep(Duration::from_millis(50));
         }
         let mut child = self
             .child
@@ -396,6 +404,70 @@ impl Agent {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         child.kill()?;
         Ok(())
+    }
+
+    /// `kill --force`: everything the reaper knows about.
+    ///
+    /// Errors from the tree teardown are reported to the caller once the
+    /// fallback has been tried (or immediately when the client is already
+    /// gone), so a script is not told the tree died when it did not.
+    fn kill_tree(&self) -> Result<()> {
+        // Read the liveness flag before taking the reaper: on Unix a force kill
+        // after the leader exited must not signal a recycled process group.
+        let leader_alive = self.is_running();
+        let reaper = self
+            .reaper
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(reaper) = reaper else {
+            // No reaper: the OS cannot promise a tree teardown (install() already
+            // logged that at spawn). Stop the client and report the degraded
+            // path as success, as before this feature.
+            let mut child = self
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if child.try_wait()?.is_none() {
+                child.kill()?;
+            }
+            return Ok(());
+        };
+
+        let tree_error = match reaper.terminate(leader_alive) {
+            Ok(()) => None,
+            Err(err) => {
+                warn!(agent = %self.name, error = %err, "could not terminate the agent tree");
+                Some(err)
+            }
+        };
+
+        for _ in 0..10 {
+            if !self.is_running() {
+                return tree_error.map_or(Ok(()), Err);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // The tree signal did not take the PTY client with it: at least stop
+        // the client.
+        let mut child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let client_error = match child.try_wait() {
+            Ok(Some(_)) => None,
+            _ => child.kill().err(),
+        };
+        match (tree_error, client_error) {
+            (None, None) => Ok(()),
+            (Some(tree), None) => Err(tree),
+            (None, Some(client)) => Err(client.into()),
+            (Some(tree), Some(client)) => {
+                debug!(agent = %self.name, error = %client, "client kill also failed");
+                Err(tree)
+            }
+        }
     }
 }
 
