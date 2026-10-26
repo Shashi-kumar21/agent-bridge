@@ -21,7 +21,17 @@ tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 widestring = "1"
+# Safe wrapper over CreateJobObjectW/AssignProcessToJobObject: `unsafe_code =
+# "forbid"` rules out hand-written FFI, and the job object is what makes agents
+# die with the daemon (see src/reaper.rs). Windows-only, so it stays out of the
+# Linux/macOS graphs.
 win32job = "2"
+
+[target.'cfg(unix)'.dependencies]
+# Safe process-group signalling for `kill --force` (SIGKILL to the agent's
+# group). Same 1.1 line already resolves through `interprocess`, so this adds no
+# new transitive crates.
+rustix = { version = "1.1", features = ["process"] }
 
 [lints]
 workspace = true

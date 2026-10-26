@@ -1,27 +1,35 @@
-//! Regression test: an agent tree must not outlive a daemon that is killed hard.
+//! Process-lifetime regression tests: an agent tree must follow its daemon and
+//! must disappear when it is killed on purpose.
 //!
-//! A `kill -9` (Unix) or Task Manager kill (Windows) never runs the daemon's
-//! shutdown path, so the guarantee has to come from the OS. This test starts a
-//! real daemon process and a real PTY agent, terminates the daemon without
-//! warning, and asserts that the agent (and, on Windows, a grandchild that
-//! escaped the pseudo console) is gone shortly afterwards.
+//! * `agent_dies_when_daemon_is_hard_killed` - a `kill -9` (Unix) or Task
+//!   Manager kill (Windows) never runs the daemon's shutdown path, so the
+//!   guarantee has to come from the OS. Why the grandchild matters: closing the
+//!   `ConPTY` already takes down the direct client, so the interesting orphan is
+//!   a process started in its own console. On Windows that is what the job
+//!   object in `ab_core::reaper` is for; on Unix the kernel sends `SIGHUP`
+//!   through the PTY and descendants that ignore the hangup can still survive,
+//!   which is documented in `SECURITY.md`.
+//! * `kill_force_reaps_descendants` - `agent-bridge kill --force` must take the
+//!   whole tree down instead of leaving the shell's children running, and must
+//!   not disturb the daemon.
 //!
-//! Why the grandchild matters: closing the `ConPTY` already takes down the
-//! direct client, so the interesting orphan is a process started in its own
-//! console. On Windows that is what the job object in `ab_core::reaper` is for.
-//! On Unix the kernel sends `SIGHUP` through the PTY, and descendants that
-//! ignore the hangup can still survive; that gap is documented in `SECURITY.md`.
+//! Both tests start a real daemon process and a real PTY agent.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_bridge_core::client;
 use agent_bridge_core::protocol::{Request, Response};
 
-/// Time the OS gets to tear the agent tree down after the daemon disappears.
+/// Time the OS gets to tear an agent tree down.
 const DEATH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `AGENT_BRIDGE_HOME` / `AGENT_BRIDGE_PIPE` are process-wide, so the tests in
+/// this binary must not run at the same time.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// A shell that stays alive until it is killed.
 fn long_lived_command() -> Vec<String> {
@@ -74,10 +82,7 @@ fn remove_home(home: &Path) {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    eprintln!(
-        "warning: could not remove {}; it still holds daemon.log",
-        home.display()
-    );
+    eprintln!("warning: could not remove {}", home.display());
 }
 
 /// Daemon log, or a readable placeholder - used in failure messages.
@@ -102,6 +107,19 @@ fn wait_until_ready(home: &Path) -> Response {
     }
 }
 
+fn spawn_agent() -> u32 {
+    let created = client::request(&Request::New {
+        name: "orphan".to_string(),
+        command: Some(long_lived_command()),
+        cwd: None,
+        cols: None,
+        rows: None,
+    })
+    .expect("spawn agent");
+    assert!(matches!(created, Response::Agent { .. }), "got {created:?}");
+    agent_pid()
+}
+
 fn agent_pid() -> u32 {
     match client::request(&Request::List).expect("list agents") {
         Response::Agents { agents } => agents
@@ -113,7 +131,6 @@ fn agent_pid() -> u32 {
     }
 }
 
-#[cfg(windows)]
 fn send(target: &str, message: &str) {
     let sent = client::request(&Request::Send {
         target: target.to_string(),
@@ -176,6 +193,28 @@ fn is_alive(pid: u32) -> bool {
     }
 }
 
+/// Poll the agent's output for a `<marker><pid>` number.
+#[cfg(unix)]
+fn read_pid(agent: &str, marker: &str) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(Response::Output { lines, .. }) = client::request(&Request::Read {
+            target: agent.to_string(),
+            lines: Some(80),
+        }) {
+            for line in &lines {
+                if let Some(rest) = line.rsplit(marker).next() {
+                    if let Ok(pid) = rest.trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("the agent never printed {marker}<pid>");
+}
+
 /// On Windows, start a detached grandchild (own console) inside the agent and
 /// return its pid. This is the process the job object has to reap.
 #[cfg(windows)]
@@ -215,6 +254,27 @@ fn spawn_detached_grandchild(agent: &str, home: &Path) -> u32 {
     panic!("the detached grandchild never started");
 }
 
+/// On Unix, start a background grandchild in the agent's shell and return its
+/// pid. It stays in the agent's process group, so `kill --force` must reach it.
+#[cfg(unix)]
+fn spawn_background_grandchild(agent: &str) -> u32 {
+    send(agent, "sleep 600 & echo ORPHAN:$!");
+    read_pid(agent, "ORPHAN:")
+}
+
+/// Start a grandchild the OS-level teardown has to reach, whatever the platform.
+fn spawn_grandchild(agent: &str, home: &Path) -> u32 {
+    #[cfg(windows)]
+    {
+        spawn_detached_grandchild(agent, home)
+    }
+    #[cfg(unix)]
+    {
+        let _ = home;
+        spawn_background_grandchild(agent)
+    }
+}
+
 /// Best-effort cleanup so a failing assertion does not leak a shell.
 struct Cleanup(Vec<u32>);
 
@@ -228,8 +288,31 @@ impl Drop for Cleanup {
     }
 }
 
+/// Assert every pid dies within [`DEATH_TIMEOUT`], showing the daemon log when
+/// they do not.
+fn assert_all_dead(tracked: &[u32], home: &Path) {
+    let deadline = Instant::now() + DEATH_TIMEOUT;
+    loop {
+        let survivors: Vec<u32> = tracked
+            .iter()
+            .copied()
+            .filter(|pid| is_alive(*pid))
+            .collect();
+        if survivors.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "still running after {DEATH_TIMEOUT:?}: {survivors:?}\n--- daemon.log ---\n{}",
+            dump_log(home)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 fn agent_dies_when_daemon_is_hard_killed() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let home = isolate();
     let mut daemon = start_daemon(&home);
 
@@ -240,21 +323,7 @@ fn agent_dies_when_daemon_is_hard_killed() {
         panic!("expected a version response");
     };
 
-    let created = client::request(&Request::New {
-        name: "orphan".to_string(),
-        command: Some(long_lived_command()),
-        cwd: None,
-        cols: None,
-        rows: None,
-    })
-    .expect("spawn agent");
-    assert!(matches!(created, Response::Agent { .. }), "got {created:?}");
-
-    #[cfg(windows)]
-    let tracked = vec![agent_pid(), spawn_detached_grandchild("orphan", &home)];
-    #[cfg(unix)]
-    let tracked = vec![agent_pid()];
-
+    let tracked = vec![spawn_agent(), spawn_grandchild("orphan", &home)];
     let _cleanup = Cleanup(tracked.clone());
     for pid in &tracked {
         assert!(
@@ -267,23 +336,37 @@ fn agent_dies_when_daemon_is_hard_killed() {
     let _ = daemon.0.wait();
     assert!(!is_alive(daemon_pid), "the daemon should be gone");
 
-    let deadline = Instant::now() + DEATH_TIMEOUT;
-    loop {
-        let survivors: Vec<u32> = tracked
-            .iter()
-            .copied()
-            .filter(|pid| is_alive(*pid))
-            .collect();
-        if survivors.is_empty() {
-            break;
-        }
+    assert_all_dead(&tracked, &home);
+    remove_home(&home);
+}
+
+#[test]
+fn kill_force_reaps_descendants() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let home = isolate();
+    let _daemon = start_daemon(&home);
+    wait_until_ready(&home);
+
+    let tracked = vec![spawn_agent(), spawn_grandchild("orphan", &home)];
+    let _cleanup = Cleanup(tracked.clone());
+    for pid in &tracked {
         assert!(
-            Instant::now() < deadline,
-            "survived their daemon for {DEATH_TIMEOUT:?}: {survivors:?}\n--- daemon.log ---\n{}",
-            dump_log(&home)
+            is_alive(*pid),
+            "pid {pid} should be running before the kill"
         );
-        thread::sleep(Duration::from_millis(100));
     }
 
+    let killed = client::request(&Request::Kill {
+        name: "orphan".to_string(),
+        force: Some(true),
+    })
+    .expect("kill agent");
+    assert!(matches!(killed, Response::Ok), "got {killed:?}");
+
+    assert_all_dead(&tracked, &home);
+    assert!(
+        client::is_running(),
+        "killing an agent must not take the daemon down"
+    );
     remove_home(&home);
 }

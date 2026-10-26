@@ -64,8 +64,9 @@ pub struct Agent {
     subscribers: Mutex<Vec<Sender<Event>>>,
     subscriber_count: AtomicUsize,
     seq: AtomicU64,
-    /// Holds the OS-level "die with the daemon" link; never read, only kept.
-    _reaper: Option<ProcessReaper>,
+    /// Holds the OS-level "die with the daemon" link; taken when the agent tree
+    /// is terminated on purpose.
+    reaper: Mutex<Option<ProcessReaper>>,
 }
 
 impl Agent {
@@ -138,7 +139,7 @@ impl Agent {
             subscribers: Mutex::new(Vec::new()),
             subscriber_count: AtomicUsize::new(0),
             seq: AtomicU64::new(0),
-            _reaper: process_reaper,
+            reaper: Mutex::new(process_reaper),
         });
 
         let pump = Arc::clone(&agent);
@@ -377,6 +378,10 @@ impl Agent {
     }
 
     /// Terminate the agent: Ctrl-C first, then a hard kill if needed.
+    ///
+    /// `force` skips the grace period and takes the whole process tree down
+    /// (job object on Windows, process group on Unix) instead of only the PTY
+    /// client, so `agent-bridge kill --force` no longer leaves children behind.
     pub fn kill(&self, force: bool) -> Result<()> {
         if !self.is_running() {
             return Ok(());
@@ -389,13 +394,48 @@ impl Agent {
                 }
                 thread::sleep(Duration::from_millis(50));
             }
+            let mut child = self
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            child.kill()?;
+            return Ok(());
         }
+
+        if self.terminate_tree() {
+            for _ in 0..10 {
+                if !self.is_running() {
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        // No reaper (install failed) or the tree teardown did not bite: at
+        // least stop the PTY client.
         let mut child = self
             .child
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        child.kill()?;
+        if let Err(err) = child.kill() {
+            debug!(agent = %self.name, error = %err, "hard kill after tree teardown failed");
+        }
         Ok(())
+    }
+
+    /// Take the whole agent tree down; `true` when a reaper was installed.
+    fn terminate_tree(&self) -> bool {
+        let reaper = self
+            .reaper
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(reaper) = reaper else {
+            return false;
+        };
+        if let Err(err) = reaper.terminate() {
+            warn!(agent = %self.name, error = %err, "could not terminate the agent tree");
+        }
+        true
     }
 }
 

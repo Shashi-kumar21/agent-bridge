@@ -50,13 +50,21 @@ You should receive a response within 72 hours.
   * If the OS refuses the link (for example a restricted job object on a locked
     down host), the daemon logs a warning and spawns the agent anyway; refusing
     to run a terminal would be worse than running it without the safety net.
+* `agent-bridge kill --force` reaps the same tree while the daemon stays up:
+  Windows drops the job handle (kernel terminates the job), Unix sends
+  `SIGKILL` to the agent's process group - background jobs included, because
+  the shell is a session and group leader. `kill` without `--force` still tries
+  Ctrl-C first and then only terminates the PTY client, so children of a
+  stubborn agent survive that path by design.
 
 ## Known gaps (tracked, not yet implemented)
 
-* Unix descendants that leave the PTY's foreground process group (background
-  jobs, `setsid`, `nohup`) can outlive a daemon kill. Only the Windows job
-  object covers the whole tree; `crates/ab-cli/tests/orphan_teardown.rs`
-  exercises the full-tree case on Windows and the `SIGHUP` case on Unix.
+* Unix descendants that create their own session (`setsid`, `nohup` with
+  `setsid`, daemons) can outlive both a daemon kill and `kill --force`; nothing
+  portable can follow them, and the Windows job object is the only mechanism
+  here that covers the whole tree. `crates/ab-cli/tests/orphan_teardown.rs`
+  exercises the full-tree case on Windows and the `SIGHUP`/process-group case
+  on Unix.
 * Running agents are not re-adopted after a daemon restart.
 * No optional token handshake for shared machines.
 * Denial for a *different* OS user is not exercised by CI yet; only the
