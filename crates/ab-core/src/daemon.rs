@@ -126,6 +126,7 @@ impl Inner {
             Request::Version => Ok(Response::Version {
                 protocol: PROTOCOL_VERSION,
                 daemon: env!("CARGO_PKG_VERSION").to_string(),
+                pid: std::process::id(),
                 socket: self.endpoint.clone(),
                 started_at: self.started_at,
             }),

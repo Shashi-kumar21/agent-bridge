@@ -68,7 +68,7 @@ interactive CLI works: Claude Code, OpenCode, a shell, a REPL, an editor.
 | `agent-bridge attach <name>` | live mirror + keyboard passthrough |
 | `agent-bridge kill <name>` | Ctrl-C first, hard kill on `--force` |
 | `agent-bridge log` | global message history |
-| `agent-bridge ping` / `version` | health and protocol details |
+| `agent-bridge ping` / `version` | health and protocol details (includes the daemon pid) |
 
 Every command supports `--json` for scripting and for the Tauri UI.
 
