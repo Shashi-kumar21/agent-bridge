@@ -12,9 +12,7 @@
 //! On Unix the kernel sends `SIGHUP` through the PTY, and descendants that
 //! ignore the hangup can still survive; that gap is documented in `SECURITY.md`.
 
-#[cfg(windows)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -45,13 +43,37 @@ fn isolate() -> PathBuf {
     home
 }
 
-fn start_daemon() -> Child {
-    Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+/// Daemon under test. Owning the child means a failed assertion still tears it
+/// down (and its agents) instead of leaking a daemon into the next run.
+struct DaemonProcess(Child);
+
+impl Drop for DaemonProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Start the daemon with its stderr captured next to the socket.
+fn start_daemon(home: &Path) -> DaemonProcess {
+    let log = std::fs::File::create(home.join("daemon.log")).expect("create daemon log");
+    let child = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
         .args(["daemon", "run"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(log))
         .spawn()
-        .expect("spawn daemon")
+        .expect("spawn daemon");
+    DaemonProcess(child)
+}
+
+/// Best-effort removal; Windows can hold the copied image for a moment.
+fn remove_home(home: &Path) {
+    for _ in 0..20 {
+        if std::fs::remove_dir_all(home).is_ok() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn wait_until_ready() -> Response {
@@ -197,7 +219,7 @@ impl Drop for Cleanup {
 #[test]
 fn agent_dies_when_daemon_is_hard_killed() {
     let home = isolate();
-    let mut daemon = start_daemon();
+    let mut daemon = start_daemon(&home);
 
     let Response::Version {
         pid: daemon_pid, ..
@@ -230,7 +252,7 @@ fn agent_dies_when_daemon_is_hard_killed() {
     }
 
     hard_kill(daemon_pid);
-    let _ = daemon.wait();
+    let _ = daemon.0.wait();
     assert!(!is_alive(daemon_pid), "the daemon should be gone");
 
     let deadline = Instant::now() + DEATH_TIMEOUT;
@@ -243,12 +265,15 @@ fn agent_dies_when_daemon_is_hard_killed() {
         if survivors.is_empty() {
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "survived their daemon for {DEATH_TIMEOUT:?}: {survivors:?}"
-        );
+        if Instant::now() >= deadline {
+            let log = std::fs::read_to_string(home.join("daemon.log"))
+                .unwrap_or_else(|err| format!("<could not read daemon.log: {err}>"));
+            panic!(
+                "survived their daemon for {DEATH_TIMEOUT:?}: {survivors:?}\n--- daemon.log ---\n{log}"
+            );
+        }
         thread::sleep(Duration::from_millis(100));
     }
 
-    let _ = std::fs::remove_dir_all(&home);
+    remove_home(&home);
 }

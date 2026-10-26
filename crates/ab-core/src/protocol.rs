@@ -196,7 +196,8 @@ pub enum Response {
         protocol: u32,
         /// Daemon crate version.
         daemon: String,
-        /// Daemon process id, so callers can target it for teardown.
+        /// Daemon process id, or `0` when the daemon predates this field.
+        #[serde(default)]
         pid: u32,
         /// Socket path in use.
         socket: String,
@@ -308,7 +309,7 @@ pub fn validate_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_name;
+    use super::{validate_name, Response};
 
     #[test]
     fn accepts_reasonable_names() {
@@ -328,5 +329,20 @@ mod tests {
         ] {
             assert!(!validate_name(name), "{name} should be rejected");
         }
+    }
+
+    /// A new client must be able to talk to a daemon that predates `pid`.
+    #[test]
+    fn version_frame_without_pid_still_parses() {
+        let legacy = r#"{"kind":"version","protocol":1,"daemon":"0.1.0","socket":"\\\\.\\pipe\\x","started_at":0}"#;
+        let parsed: Response = serde_json::from_str(legacy).expect("legacy version frame");
+        assert!(matches!(
+            parsed,
+            Response::Version {
+                protocol: 1,
+                pid: 0,
+                ..
+            }
+        ));
     }
 }
