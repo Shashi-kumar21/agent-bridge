@@ -88,7 +88,8 @@ enum Command {
     Kill {
         /// Agent name.
         name: String,
-        /// Skip Ctrl-C and kill the whole process tree immediately.
+        /// Skip Ctrl-C and kill the agent's process tree immediately
+        /// (Windows: whole job; Unix: process group).
         #[arg(long)]
         force: bool,
     },

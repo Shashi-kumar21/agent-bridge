@@ -1,5 +1,5 @@
-//! Keeps agent processes from outliving the daemon, and takes a whole agent
-//! tree down on request.
+//! Keeps agent processes from outliving the daemon, and tears an agent's
+//! process tree down on request.
 //!
 //! A daemon that is killed with `SIGKILL` / `TerminateProcess` / Task Manager
 //! never runs its shutdown path, so anything the daemon owns has to be reaped
@@ -13,10 +13,11 @@
 //! * **Unix** - `portable-pty` makes the child a session leader with the PTY
 //!   slave as its controlling terminal, so when the daemon dies the kernel
 //!   closes the master and sends `SIGHUP` to the terminal's foreground process
-//!   group. A background job that left that group can still survive a daemon
-//!   crash; [`ProcessReaper::terminate`] reaches it by signalling the whole
-//!   process group. A descendant that created its own session (`setsid`,
-//!   `nohup`) is out of reach for both and is documented in `SECURITY.md`.
+//!   group. [`ProcessReaper::terminate`] additionally `SIGKILL`s the agent's
+//!   process group. Jobs that moved to their own process group (an interactive
+//!   shell's job control) or their own session (`setsid`) are out of reach for
+//!   the signal; only the Windows job object covers a whole tree. That gap is
+//!   documented in `SECURITY.md`.
 
 use portable_pty::Child;
 
@@ -43,9 +44,11 @@ impl ProcessReaper {
     ///   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, the kernel terminates every
     ///   process in it, including grandchildren that opened their own console.
     /// * **Unix** - `SIGKILL` to the agent's process group. The child is a
-    ///   session leader, so the group holds the shell plus everything it
-    ///   started, foreground or background. Processes that created their own
-    ///   session are out of reach; nothing portable can follow those.
+    ///   session leader, so this reaches the agent and every process that
+    ///   stayed in its group (the normal case for a CLI agent and its tool
+    ///   subprocesses). An interactive shell with job control moves each job
+    ///   into its own process group, so those jobs are *not* reached here - see
+    ///   `SECURITY.md`.
     ///
     /// Consumes the reaper: once the tree is gone there is nothing left to
     /// guard. Returns an error only when the signal could not be delivered.
@@ -66,7 +69,9 @@ impl ProcessReaper {
                 return Ok(());
             };
             // `portable-pty` calls `setsid()` before exec, so the child's pid is
-            // also its process group id.
+            // also its process group id. The id was captured at spawn, so a
+            // recycled pid could in theory name another group; the window is
+            // one scheduler tick and only after the agent has already exited.
             if let Err(err) =
                 rustix::process::kill_process_group(group, rustix::process::Signal::KILL)
             {
@@ -133,6 +138,6 @@ pub const fn mechanism() -> &'static str {
     if cfg!(windows) {
         "windows job object (kill on job close)"
     } else {
-        "pty hangup (SIGHUP on master close)"
+        "pty hangup (SIGHUP) + SIGKILL to the agent process group"
     }
 }

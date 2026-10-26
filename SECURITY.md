@@ -50,21 +50,26 @@ You should receive a response within 72 hours.
   * If the OS refuses the link (for example a restricted job object on a locked
     down host), the daemon logs a warning and spawns the agent anyway; refusing
     to run a terminal would be worse than running it without the safety net.
-* `agent-bridge kill --force` reaps the same tree while the daemon stays up:
-  Windows drops the job handle (kernel terminates the job), Unix sends
-  `SIGKILL` to the agent's process group - background jobs included, because
-  the shell is a session and group leader. `kill` without `--force` still tries
+* `agent-bridge kill --force` tears the agent's process tree down while the
+  daemon stays up: Windows drops the job handle (the kernel terminates the job),
+  Unix sends `SIGKILL` to the agent's process group. On Unix that reaches the
+  agent and every process that stayed in its group - the normal case for a CLI
+  agent and the tool subprocesses it starts. An interactive shell with job
+  control moves each job into its own process group, so those jobs survive
+  `kill --force` (see the known gaps). `kill` without `--force` still tries
   Ctrl-C first and then only terminates the PTY client, so children of a
   stubborn agent survive that path by design.
 
 ## Known gaps (tracked, not yet implemented)
 
-* Unix descendants that create their own session (`setsid`, `nohup` with
-  `setsid`, daemons) can outlive both a daemon kill and `kill --force`; nothing
-  portable can follow them, and the Windows job object is the only mechanism
-  here that covers the whole tree. `crates/ab-cli/tests/orphan_teardown.rs`
-  exercises the full-tree case on Windows and the `SIGHUP`/process-group case
-  on Unix.
+* Unix job-control descendants: an interactive shell (`bash`, `zsh`) puts every
+  job in its own process group, and `setsid` / `nohup` can leave the session
+  entirely. `kill --force` only signals the agent's own group, so such
+  processes can outlive both a daemon kill and `kill --force`. Following them
+  needs process/session enumeration, which this daemon does not do; the Windows
+  job object is the only mechanism here that covers a whole tree.
+  `crates/ab-cli/tests/orphan_teardown.rs` exercises the full-tree case on
+  Windows and the process-group case on Unix (with a non-interactive shell).
 * Running agents are not re-adopted after a daemon restart.
 * No optional token handshake for shared machines.
 * Denial for a *different* OS user is not exercised by CI yet; only the

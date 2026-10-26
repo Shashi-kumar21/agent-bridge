@@ -10,8 +10,11 @@
 //!   through the PTY and descendants that ignore the hangup can still survive,
 //!   which is documented in `SECURITY.md`.
 //! * `kill_force_reaps_descendants` - `agent-bridge kill --force` must take the
-//!   whole tree down instead of leaving the shell's children running, and must
-//!   not disturb the daemon.
+//!   agent's process tree down and must not disturb the daemon. Scope differs by
+//!   platform: Windows reaps the whole job object (a grandchild in its own
+//!   console included), Unix `SIGKILL`s the agent's process group, which is why
+//!   the Unix case uses a non-interactive shell - an interactive shell would
+//!   move the background job into a group of its own (see `SECURITY.md`).
 //!
 //! Both tests start a real daemon process and a real PTY agent.
 
@@ -32,7 +35,7 @@ const DEATH_TIMEOUT: Duration = Duration::from_secs(15);
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// A shell that stays alive until it is killed.
-fn long_lived_command() -> Vec<String> {
+fn shell_command() -> Vec<String> {
     if cfg!(windows) {
         let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
         vec![shell]
@@ -107,10 +110,10 @@ fn wait_until_ready(home: &Path) -> Response {
     }
 }
 
-fn spawn_agent() -> u32 {
+fn spawn_agent(command: Vec<String>) -> u32 {
     let created = client::request(&Request::New {
         name: "orphan".to_string(),
-        command: Some(long_lived_command()),
+        command: Some(command),
         cwd: None,
         cols: None,
         rows: None,
@@ -131,6 +134,7 @@ fn agent_pid() -> u32 {
     }
 }
 
+#[cfg(windows)]
 fn send(target: &str, message: &str) {
     let sent = client::request(&Request::Send {
         target: target.to_string(),
@@ -203,7 +207,7 @@ fn read_pid(agent: &str, marker: &str) -> u32 {
             lines: Some(80),
         }) {
             for line in &lines {
-                if let Some(rest) = line.rsplit(marker).next() {
+                if let Some((_, rest)) = line.split_once(marker) {
                     if let Ok(pid) = rest.trim().parse::<u32>() {
                         return pid;
                     }
@@ -254,27 +258,6 @@ fn spawn_detached_grandchild(agent: &str, home: &Path) -> u32 {
     panic!("the detached grandchild never started");
 }
 
-/// On Unix, start a background grandchild in the agent's shell and return its
-/// pid. It stays in the agent's process group, so `kill --force` must reach it.
-#[cfg(unix)]
-fn spawn_background_grandchild(agent: &str) -> u32 {
-    send(agent, "sleep 600 & echo ORPHAN:$!");
-    read_pid(agent, "ORPHAN:")
-}
-
-/// Start a grandchild the OS-level teardown has to reach, whatever the platform.
-fn spawn_grandchild(agent: &str, home: &Path) -> u32 {
-    #[cfg(windows)]
-    {
-        spawn_detached_grandchild(agent, home)
-    }
-    #[cfg(unix)]
-    {
-        let _ = home;
-        spawn_background_grandchild(agent)
-    }
-}
-
 /// Best-effort cleanup so a failing assertion does not leak a shell.
 struct Cleanup(Vec<u32>);
 
@@ -323,7 +306,15 @@ fn agent_dies_when_daemon_is_hard_killed() {
         panic!("expected a version response");
     };
 
-    let tracked = vec![spawn_agent(), spawn_grandchild("orphan", &home)];
+    let agent = spawn_agent(shell_command());
+    // On Unix the daemon-death guarantee is the PTY hangup, which reaches the
+    // foreground group only - a background job would not be covered, so it is
+    // not tracked here (see SECURITY.md).
+    #[cfg(windows)]
+    let tracked = vec![agent, spawn_detached_grandchild("orphan", &home)];
+    #[cfg(unix)]
+    let tracked = vec![agent];
+
     let _cleanup = Cleanup(tracked.clone());
     for pid in &tracked {
         assert!(
@@ -337,6 +328,7 @@ fn agent_dies_when_daemon_is_hard_killed() {
     assert!(!is_alive(daemon_pid), "the daemon should be gone");
 
     assert_all_dead(&tracked, &home);
+    drop(daemon);
     remove_home(&home);
 }
 
@@ -344,10 +336,28 @@ fn agent_dies_when_daemon_is_hard_killed() {
 fn kill_force_reaps_descendants() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let home = isolate();
-    let _daemon = start_daemon(&home);
+    let daemon = start_daemon(&home);
     wait_until_ready(&home);
 
-    let tracked = vec![spawn_agent(), spawn_grandchild("orphan", &home)];
+    // Windows: a grandchild in its own console (job object must reap it).
+    // Unix: a non-interactive shell, so `sleep 600 &` stays in the agent's
+    // process group. An interactive shell would give it a group of its own,
+    // which SIGKILL to the agent's group cannot reach by design.
+    #[cfg(windows)]
+    let tracked = {
+        let agent = spawn_agent(shell_command());
+        vec![agent, spawn_detached_grandchild("orphan", &home)]
+    };
+    #[cfg(unix)]
+    let tracked = {
+        let agent = spawn_agent(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 600 & echo ORPHAN:$!; wait".to_string(),
+        ]);
+        vec![agent, read_pid("orphan", "ORPHAN:")]
+    };
+
     let _cleanup = Cleanup(tracked.clone());
     for pid in &tracked {
         assert!(
@@ -368,5 +378,6 @@ fn kill_force_reaps_descendants() {
         client::is_running(),
         "killing an agent must not take the daemon down"
     );
+    drop(daemon);
     remove_home(&home);
 }
