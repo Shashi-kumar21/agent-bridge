@@ -107,8 +107,9 @@ A PR is ready for QA only when **all** of these are true:
   (`win32job`, a safe wrapper - required because `unsafe_code = "forbid"`);
   closing the ConPTY only reaps the direct client, not grandchildren that
   opened their own console. Do not drop `_reaper` from `Agent` or replace it
-  with raw FFI, and keep `crates/ab-cli/tests/orphan_teardown.rs` green - it
-  fails if the job object stops working.
+  with raw FFI, and keep `crates/ab-cli/tests/orphan_teardown.rs` green - on
+  Windows it fails if the job object stops working (on Unix it covers the
+  `SIGHUP` path only).
 * Keep the daemon single-binary and dependency-light; new deps need a
   justification in the PR.
 

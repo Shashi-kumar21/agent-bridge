@@ -39,6 +39,11 @@ You should receive a response within 72 hours.
     `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. When the daemon exits, crashes, or is
     terminated from Task Manager, the kernel kills the agent and every
     descendant in the job, including processes that opened their own console.
+    Two caveats: the assignment happens right after `CreateProcessW`, so a
+    process forked in that brief window is outside the job; and the
+    job does not set `JOB_OBJECT_LIMIT_BREAKAWAY_OK`, so a child that asks for
+    `CREATE_BREAKAWAY_FROM_JOB` now fails with `ERROR_ACCESS_DENIED` instead of
+    escaping (some installers/launchers do this).
   * **Unix** - `portable-pty` makes the agent a session leader with the PTY as
     its controlling terminal. Closing the master on daemon death makes the
     kernel send `SIGHUP` to the foreground process group.
