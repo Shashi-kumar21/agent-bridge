@@ -439,13 +439,15 @@ fn kill_force_reaps_after_client_exit() {
     };
     // Unix: the shell exits, the background job ignores SIGHUP (so the kernel's
     // session-leader hangup does not take it down) and stays in the agent's
-    // process group, where only `killpg` can reach it.
+    // process group, where only `killpg` can reach it. The trap is installed in
+    // the parent *before* the fork: setting it inside the subshell loses a race
+    // against the SIGHUP the kernel sends when the leader exits.
     #[cfg(unix)]
     let (agent, orphan) = {
         let agent = spawn_agent(vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            "(trap '' HUP; exec sleep 600) & echo ORPHAN:$!; exit 0".to_string(),
+            "trap '' HUP; (exec sleep 600) & echo ORPHAN:$!; exit 0".to_string(),
         ]);
         (agent, read_pid("orphan", "ORPHAN:"))
     };
