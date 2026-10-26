@@ -62,13 +62,14 @@ You should receive a response within 72 hours.
 
 ## Known gaps (tracked, not yet implemented)
 
-* Unix job-control descendants: an interactive shell (`bash`, `zsh`) puts every
-  job in its own process group, and `setsid` / `nohup` can leave the session
+* Unix job-control descendants: an interactive shell (`bash`, `zsh`, `dash`)
+  puts every job in its own process group, and `setsid` leaves the session
   entirely. `kill --force` only signals the agent's own group, so such
-  processes can outlive both a daemon kill and `kill --force`. Following them
-  needs process/session enumeration, which this daemon does not do; the Windows
-  job object is the only mechanism here that covers a whole tree.
-  `crates/ab-cli/tests/orphan_teardown.rs` exercises the full-tree case on
+  processes can outlive both a daemon kill and `kill --force`. (`nohup` only
+  ignores `SIGHUP` and stays in the group, so the force kill does reach it.)
+  Following them needs process/session enumeration, which this daemon does not
+  do; the Windows job object is the only mechanism here that covers a whole
+  tree. `crates/ab-cli/tests/orphan_teardown.rs` exercises the full-tree case on
   Windows and the process-group case on Unix (with a non-interactive shell).
 * Running agents are not re-adopted after a daemon restart.
 * No optional token handshake for shared machines.

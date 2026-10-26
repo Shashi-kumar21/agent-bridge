@@ -38,7 +38,7 @@ pub struct ProcessReaper {
 }
 
 impl ProcessReaper {
-    /// Kill the agent and everything it spawned.
+    /// Kill the agent and the descendants it still owns.
     ///
     /// * **Windows** - drops the job handle. Since the job was created with
     ///   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, the kernel terminates every
@@ -50,11 +50,18 @@ impl ProcessReaper {
     ///   into its own process group, so those jobs are *not* reached here - see
     ///   `SECURITY.md`.
     ///
+    /// `leader_alive` is the caller's last liveness observation. On Unix it
+    /// guards against pid reuse: once the leader is gone its pid may have been
+    /// recycled into an unrelated process group, and signalling that group
+    /// would be destructive. A live process group keeps its pgid allocated, so
+    /// a *free* pid can only name the agent's own orphaned group.
+    ///
     /// Consumes the reaper: once the tree is gone there is nothing left to
     /// guard. Returns an error only when the signal could not be delivered.
-    pub fn terminate(self) -> Result<()> {
+    pub fn terminate(self, leader_alive: bool) -> Result<()> {
         #[cfg(windows)]
         {
+            let _ = leader_alive;
             drop(self);
             Ok(())
         }
@@ -69,9 +76,18 @@ impl ProcessReaper {
                 return Ok(());
             };
             // `portable-pty` calls `setsid()` before exec, so the child's pid is
-            // also its process group id. The id was captured at spawn, so a
-            // recycled pid could in theory name another group; the window is
-            // one scheduler tick and only after the agent has already exited.
+            // also its process group id.
+            if !leader_alive
+                && !matches!(
+                    rustix::process::test_kill_process(group),
+                    Err(rustix::io::Errno::SRCH)
+                )
+            {
+                // The leader is gone and its pid is in use again (or exists but
+                // is not ours), so the agent's group is gone and the id now
+                // belongs to someone else. Nothing left to signal.
+                return Ok(());
+            }
             if let Err(err) =
                 rustix::process::kill_process_group(group, rustix::process::Signal::KILL)
             {

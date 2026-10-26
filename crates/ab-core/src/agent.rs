@@ -408,21 +408,39 @@ impl Agent {
 
     /// `kill --force`: everything the reaper knows about.
     ///
-    /// Errors from the tree teardown are reported to the caller (after the
-    /// fallback attempt) so a script is not told the tree died when it did not.
+    /// Errors from the tree teardown are reported to the caller once the
+    /// fallback has been tried (or immediately when the client is already
+    /// gone), so a script is not told the tree died when it did not.
     fn kill_tree(&self) -> Result<()> {
+        // Read the liveness flag before taking the reaper: on Unix a force kill
+        // after the leader exited must not signal a recycled process group.
+        let leader_alive = self.is_running();
         let reaper = self
             .reaper
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        let mut tree_error = None;
-        if let Some(reaper) = reaper {
-            if let Err(err) = reaper.terminate() {
-                warn!(agent = %self.name, error = %err, "could not terminate the agent tree");
-                tree_error = Some(err);
+        let Some(reaper) = reaper else {
+            // No reaper: the OS cannot promise a tree teardown (install() already
+            // logged that at spawn). Stop the client and report the degraded
+            // path as success, as before this feature.
+            let mut child = self
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if child.try_wait()?.is_none() {
+                child.kill()?;
             }
-        }
+            return Ok(());
+        };
+
+        let tree_error = match reaper.terminate(leader_alive) {
+            Ok(()) => None,
+            Err(err) => {
+                warn!(agent = %self.name, error = %err, "could not terminate the agent tree");
+                Some(err)
+            }
+        };
 
         for _ in 0..10 {
             if !self.is_running() {
@@ -431,8 +449,8 @@ impl Agent {
             thread::sleep(Duration::from_millis(50));
         }
 
-        // No reaper (install failed) or the tree signal did not take the PTY
-        // client with it: at least stop the client.
+        // The tree signal did not take the PTY client with it: at least stop
+        // the client.
         let mut child = self
             .child
             .lock()

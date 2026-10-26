@@ -15,8 +15,11 @@
 //!   console included), Unix `SIGKILL`s the agent's process group, which is why
 //!   the Unix case uses a non-interactive shell - an interactive shell would
 //!   move the background job into a group of its own (see `SECURITY.md`).
+//! * `kill_force_reaps_after_client_exit` - the same teardown must run when the
+//!   direct client has already exited and only its descendants are left; that
+//!   is the case `kill --force` used to skip by returning early on liveness.
 //!
-//! Both tests start a real daemon process and a real PTY agent.
+//! All tests start a real daemon process and a real PTY agent.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -25,7 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_bridge_core::client;
-use agent_bridge_core::protocol::{Request, Response};
+use agent_bridge_core::protocol::{AgentStatus, Request, Response};
 
 /// Time the OS gets to tear an agent tree down.
 const DEATH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -79,6 +82,19 @@ fn start_daemon(home: &Path) -> DaemonProcess {
 
 /// Best-effort removal; Windows can hold the copied image for a moment.
 fn remove_home(home: &Path) {
+    // The detached grandchild runs a copy of ping.exe; delete the image first so
+    // remove_dir_all does not race the process teardown.
+    if let Ok(entries) = std::fs::read_dir(home) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("ab-orphan-")
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
     for _ in 0..20 {
         if std::fs::remove_dir_all(home).is_ok() {
             return;
@@ -131,6 +147,26 @@ fn agent_pid() -> u32 {
             .and_then(|agent| agent.pid)
             .expect("the agent should report a pid"),
         other => panic!("unexpected list response: {other:?}"),
+    }
+}
+
+/// Poll until the daemon reports the agent as exited.
+fn wait_for_exit(agent: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(Response::Agents { agents }) = client::request(&Request::List) {
+            if agents
+                .iter()
+                .any(|info| info.name == agent && matches!(info.status, AgentStatus::Exited))
+            {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agent '{agent}' should exit on its own"
+        );
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -374,6 +410,63 @@ fn kill_force_reaps_descendants() {
     assert!(matches!(killed, Response::Ok), "got {killed:?}");
 
     assert_all_dead(&tracked, &home);
+    assert!(
+        client::is_running(),
+        "killing an agent must not take the daemon down"
+    );
+    drop(daemon);
+    remove_home(&home);
+}
+
+/// A force kill must still reach the tree after the direct client exited - the
+/// case where `kill --force` used to return early and leave descendants alive
+/// until the daemon stopped.
+#[test]
+fn kill_force_reaps_after_client_exit() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let home = isolate();
+    let daemon = start_daemon(&home);
+    wait_until_ready(&home);
+
+    // Windows: the shell exits, the detached grandchild (own console) stays in
+    // the job object.
+    #[cfg(windows)]
+    let (agent, orphan) = {
+        let agent = spawn_agent(shell_command());
+        let orphan = spawn_detached_grandchild("orphan", &home);
+        send("orphan", "exit");
+        (agent, orphan)
+    };
+    // Unix: the shell exits, the background job ignores SIGHUP (so the kernel's
+    // session-leader hangup does not take it down) and stays in the agent's
+    // process group, where only `killpg` can reach it.
+    #[cfg(unix)]
+    let (agent, orphan) = {
+        let agent = spawn_agent(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "(trap '' HUP; exec sleep 600) & echo ORPHAN:$!; exit 0".to_string(),
+        ]);
+        (agent, read_pid("orphan", "ORPHAN:"))
+    };
+
+    let _cleanup = Cleanup(vec![agent, orphan]);
+    assert!(
+        is_alive(orphan),
+        "the orphan should be running before the kill"
+    );
+
+    wait_for_exit("orphan");
+    assert!(!is_alive(agent), "the direct client should be gone");
+
+    let killed = client::request(&Request::Kill {
+        name: "orphan".to_string(),
+        force: Some(true),
+    })
+    .expect("kill agent");
+    assert!(matches!(killed, Response::Ok), "got {killed:?}");
+
+    assert_all_dead(&[orphan], &home);
     assert!(
         client::is_running(),
         "killing an agent must not take the daemon down"
