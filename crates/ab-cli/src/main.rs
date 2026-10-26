@@ -280,11 +280,18 @@ fn emit(response: Response, json: bool) -> Result<()> {
         Response::Version {
             protocol,
             daemon,
+            pid,
             socket,
             started_at,
         } => {
             println!("protocol : {protocol}");
             println!("daemon   : {daemon}");
+            if pid == 0 {
+                println!("pid      : unknown (daemon predates this field)");
+            } else {
+                println!("pid      : {pid}");
+                println!("teardown : {}", agent_bridge_core::reaper::mechanism());
+            }
             println!("socket   : {socket}");
             println!("uptime   : {}", fmt::human_age(started_at));
         }

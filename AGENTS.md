@@ -82,7 +82,7 @@ A PR is ready for QA only when **all** of these are true:
 
 - [ ] `cargo fmt --all --check`
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --all` (unit + `daemon_e2e` integration test)
+- [ ] `cargo test --all` (unit + `daemon_e2e` + `orphan_teardown`)
 - [ ] New behaviour has tests; public items have doc comments
 - [ ] `--json` output stays backward compatible (protocol version bump if not)
 - [ ] README / AGENTS.md updated when commands or behaviour change
@@ -102,6 +102,14 @@ A PR is ready for QA only when **all** of these are true:
 * Daemon lifecycle: a protocol-skew restart is allowed **only** when the daemon
   owns no agent sessions. Never add a path that silently kills live agents
   (a version bump is not a licence to destroy someone's terminal).
+* Process lifetime: agents are tied to the daemon through
+  `crates/ab-core/src/reaper.rs`. On Windows that is an anonymous job object
+  (`win32job`, a safe wrapper - required because `unsafe_code = "forbid"`);
+  closing the ConPTY only reaps the direct client, not grandchildren that
+  opened their own console. Do not drop `_reaper` from `Agent` or replace it
+  with raw FFI, and keep `crates/ab-cli/tests/orphan_teardown.rs` green - on
+  Windows it fails if the job object stops working (on Unix it covers the
+  `SIGHUP` path only).
 * Keep the daemon single-binary and dependency-light; new deps need a
   justification in the PR.
 
@@ -111,6 +119,7 @@ A PR is ready for QA only when **all** of these are true:
 crates/ab-core/src/protocol.rs  wire types (single source of truth)
 crates/ab-core/src/daemon.rs    accept loop, request handling, attach streams
 crates/ab-core/src/agent.rs     PTY spawn, output pump, resize, kill
+crates/ab-core/src/reaper.rs    agent lifetime link (job object / PTY hangup)
 crates/ab-core/src/transport.rs local socket / named pipe
 crates/ab-core/src/client.rs    blocking client used by CLI and UI
 crates/ab-cli/src/main.rs       command surface (clap)

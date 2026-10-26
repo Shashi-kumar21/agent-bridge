@@ -33,11 +33,30 @@ You should receive a response within 72 hours.
   input as code execution in that terminal - that is the point of the tool.
 * Output buffers are kept in memory only (256 KiB per agent) and are never
   written to disk unless the daemon log is enabled.
+* Agent lifetime is tied to the daemon, so a crashed or force-killed daemon does
+  not leave hidden terminals behind (`crates/ab-core/src/reaper.rs`):
+  * **Windows** - each agent is assigned to an anonymous job object with
+    `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. When the daemon exits, crashes, or is
+    terminated from Task Manager, the kernel kills the agent and every
+    descendant in the job, including processes that opened their own console.
+    Two caveats: the assignment happens right after `CreateProcessW`, so a
+    process forked in that brief window is outside the job; and the
+    job does not set `JOB_OBJECT_LIMIT_BREAKAWAY_OK`, so a child that asks for
+    `CREATE_BREAKAWAY_FROM_JOB` now fails with `ERROR_ACCESS_DENIED` instead of
+    escaping (some installers/launchers do this).
+  * **Unix** - `portable-pty` makes the agent a session leader with the PTY as
+    its controlling terminal. Closing the master on daemon death makes the
+    kernel send `SIGHUP` to the foreground process group.
+  * If the OS refuses the link (for example a restricted job object on a locked
+    down host), the daemon logs a warning and spawns the agent anyway; refusing
+    to run a terminal would be worse than running it without the safety net.
 
 ## Known gaps (tracked, not yet implemented)
 
-* Children are orphaned if the daemon is killed with `SIGKILL` / `TerminateProcess`
-  (no job object or process-group teardown).
+* Unix descendants that leave the PTY's foreground process group (background
+  jobs, `setsid`, `nohup`) can outlive a daemon kill. Only the Windows job
+  object covers the whole tree; `crates/ab-cli/tests/orphan_teardown.rs`
+  exercises the full-tree case on Windows and the `SIGHUP` case on Unix.
 * Running agents are not re-adopted after a daemon restart.
 * No optional token handshake for shared machines.
 * Denial for a *different* OS user is not exercised by CI yet; only the
