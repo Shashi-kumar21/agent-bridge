@@ -290,9 +290,9 @@ fn emit(response: Response, json: bool) -> Result<()> {
                 println!("pid      : unknown (daemon predates this field)");
             } else {
                 println!("pid      : {pid}");
+                println!("teardown : {}", agent_bridge_core::reaper::mechanism());
             }
             println!("socket   : {socket}");
-            println!("teardown : {}", agent_bridge_core::reaper::mechanism());
             println!("uptime   : {}", fmt::human_age(started_at));
         }
         Response::Agents { agents } => fmt::print_agents(&agents),

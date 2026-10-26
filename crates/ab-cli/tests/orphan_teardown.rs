@@ -74,9 +74,20 @@ fn remove_home(home: &Path) {
         }
         thread::sleep(Duration::from_millis(100));
     }
+    eprintln!(
+        "warning: could not remove {}; it still holds daemon.log",
+        home.display()
+    );
 }
 
-fn wait_until_ready() -> Response {
+/// Daemon log, or a readable placeholder - used in failure messages.
+fn dump_log(home: &Path) -> String {
+    let path = home.join("daemon.log");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| format!("<could not read {}: {err}>", path.display()))
+}
+
+fn wait_until_ready(home: &Path) -> Response {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Ok(version @ Response::Version { .. }) = client::request(&Request::Version) {
@@ -84,7 +95,8 @@ fn wait_until_ready() -> Response {
         }
         assert!(
             Instant::now() < deadline,
-            "the daemon did not answer within 20s"
+            "the daemon did not answer within 20s\n--- daemon.log ---\n{}",
+            dump_log(home)
         );
         thread::sleep(Duration::from_millis(100));
     }
@@ -223,7 +235,7 @@ fn agent_dies_when_daemon_is_hard_killed() {
 
     let Response::Version {
         pid: daemon_pid, ..
-    } = wait_until_ready()
+    } = wait_until_ready(&home)
     else {
         panic!("expected a version response");
     };
@@ -265,13 +277,11 @@ fn agent_dies_when_daemon_is_hard_killed() {
         if survivors.is_empty() {
             break;
         }
-        if Instant::now() >= deadline {
-            let log = std::fs::read_to_string(home.join("daemon.log"))
-                .unwrap_or_else(|err| format!("<could not read daemon.log: {err}>"));
-            panic!(
-                "survived their daemon for {DEATH_TIMEOUT:?}: {survivors:?}\n--- daemon.log ---\n{log}"
-            );
-        }
+        assert!(
+            Instant::now() < deadline,
+            "survived their daemon for {DEATH_TIMEOUT:?}: {survivors:?}\n--- daemon.log ---\n{}",
+            dump_log(&home)
+        );
         thread::sleep(Duration::from_millis(100));
     }
 
