@@ -196,6 +196,8 @@ pub enum Response {
         protocol: u32,
         /// Daemon crate version.
         daemon: String,
+        /// Daemon process id, so callers can target it for teardown.
+        pid: u32,
         /// Socket path in use.
         socket: String,
         /// Daemon start time (ms since epoch).

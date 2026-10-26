@@ -280,12 +280,15 @@ fn emit(response: Response, json: bool) -> Result<()> {
         Response::Version {
             protocol,
             daemon,
+            pid,
             socket,
             started_at,
         } => {
             println!("protocol : {protocol}");
             println!("daemon   : {daemon}");
+            println!("pid      : {pid}");
             println!("socket   : {socket}");
+            println!("teardown : {}", agent_bridge_core::reaper::mechanism());
             println!("uptime   : {}", fmt::human_age(started_at));
         }
         Response::Agents { agents } => fmt::print_agents(&agents),

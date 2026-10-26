@@ -15,6 +15,7 @@ use tracing::{debug, warn};
 use crate::buffer::OutputBuffer;
 use crate::error::{BridgeError, Result};
 use crate::protocol::{AgentInfo, AgentStatus, Event, Message, Millis};
+use crate::reaper::{self, ProcessReaper};
 
 const MAX_MESSAGES: usize = 500;
 
@@ -63,6 +64,8 @@ pub struct Agent {
     subscribers: Mutex<Vec<Sender<Event>>>,
     subscriber_count: AtomicUsize,
     seq: AtomicU64,
+    /// Holds the OS-level "die with the daemon" link; never read, only kept.
+    _reaper: Option<ProcessReaper>,
 }
 
 impl Agent {
@@ -103,6 +106,9 @@ impl Agent {
         let child = pair.slave.spawn_command(builder)?;
         drop(pair.slave);
         let pid = child.process_id();
+        // Must happen right after spawn: assign the agent to a job object so the
+        // kernel kills it if the daemon dies without running its shutdown path.
+        let process_reaper = reaper::install(child.as_ref());
         let master = pair.master;
         let writer = master.take_writer()?;
         let reader = master.try_clone_reader()?;
@@ -132,6 +138,7 @@ impl Agent {
             subscribers: Mutex::new(Vec::new()),
             subscriber_count: AtomicUsize::new(0),
             seq: AtomicU64::new(0),
+            _reaper: process_reaper,
         });
 
         let pump = Arc::clone(&agent);
