@@ -19,6 +19,9 @@ Rules of engagement:
 3. Dev never approves its own PR; QA never merges.
 4. If QA and Dev disagree twice, escalate to the Owner with a short summary of
    both positions.
+5. Dependency and CI PRs (dependabot included) follow the same loop: Dev
+   verifies, QA reviews, Owner merges. GitHub auto-merge stays off, and
+   `portable-pty` is never bumped without the Windows smoke test in section 9.
 
 ## 2. Communication protocol
 
@@ -94,6 +97,11 @@ A PR is ready for QA only when **all** of these are true:
 * Never log message bodies at `info`; they may contain sensitive prompts.
 * Wire compatibility: `PROTOCOL_VERSION` in `crates/ab-core/src/protocol.rs`
   must change whenever `Request`/`Response` changes incompatibly.
+* Attach streams replay buffered output and then continue live, so the same
+  `seq` can arrive twice; clients must drop non-increasing `seq` frames.
+* Daemon lifecycle: a protocol-skew restart is allowed **only** when the daemon
+  owns no agent sessions. Never add a path that silently kills live agents
+  (a version bump is not a licence to destroy someone's terminal).
 * Keep the daemon single-binary and dependency-light; new deps need a
   justification in the PR.
 
@@ -144,3 +152,33 @@ gh pr review <num> --approve --body "VERDICT: APPROVE"
 # Owner: merge
 gh pr merge <num> --squash --delete-branch
 ```
+
+## 9. `portable-pty` pin (do not forget)
+
+`portable-pty` is pinned to **exactly** `0.8.1` in the workspace `Cargo.toml`:
+the 0.9 line returned no ConPTY output on Windows, so every agent terminal went
+silent. `RUSTSEC-2017-0008` (unmaintained `serial`, not vulnerable) is therefore
+ignored in `deny.toml` with that reason.
+
+Three guards keep this from regressing:
+
+* `Cargo.toml` uses `=0.8.1`, so a plain `cargo update` cannot move it.
+* `.github/dependabot.yml` ignores `portable-pty`; do not remove that ignore
+  without the smoke test below passing on the new version.
+* The `deny` CI job fails if `Cargo.lock` does not resolve `portable-pty` to
+  `0.8.1`.
+
+Never merge a `portable-pty` bump on green CI alone - ConPTY output is not
+covered by unit tests that a version bump would exercise. Run this on Windows:
+
+```bash
+agent-bridge daemon start
+agent-bridge new smoke -- cmd.exe /c "echo conpty-ok"
+agent-bridge read smoke --lines 5      # must contain conpty-ok
+agent-bridge kill smoke --force
+agent-bridge daemon stop
+```
+
+If a 0.9.x release passes, upgrade, delete the advisory ignore from
+`deny.toml`, delete the dependabot ignore and the CI pin step, and confirm
+`serial` is gone from `Cargo.lock`.

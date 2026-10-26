@@ -19,5 +19,8 @@ crossbeam-channel = "0.5"
 anyhow = "1"
 tracing.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+widestring = "1"
+
 [lints]
 workspace = true
