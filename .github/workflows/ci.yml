@@ -90,6 +90,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+      - name: enforce portable-pty pin
+        # 0.9.x emits no ConPTY output on Windows; see AGENTS.md section 9.
+        run: |
+          pin=$(awk '/^name = "portable-pty"/{getline; print}' Cargo.lock | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "portable-pty = $pin"
+          test "$pin" = "0.8.1"
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses bans sources advisories
