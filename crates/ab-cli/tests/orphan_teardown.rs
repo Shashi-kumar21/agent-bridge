@@ -82,20 +82,21 @@ fn start_daemon(home: &Path) -> DaemonProcess {
 
 /// Best-effort removal; Windows can hold the copied image for a moment.
 fn remove_home(home: &Path) {
-    // The detached grandchild runs a copy of ping.exe; delete the image first so
-    // remove_dir_all does not race the process teardown.
-    if let Ok(entries) = std::fs::read_dir(home) {
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("ab-orphan-")
-            {
-                let _ = std::fs::remove_file(entry.path());
+    // The detached grandchild runs a copy of ping.exe. Retry the image delete
+    // together with the directory removal: an AV scanner or a not-yet-released
+    // handle can make the first attempt fail.
+    for _ in 0..20 {
+        if let Ok(entries) = std::fs::read_dir(home) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("ab-orphan-")
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
             }
         }
-    }
-    for _ in 0..20 {
         if std::fs::remove_dir_all(home).is_ok() {
             return;
         }

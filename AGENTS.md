@@ -112,9 +112,9 @@ A PR is ready for QA only when **all** of these are true:
   gap (see `SECURITY.md`).
   `kill --force` tears the tree down through the same hook - do not replace it
   with a bare `child.kill()`, and do not replace the crates with raw FFI. Keep
-  `crates/ab-cli/tests/orphan_teardown.rs` green: on Windows both tests fail if
-  the job object stops working, on Unix they cover `SIGHUP` plus the process
-  group.
+  `crates/ab-cli/tests/orphan_teardown.rs` green: on Windows all three tests
+  fail if the job object stops working (including the exited-client case), on
+  Unix they cover `SIGHUP` plus the process group.
 * Keep the daemon single-binary and dependency-light; new deps need a
   justification in the PR.
 

@@ -77,15 +77,23 @@ impl ProcessReaper {
             };
             // `portable-pty` calls `setsid()` before exec, so the child's pid is
             // also its process group id.
+            //
+            // If the leader is gone the id may have been recycled. On Linux a
+            // pid number stays allocated while a process group references it
+            // (`struct pid` refcount), so `ESRCH` means the agent's own
+            // orphaned group (or nothing) and is safe to signal. `Ok`/`EPERM`
+            // means some process owns the number again, so the agent's group is
+            // gone and the id now belongs to someone else. macOS does not
+            // document that guarantee, so the guard is deliberately
+            // conservative there: it can miss an orphan in the microseconds
+            // between the probe and `killpg`, but never signals an unrelated
+            // group.
             if !leader_alive
                 && !matches!(
                     rustix::process::test_kill_process(group),
                     Err(rustix::io::Errno::SRCH)
                 )
             {
-                // The leader is gone and its pid is in use again (or exists but
-                // is not ours), so the agent's group is gone and the id now
-                // belongs to someone else. Nothing left to signal.
                 return Ok(());
             }
             if let Err(err) =

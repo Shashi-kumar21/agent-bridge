@@ -193,6 +193,11 @@ impl Agent {
                     Ok(Some(status)) => Some(i32::try_from(status.exit_code()).unwrap_or(-1)),
                     Ok(None) => None,
                     Err(err) => {
+                        // Only this daemon waits on the child, so an error means
+                        // the handle is gone or the OS refused (ECHILD and
+                        // friends). Treat it as an exit so the agent does not
+                        // stay "running" forever; the reaper's pid guard is
+                        // conservative for that case.
                         warn!(agent = %self.name, error = %err, "wait failed");
                         Some(-1)
                     }
