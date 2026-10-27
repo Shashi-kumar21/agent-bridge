@@ -66,7 +66,7 @@ interactive CLI works: Claude Code, OpenCode, a shell, a REPL, an editor.
 | `agent-bridge sendmessage <name> <text>` | type text into another agent's terminal |
 | `agent-bridge read <name> --lines N` | ANSI-stripped tail of its output |
 | `agent-bridge attach <name>` | live mirror + keyboard passthrough |
-| `agent-bridge kill <name>` | Ctrl-C first, hard kill on `--force` |
+| `agent-bridge kill <name>` | Ctrl-C first; `--force` kills the agent's process tree immediately (Windows: whole job; Unix: process group + best-effort tree snapshot) |
 | `agent-bridge log` | global message history |
 | `agent-bridge ping` / `version` | health, protocol details, daemon pid and teardown mechanism |
 

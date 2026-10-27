@@ -1,4 +1,5 @@
-//! Keeps agent processes from outliving the daemon.
+//! Keeps agent processes from outliving the daemon, and tears an agent's
+//! process tree down on request.
 //!
 //! A daemon that is killed with `SIGKILL` / `TerminateProcess` / Task Manager
 //! never runs its shutdown path, so anything the daemon owns has to be reaped
@@ -6,16 +7,25 @@
 //!
 //! * **Windows** - every agent is assigned to an anonymous job object with
 //!   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. When the last handle to that job
-//!   closes (daemon exits, crashes, or is terminated), the kernel terminates
-//!   every process in the job, including descendants the agent spawned.
-//! * **Unix** - nothing to install. `portable-pty` makes the child a session
-//!   leader with the PTY slave as its controlling terminal, so when the daemon
-//!   dies the kernel closes the master and sends `SIGHUP` to the terminal's
-//!   foreground process group. A descendant that left that group (background
-//!   job, `setsid`, `nohup`) can still survive; the next daemon start does not
-//!   adopt it. That limitation is documented in `SECURITY.md`.
+//!   closes (daemon exits, crashes, is terminated, or the handle is dropped by
+//!   [`ProcessReaper::terminate`]), the kernel terminates every process in the
+//!   job, including descendants the agent spawned.
+//! * **Unix** - `portable-pty` makes the child a session leader with the PTY
+//!   slave as its controlling terminal, so when the daemon dies the kernel
+//!   closes the master and sends `SIGHUP` to the terminal's foreground process
+//!   group. [`ProcessReaper::terminate`] additionally `SIGKILL`s the agent's
+//!   process group and the descendants it finds in a snapshot taken first, which
+//!   covers the jobs an interactive shell moved into their own process group -
+//!   but only while the client is still alive. A process that daemonized before
+//!   the snapshot, or a job-control job left behind after the client exited, is
+//!   not reached; daemon death only reaches the foreground group. All of that is
+//!   documented in `SECURITY.md`.
 
 use portable_pty::Child;
+
+#[cfg(unix)]
+use crate::error::BridgeError;
+use crate::Result;
 
 /// Owner of the OS-level process lifetime link.
 ///
@@ -25,6 +35,184 @@ use portable_pty::Child;
 pub struct ProcessReaper {
     #[cfg(windows)]
     _job: win32job::Job,
+    #[cfg(unix)]
+    pid: Option<u32>,
+}
+
+impl ProcessReaper {
+    /// Kill the agent and the descendants it still owns.
+    ///
+    /// * **Windows** - drops the job handle. Since the job was created with
+    ///   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, the kernel terminates every
+    ///   process in it, including grandchildren that opened their own console.
+    /// * **Unix** - `SIGKILL` to the agent's process group, then to every
+    ///   descendant found in a `ps` snapshot taken before the signals. The child
+    ///   is a session leader, so the group signal reaches the agent and the
+    ///   processes that stayed in its group; the snapshot adds the jobs an
+    ///   interactive shell moved into their own group (and children that called
+    ///   `setsid`). A process that had already left the tree is *not* reached -
+    ///   see `SECURITY.md`.
+    ///
+    /// `leader_alive` is the caller's last liveness observation. On Unix it
+    /// narrows the pid-reuse hazard: once the leader is gone its pid may have
+    /// been recycled into an unrelated process group, so the group signal is
+    /// skipped when a process owns that number again, and the descendant walk
+    /// is skipped entirely (its root would be a stranger). This is best-effort,
+    /// not a proof (the probe and the signals are not atomic); a complete fix
+    /// needs `pidfd` or process enumeration.
+    ///
+    /// Consumes the reaper: once the tree is gone there is nothing left to
+    /// guard. Returns an error only when the signal could not be delivered.
+    pub fn terminate(self, leader_alive: bool) -> Result<()> {
+        #[cfg(windows)]
+        {
+            let _ = leader_alive;
+            drop(self);
+            Ok(())
+        }
+        #[cfg(unix)]
+        {
+            let Some(pid) = self.pid else {
+                return Ok(());
+            };
+            let raw = i32::try_from(pid)
+                .map_err(|_| BridgeError::Daemon(format!("agent pid {pid} does not fit in i32")))?;
+            let Some(group) = rustix::process::Pid::from_raw(raw) else {
+                return Ok(());
+            };
+            // `portable-pty` calls `setsid()` before exec, so the child's pid is
+            // also its process group id.
+            //
+            // If the leader is gone the id may have been recycled. On Linux a
+            // pid number stays allocated while the agent's own group references
+            // it, so `ESRCH` usually means that orphaned group (or nothing).
+            // That narrows the hazard but does not prove it: an unrelated group
+            // can reuse the id after its own leader exits, and the probe ->
+            // killpg window is not atomic. `Ok`/`EPERM` means a process owns the
+            // number, so skip. A complete fix needs pidfd or enumeration.
+            if !leader_alive
+                && !matches!(
+                    rustix::process::test_kill_process(group),
+                    Err(rustix::io::Errno::SRCH)
+                )
+            {
+                return Ok(());
+            }
+            // Snapshot the tree before signalling: once the agent dies its
+            // children are reparented and can no longer be found. Skipped when
+            // the leader is gone - its pid may name an unrelated tree by now.
+            let descendants = if leader_alive {
+                descendants(pid)
+            } else {
+                Vec::new()
+            };
+            let mut first_error = None;
+            if let Err(err) =
+                rustix::process::kill_process_group(group, rustix::process::Signal::KILL)
+            {
+                // The agent may have exited between the liveness check and the
+                // signal; a vanishing group is success, not a failure. Any other
+                // error (`EPERM` after a credential change, a sandbox) must not
+                // skip the sweep: the descendants are already snapshotted and
+                // killing them is still the best chance to avoid a leak.
+                if err != rustix::io::Errno::SRCH {
+                    first_error = Some(BridgeError::Io(std::io::Error::from_raw_os_error(
+                        err.raw_os_error(),
+                    )));
+                }
+            }
+            // Job-control jobs live in their own process group, so the group
+            // signal above leaves them behind. The snapshot fixed the pid list,
+            // so the order is not a correctness requirement; leaves first just
+            // reads like a tree teardown. One unkillable pid (`EPERM`) must not
+            // stop the rest of the tree from being signalled either.
+            for descendant in descendants.into_iter().rev() {
+                if let Err(err) = kill_member(descendant) {
+                    first_error.get_or_insert(err);
+                }
+            }
+            match first_error {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
+/// Every descendant of `root` in a `ps` snapshot, parents before children.
+///
+/// `ps` is the only portable way to enumerate processes without unsafe FFI or
+/// a platform crate; it is part of POSIX and present on every target here. The
+/// flags matter: `-axo` works on both procps and BSD `ps`, while the
+/// equivalent `-Axo` makes procps reject `-x` ("must set personality to get -x
+/// option") and the sweep silently finds nothing. The snapshot-to-kill window
+/// is best-effort: a process forked afterwards, one that had already been
+/// reparented, or a snapshotted pid that exits and is recycled before the sweep
+/// is not handled - a complete fix needs `pidfd` or process enumeration.
+#[cfg(unix)]
+fn descendants(root: u32) -> Vec<u32> {
+    let output = match std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not run ps; the agent's descendants may survive kill --force");
+            return Vec::new();
+        }
+    };
+    if !output.status.success() {
+        tracing::warn!(
+            status = ?output.status,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "ps failed; the agent's descendants may survive kill --force"
+        );
+        return Vec::new();
+    }
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(child), Some(parent)) = (
+            fields.next().and_then(|value| value.parse::<u32>().ok()),
+            fields.next().and_then(|value| value.parse::<u32>().ok()),
+        ) else {
+            continue;
+        };
+        children.entry(parent).or_default().push(child);
+    }
+    let mut seen = std::collections::HashSet::from([root]);
+    let mut found = Vec::new();
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        for child in children.get(&pid).into_iter().flatten().copied() {
+            if seen.insert(child) {
+                found.push(child);
+                stack.push(child);
+            }
+        }
+    }
+    found
+}
+
+/// SIGKILL one pid, treating "already gone" as success.
+///
+/// The pid comes from a snapshot, so a process that exited and had its pid
+/// recycled before this call is signalled too - the same best-effort window as
+/// the group signal, not a proof of identity.
+#[cfg(unix)]
+fn kill_member(pid: u32) -> Result<()> {
+    let Ok(raw) = i32::try_from(pid) else {
+        return Ok(());
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(raw) else {
+        return Ok(());
+    };
+    match rustix::process::kill_process(pid, rustix::process::Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(err) => Err(BridgeError::Io(std::io::Error::from_raw_os_error(
+            err.raw_os_error(),
+        ))),
+    }
 }
 
 /// Tie `child` to the daemon's lifetime.
@@ -60,10 +248,14 @@ pub fn install(child: &dyn Child) -> Option<ProcessReaper> {
     Some(ProcessReaper { _job: job })
 }
 
-/// Unix keeps the guarantee through the PTY (see the module docs).
+/// Unix keeps the daemon-death guarantee through the PTY (see the module
+/// docs); the pid is recorded so [`ProcessReaper::terminate`] can signal the
+/// process group.
 #[cfg(unix)]
-pub fn install(_child: &dyn Child) -> Option<ProcessReaper> {
-    Some(ProcessReaper {})
+pub fn install(child: &dyn Child) -> Option<ProcessReaper> {
+    Some(ProcessReaper {
+        pid: child.process_id(),
+    })
 }
 
 /// Human readable description of the platform mechanism, printed by
@@ -73,6 +265,6 @@ pub const fn mechanism() -> &'static str {
     if cfg!(windows) {
         "windows job object (kill on job close)"
     } else {
-        "pty hangup (SIGHUP on master close)"
+        "pty hangup (SIGHUP) + SIGKILL to the agent group + best-effort tree snapshot"
     }
 }

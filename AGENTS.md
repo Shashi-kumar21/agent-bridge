@@ -106,10 +106,17 @@ A PR is ready for QA only when **all** of these are true:
   `crates/ab-core/src/reaper.rs`. On Windows that is an anonymous job object
   (`win32job`, a safe wrapper - required because `unsafe_code = "forbid"`);
   closing the ConPTY only reaps the direct client, not grandchildren that
-  opened their own console. Do not drop `_reaper` from `Agent` or replace it
-  with raw FFI, and keep `crates/ab-cli/tests/orphan_teardown.rs` green - on
-  Windows it fails if the job object stops working (on Unix it covers the
-  `SIGHUP` path only).
+  opened their own console. On Unix the PTY hangup covers daemon death and
+  `ProcessReaper::terminate` signals the agent's process group and then the
+  descendants in a `ps` snapshot taken first, so job-control jobs are reaped
+  too - but only while the direct client is alive; a job left behind after the
+  client exited, or a process that already detached (daemonized), is a known gap
+  (see `SECURITY.md`).
+  `kill --force` tears the tree down through the same hook - do not replace it
+  with a bare `child.kill()`, and do not replace the crates with raw FFI. Keep
+  `crates/ab-cli/tests/orphan_teardown.rs` green: on Windows all three tests
+  fail if the job object stops working (including the exited-client case), on
+  Unix they cover `SIGHUP` plus the group/tree sweep.
 * Keep the daemon single-binary and dependency-light; new deps need a
   justification in the PR.
 
@@ -119,7 +126,7 @@ A PR is ready for QA only when **all** of these are true:
 crates/ab-core/src/protocol.rs  wire types (single source of truth)
 crates/ab-core/src/daemon.rs    accept loop, request handling, attach streams
 crates/ab-core/src/agent.rs     PTY spawn, output pump, resize, kill
-crates/ab-core/src/reaper.rs    agent lifetime link (job object / PTY hangup)
+crates/ab-core/src/reaper.rs    agent lifetime + `kill --force` tree teardown
 crates/ab-core/src/transport.rs local socket / named pipe
 crates/ab-core/src/client.rs    blocking client used by CLI and UI
 crates/ab-cli/src/main.rs       command surface (clap)

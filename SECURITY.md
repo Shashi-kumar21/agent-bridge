@@ -50,13 +50,41 @@ You should receive a response within 72 hours.
   * If the OS refuses the link (for example a restricted job object on a locked
     down host), the daemon logs a warning and spawns the agent anyway; refusing
     to run a terminal would be worse than running it without the safety net.
+* `agent-bridge kill --force` tears the agent's process tree down while the
+  daemon stays up: Windows drops the job handle (the kernel terminates the job),
+  Unix sends `SIGKILL` to the agent's process group and then to every descendant
+  found in a `ps` snapshot taken just before the signals. While the direct
+  client is still running that also reaches the jobs an interactive shell moved
+  into their own process group and children that called `setsid`. Once the
+  client has exited the snapshot is skipped (its pid may name an unrelated tree
+  by then), so only processes that stayed in the agent's process group are
+  reached - a job-control background job survives in that case (see the known
+  gaps). `kill` without `--force` still tries Ctrl-C first and then only
+  terminates the PTY client, so children of a stubborn agent survive that path
+  by design.
 
 ## Known gaps (tracked, not yet implemented)
 
-* Unix descendants that leave the PTY's foreground process group (background
-  jobs, `setsid`, `nohup`) can outlive a daemon kill. Only the Windows job
-  object covers the whole tree; `crates/ab-cli/tests/orphan_teardown.rs`
-  exercises the full-tree case on Windows and the `SIGHUP` case on Unix.
+* Unix job-control job after the client exited: `kill --force` only snapshots
+  the tree while the direct client is still running, so a background job that
+  shell job control moved into its own process group survives once the client
+  has exited. Reaping it needs a supervisor or a tracked child list, not a `ps`
+  snapshot.
+* Unix snapshot window: the tree comes from a `ps` snapshot, so a process forked
+  after it is not signalled, and a snapshotted pid that exits and is recycled
+  before the sweep can be signalled instead. Best-effort by design.
+* Unix `ps` unavailable or failing: `descendants()` logs a warning (with the
+  status and stderr) and the sweep is skipped, so only the process-group signal
+  runs.
+* Unix already-detached processes: a process that daemonized (double-fork,
+  reparented to init) before `kill --force` is not in the snapshot and survives.
+  Following it needs cgroups on Linux, or a supervisor / process-enumeration
+  mechanism elsewhere; the Windows job object is the only mechanism here that
+  keeps daemonized children in the tree.
+* Unix daemon death: only the foreground process group gets `SIGHUP`, so a
+  job-control background job survives a daemon crash; `kill --force` reaps it
+  while the direct client is still running, but not after the client has exited.
+  Reaping on daemon death would need a supervisor outside the daemon.
 * Running agents are not re-adopted after a daemon restart.
 * No optional token handshake for shared machines.
 * Denial for a *different* OS user is not exercised by CI yet; only the

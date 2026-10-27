@@ -1,30 +1,44 @@
-//! Regression test: an agent tree must not outlive a daemon that is killed hard.
+//! Process-lifetime regression tests: an agent tree must follow its daemon and
+//! must disappear when it is killed on purpose.
 //!
-//! A `kill -9` (Unix) or Task Manager kill (Windows) never runs the daemon's
-//! shutdown path, so the guarantee has to come from the OS. This test starts a
-//! real daemon process and a real PTY agent, terminates the daemon without
-//! warning, and asserts that the agent (and, on Windows, a grandchild that
-//! escaped the pseudo console) is gone shortly afterwards.
+//! * `agent_dies_when_daemon_is_hard_killed` - a `kill -9` (Unix) or Task
+//!   Manager kill (Windows) never runs the daemon's shutdown path, so the
+//!   guarantee has to come from the OS. Why the grandchild matters: closing the
+//!   `ConPTY` already takes down the direct client, so the interesting orphan is
+//!   a process started in its own console. On Windows that is what the job
+//!   object in `ab_core::reaper` is for; on Unix the kernel sends `SIGHUP`
+//!   through the PTY and descendants that ignore the hangup can still survive,
+//!   which is documented in `SECURITY.md`.
+//! * `kill_force_reaps_descendants` - `agent-bridge kill --force` must take the
+//!   agent's process tree down and must not disturb the daemon. Scope differs by
+//!   platform: Windows reaps the whole job object (a grandchild in its own
+//!   console included); Unix kills the agent's process group and then the tree
+//!   it snapshotted, so the test forces job control (`set -m`) to put the
+//!   background job in a different group - only the tree sweep can reach it.
+//! * `kill_force_reaps_after_client_exit` - the same teardown must run when the
+//!   direct client has already exited and only its descendants are left; that
+//!   is the case `kill --force` used to skip by returning early on liveness.
 //!
-//! Why the grandchild matters: closing the `ConPTY` already takes down the
-//! direct client, so the interesting orphan is a process started in its own
-//! console. On Windows that is what the job object in `ab_core::reaper` is for.
-//! On Unix the kernel sends `SIGHUP` through the PTY, and descendants that
-//! ignore the hangup can still survive; that gap is documented in `SECURITY.md`.
+//! All tests start a real daemon process and a real PTY agent.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_bridge_core::client;
-use agent_bridge_core::protocol::{Request, Response};
+use agent_bridge_core::protocol::{AgentStatus, Request, Response};
 
-/// Time the OS gets to tear the agent tree down after the daemon disappears.
+/// Time the OS gets to tear an agent tree down.
 const DEATH_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// `AGENT_BRIDGE_HOME` / `AGENT_BRIDGE_PIPE` are process-wide, so the tests in
+/// this binary must not run at the same time.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 /// A shell that stays alive until it is killed.
-fn long_lived_command() -> Vec<String> {
+fn shell_command() -> Vec<String> {
     if cfg!(windows) {
         let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
         vec![shell]
@@ -68,16 +82,40 @@ fn start_daemon(home: &Path) -> DaemonProcess {
 
 /// Best-effort removal; Windows can hold the copied image for a moment.
 fn remove_home(home: &Path) {
+    // The detached grandchild runs a copy of ping.exe. Retry the image delete
+    // together with the directory removal: an AV scanner or a not-yet-released
+    // handle can make the first attempt fail.
     for _ in 0..20 {
+        if let Ok(entries) = std::fs::read_dir(home) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("ab-orphan-")
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         if std::fs::remove_dir_all(home).is_ok() {
             return;
         }
         thread::sleep(Duration::from_millis(100));
     }
-    eprintln!(
-        "warning: could not remove {}; it still holds daemon.log",
-        home.display()
-    );
+    eprintln!("warning: could not remove {}", home.display());
+}
+
+/// `kill --force` the `orphan` agent, dumping the daemon log if the request
+/// itself fails (a dead daemon or a panicking request handler).
+fn kill_force(home: &Path) -> Response {
+    let killed = client::request(&Request::Kill {
+        name: "orphan".to_string(),
+        force: Some(true),
+    });
+    match killed {
+        Ok(response) => response,
+        Err(err) => panic!("kill agent: {err}\n--- daemon.log ---\n{}", dump_log(home)),
+    }
 }
 
 /// Daemon log, or a readable placeholder - used in failure messages.
@@ -102,6 +140,19 @@ fn wait_until_ready(home: &Path) -> Response {
     }
 }
 
+fn spawn_agent(command: Vec<String>) -> u32 {
+    let created = client::request(&Request::New {
+        name: "orphan".to_string(),
+        command: Some(command),
+        cwd: None,
+        cols: None,
+        rows: None,
+    })
+    .expect("spawn agent");
+    assert!(matches!(created, Response::Agent { .. }), "got {created:?}");
+    agent_pid()
+}
+
 fn agent_pid() -> u32 {
     match client::request(&Request::List).expect("list agents") {
         Response::Agents { agents } => agents
@@ -113,7 +164,26 @@ fn agent_pid() -> u32 {
     }
 }
 
-#[cfg(windows)]
+/// Poll until the daemon reports the agent as exited.
+fn wait_for_exit(agent: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(Response::Agents { agents }) = client::request(&Request::List) {
+            if agents
+                .iter()
+                .any(|info| info.name == agent && matches!(info.status, AgentStatus::Exited))
+            {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agent '{agent}' should exit on its own"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn send(target: &str, message: &str) {
     let sent = client::request(&Request::Send {
         target: target.to_string(),
@@ -176,6 +246,41 @@ fn is_alive(pid: u32) -> bool {
     }
 }
 
+/// Poll the agent's output for a `<marker><pid>` number.
+#[cfg(unix)]
+fn read_pid(agent: &str, marker: &str) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(Response::Output { lines, .. }) = client::request(&Request::Read {
+            target: agent.to_string(),
+            lines: Some(80),
+        }) {
+            for line in &lines {
+                if let Some((_, rest)) = line.split_once(marker) {
+                    if let Ok(pid) = rest.trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("the agent never printed {marker}<pid>");
+}
+
+/// Process group id of `pid`, via `ps`.
+#[cfg(unix)]
+fn process_group(pid: u32) -> u32 {
+    let output = Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .expect("run ps");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("ps should report a pgid")
+}
+
 /// On Windows, start a detached grandchild (own console) inside the agent and
 /// return its pid. This is the process the job object has to reap.
 #[cfg(windows)]
@@ -228,8 +333,31 @@ impl Drop for Cleanup {
     }
 }
 
+/// Assert every pid dies within [`DEATH_TIMEOUT`], showing the daemon log when
+/// they do not.
+fn assert_all_dead(tracked: &[u32], home: &Path) {
+    let deadline = Instant::now() + DEATH_TIMEOUT;
+    loop {
+        let survivors: Vec<u32> = tracked
+            .iter()
+            .copied()
+            .filter(|pid| is_alive(*pid))
+            .collect();
+        if survivors.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "still running after {DEATH_TIMEOUT:?}: {survivors:?}\n--- daemon.log ---\n{}",
+            dump_log(home)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 fn agent_dies_when_daemon_is_hard_killed() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let home = isolate();
     let mut daemon = start_daemon(&home);
 
@@ -240,20 +368,14 @@ fn agent_dies_when_daemon_is_hard_killed() {
         panic!("expected a version response");
     };
 
-    let created = client::request(&Request::New {
-        name: "orphan".to_string(),
-        command: Some(long_lived_command()),
-        cwd: None,
-        cols: None,
-        rows: None,
-    })
-    .expect("spawn agent");
-    assert!(matches!(created, Response::Agent { .. }), "got {created:?}");
-
+    let agent = spawn_agent(shell_command());
+    // On Unix the daemon-death guarantee is the PTY hangup, which reaches the
+    // foreground group only - a background job would not be covered, so it is
+    // not tracked here (see SECURITY.md).
     #[cfg(windows)]
-    let tracked = vec![agent_pid(), spawn_detached_grandchild("orphan", &home)];
+    let tracked = vec![agent, spawn_detached_grandchild("orphan", &home)];
     #[cfg(unix)]
-    let tracked = vec![agent_pid()];
+    let tracked = vec![agent];
 
     let _cleanup = Cleanup(tracked.clone());
     for pid in &tracked {
@@ -267,23 +389,172 @@ fn agent_dies_when_daemon_is_hard_killed() {
     let _ = daemon.0.wait();
     assert!(!is_alive(daemon_pid), "the daemon should be gone");
 
-    let deadline = Instant::now() + DEATH_TIMEOUT;
-    loop {
-        let survivors: Vec<u32> = tracked
-            .iter()
-            .copied()
-            .filter(|pid| is_alive(*pid))
-            .collect();
-        if survivors.is_empty() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "survived their daemon for {DEATH_TIMEOUT:?}: {survivors:?}\n--- daemon.log ---\n{}",
-            dump_log(&home)
+    assert_all_dead(&tracked, &home);
+    drop(daemon);
+    remove_home(&home);
+}
+
+#[test]
+fn kill_force_reaps_descendants() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let home = isolate();
+    let daemon = start_daemon(&home);
+    wait_until_ready(&home);
+
+    // Windows: a grandchild in its own console (job object must reap it).
+    // Unix: an interactive shell with job control forced on, so `sleep 600 &`
+    // gets its own process group and only the tree sweep can reach it.
+    #[cfg(windows)]
+    let tracked = {
+        let agent = spawn_agent(shell_command());
+        vec![agent, spawn_detached_grandchild("orphan", &home)]
+    };
+    #[cfg(unix)]
+    let tracked = {
+        let agent = spawn_agent(shell_command());
+        assert_eq!(
+            process_group(agent),
+            agent,
+            "portable-pty should make the agent its own process group leader"
         );
-        thread::sleep(Duration::from_millis(100));
+        send("orphan", "set -m; sleep 600 & echo ORPHAN:$!");
+        let orphan = read_pid("orphan", "ORPHAN:");
+        assert_ne!(
+            process_group(orphan),
+            process_group(agent),
+            "job control should put the orphan in its own process group"
+        );
+        vec![agent, orphan]
+    };
+
+    let _cleanup = Cleanup(tracked.clone());
+    for pid in &tracked {
+        assert!(
+            is_alive(*pid),
+            "pid {pid} should be running before the kill"
+        );
     }
 
+    let killed = kill_force(&home);
+    assert!(matches!(killed, Response::Ok), "got {killed:?}");
+
+    assert_all_dead(&tracked, &home);
+    assert!(
+        client::is_running(),
+        "killing an agent must not take the daemon down"
+    );
+    drop(daemon);
+    remove_home(&home);
+}
+
+/// A force kill must still reach the tree after the direct client exited - the
+/// case where `kill --force` used to return early and leave descendants alive
+/// until the daemon stopped.
+///
+/// Unix covers the group half of that path only: the orphan stays in the
+/// agent's process group, so `killpg` reaches it without a snapshot. The
+/// job-control half (own process group) is a documented gap once the client has
+/// exited - see [`kill_force_leaves_job_control_job_after_client_exit`].
+#[test]
+fn kill_force_reaps_after_client_exit() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let home = isolate();
+    let daemon = start_daemon(&home);
+    wait_until_ready(&home);
+
+    // Windows: the shell exits, the detached grandchild (own console) stays in
+    // the job object.
+    #[cfg(windows)]
+    let (agent, orphan) = {
+        let agent = spawn_agent(shell_command());
+        let orphan = spawn_detached_grandchild("orphan", &home);
+        send("orphan", "exit");
+        (agent, orphan)
+    };
+    // Unix: the shell exits, the background job ignores SIGHUP (so the kernel's
+    // session-leader hangup does not take it down) and stays in the agent's
+    // process group, where only `killpg` can reach it. The trap is installed in
+    // the parent *before* the fork: setting it inside the subshell loses a race
+    // against the SIGHUP the kernel sends when the leader exits.
+    #[cfg(unix)]
+    let (agent, orphan) = {
+        let agent = spawn_agent(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "trap '' HUP; (exec sleep 600) & echo ORPHAN:$!; exit 0".to_string(),
+        ]);
+        (agent, read_pid("orphan", "ORPHAN:"))
+    };
+
+    let _cleanup = Cleanup(vec![agent, orphan]);
+    assert!(
+        is_alive(orphan),
+        "the orphan should be running before the kill"
+    );
+
+    wait_for_exit("orphan");
+    assert!(!is_alive(agent), "the direct client should be gone");
+
+    let killed = kill_force(&home);
+    assert!(matches!(killed, Response::Ok), "got {killed:?}");
+
+    assert_all_dead(&[orphan], &home);
+    assert!(
+        client::is_running(),
+        "killing an agent must not take the daemon down"
+    );
+    drop(daemon);
+    remove_home(&home);
+}
+
+/// Pins the documented Unix limitation (`SECURITY.md`, "job-control job after
+/// the client exited"): `kill --force` only snapshots the tree while the direct
+/// client is alive, so a background job that job control moved into its own
+/// process group survives once the client has exited. If this test ever starts
+/// failing because the job died, the limitation is gone - update `SECURITY.md`,
+/// `AGENTS.md` and the help text with it instead of deleting the test.
+#[cfg(unix)]
+#[test]
+fn kill_force_leaves_job_control_job_after_client_exit() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let home = isolate();
+    let daemon = start_daemon(&home);
+    wait_until_ready(&home);
+
+    let agent = spawn_agent(shell_command());
+    send("orphan", "set -m; sleep 600 & echo ORPHAN:$!");
+    let orphan = read_pid("orphan", "ORPHAN:");
+    assert_eq!(
+        process_group(agent),
+        agent,
+        "portable-pty should make the agent its own process group leader"
+    );
+    assert_ne!(
+        process_group(orphan),
+        process_group(agent),
+        "job control should put the orphan in its own process group"
+    );
+
+    let _cleanup = Cleanup(vec![agent, orphan]);
+    send("orphan", "exit");
+    wait_for_exit("orphan");
+    assert!(!is_alive(agent), "the direct client should be gone");
+
+    let killed = kill_force(&home);
+    assert!(matches!(killed, Response::Ok), "got {killed:?}");
+    assert!(
+        client::is_running(),
+        "killing an agent must not take the daemon down"
+    );
+    // Give the group signal and any PTY hangup a chance to land before the
+    // assertion: this is the documented gap, not a race in the test.
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        is_alive(orphan),
+        "the documented gap changed: a job-control job was reaped after the \
+         client exited - update SECURITY.md/AGENTS.md/help and this test"
+    );
+
+    drop(daemon);
     remove_home(&home);
 }
