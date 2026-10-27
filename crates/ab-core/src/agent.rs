@@ -417,9 +417,13 @@ impl Agent {
     /// fallback has been tried (or immediately when the client is already
     /// gone), so a script is not told the tree died when it did not.
     fn kill_tree(&self) -> Result<()> {
-        // Read the liveness flag before taking the reaper: on Unix a force kill
+        // Read the liveness state before taking the reaper: on Unix a force kill
         // after the leader exited must not signal a recycled process group.
-        let leader_alive = self.is_running();
+        let leader = if self.is_running() {
+            reaper::LeaderState::Alive
+        } else {
+            reaper::LeaderState::Exited
+        };
         let reaper = self
             .reaper
             .lock()
@@ -439,7 +443,7 @@ impl Agent {
             return Ok(());
         };
 
-        let tree_error = match reaper.terminate(leader_alive) {
+        let tree_error = match reaper.terminate(leader) {
             Ok(()) => None,
             Err(err) => {
                 warn!(agent = %self.name, error = %err, "could not terminate the agent tree");

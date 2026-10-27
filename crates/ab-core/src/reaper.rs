@@ -39,6 +39,18 @@ pub struct ProcessReaper {
     pid: Option<u32>,
 }
 
+/// The caller's last observation of the agent's direct client.
+///
+/// A `bool` reads the same at both call sites; this enum makes the hazard
+/// explicit: once the leader is gone its pid may already name a stranger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaderState {
+    /// The client was still running when the caller checked.
+    Alive,
+    /// The client had exited (or could no longer be reaped by this process).
+    Exited,
+}
+
 impl ProcessReaper {
     /// Kill the agent and the descendants it still owns.
     ///
@@ -53,20 +65,20 @@ impl ProcessReaper {
     ///   `setsid`). A process that had already left the tree is *not* reached -
     ///   see `SECURITY.md`.
     ///
-    /// `leader_alive` is the caller's last liveness observation. On Unix it
-    /// narrows the pid-reuse hazard: once the leader is gone its pid may have
-    /// been recycled into an unrelated process group, so the group signal is
-    /// skipped when a process owns that number again, and the descendant walk
-    /// is skipped entirely (its root would be a stranger). This is best-effort,
-    /// not a proof (the probe and the signals are not atomic); a complete fix
-    /// needs `pidfd` or process enumeration.
+    /// `leader` is the caller's last liveness observation. On Unix it narrows
+    /// the pid-reuse hazard: once the leader is gone its pid may have been
+    /// recycled into an unrelated process group, so the group signal is skipped
+    /// when a process owns that number again, and the descendant walk is skipped
+    /// entirely (its root would be a stranger). This is best-effort, not a proof
+    /// (the probe and the signals are not atomic); a complete fix needs `pidfd`
+    /// or process enumeration.
     ///
     /// Consumes the reaper: once the tree is gone there is nothing left to
     /// guard. Returns an error only when the signal could not be delivered.
-    pub fn terminate(self, leader_alive: bool) -> Result<()> {
+    pub fn terminate(self, leader: LeaderState) -> Result<()> {
         #[cfg(windows)]
         {
-            let _ = leader_alive;
+            let _ = leader;
             drop(self);
             Ok(())
         }
@@ -90,7 +102,7 @@ impl ProcessReaper {
             // can reuse the id after its own leader exits, and the probe ->
             // killpg window is not atomic. `Ok`/`EPERM` means a process owns the
             // number, so skip. A complete fix needs pidfd or enumeration.
-            if !leader_alive
+            if leader == LeaderState::Exited
                 && !matches!(
                     rustix::process::test_kill_process(group),
                     Err(rustix::io::Errno::SRCH)
@@ -101,7 +113,7 @@ impl ProcessReaper {
             // Snapshot the tree before signalling: once the agent dies its
             // children are reparented and can no longer be found. Skipped when
             // the leader is gone - its pid may name an unrelated tree by now.
-            let descendants = if leader_alive {
+            let descendants = if leader == LeaderState::Alive {
                 descendants(pid)
             } else {
                 Vec::new()
