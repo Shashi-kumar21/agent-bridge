@@ -89,7 +89,8 @@ enum Command {
         /// Agent name.
         name: String,
         /// Skip Ctrl-C and kill the agent's process tree immediately
-        /// (Windows: whole job; Unix: process group).
+        /// (Windows: whole job; Unix: process group + best-effort tree
+        /// snapshot).
         #[arg(long)]
         force: bool,
     },

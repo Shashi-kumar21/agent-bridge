@@ -107,14 +107,16 @@ A PR is ready for QA only when **all** of these are true:
   (`win32job`, a safe wrapper - required because `unsafe_code = "forbid"`);
   closing the ConPTY only reaps the direct client, not grandchildren that
   opened their own console. On Unix the PTY hangup covers daemon death and
-  `ProcessReaper::terminate` signals the agent's process group (`rustix`);
-  jobs that shell job control or `setsid` moved out of that group are a known
-  gap (see `SECURITY.md`).
+  `ProcessReaper::terminate` signals the agent's process group and then the
+  descendants in a `ps` snapshot taken first, so job-control jobs are reaped
+  too - but only while the direct client is alive; a job left behind after the
+  client exited, or a process that already detached (daemonized), is a known gap
+  (see `SECURITY.md`).
   `kill --force` tears the tree down through the same hook - do not replace it
   with a bare `child.kill()`, and do not replace the crates with raw FFI. Keep
   `crates/ab-cli/tests/orphan_teardown.rs` green: on Windows all three tests
   fail if the job object stops working (including the exited-client case), on
-  Unix they cover `SIGHUP` plus the process group.
+  Unix they cover `SIGHUP` plus the group/tree sweep.
 * Keep the daemon single-binary and dependency-light; new deps need a
   justification in the PR.
 
