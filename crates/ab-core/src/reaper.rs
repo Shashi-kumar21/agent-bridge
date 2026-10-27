@@ -51,10 +51,11 @@ impl ProcessReaper {
     ///   `SECURITY.md`.
     ///
     /// `leader_alive` is the caller's last liveness observation. On Unix it
-    /// guards against pid reuse: once the leader is gone its pid may have been
-    /// recycled into an unrelated process group, and signalling that group
-    /// would be destructive. A live process group keeps its pgid allocated, so
-    /// a *free* pid can only name the agent's own orphaned group.
+    /// narrows the pid-reuse hazard: once the leader is gone its pid may have
+    /// been recycled into an unrelated process group, so the group signal is
+    /// skipped when a process owns that number again. This is best-effort, not
+    /// a proof (the probe and `killpg` are not atomic); a complete fix needs
+    /// `pidfd` or process enumeration.
     ///
     /// Consumes the reaper: once the tree is gone there is nothing left to
     /// guard. Returns an error only when the signal could not be delivered.
@@ -79,15 +80,12 @@ impl ProcessReaper {
             // also its process group id.
             //
             // If the leader is gone the id may have been recycled. On Linux a
-            // pid number stays allocated while a process group references it
-            // (`struct pid` refcount), so `ESRCH` means the agent's own
-            // orphaned group (or nothing) and is safe to signal. `Ok`/`EPERM`
-            // means some process owns the number again, so the agent's group is
-            // gone and the id now belongs to someone else. macOS does not
-            // document that guarantee, so the guard is deliberately
-            // conservative there: it can miss an orphan in the microseconds
-            // between the probe and `killpg`, but never signals an unrelated
-            // group.
+            // pid number stays allocated while the agent's own group references
+            // it, so `ESRCH` usually means that orphaned group (or nothing).
+            // That narrows the hazard but does not prove it: an unrelated group
+            // can reuse the id after its own leader exits, and the probe ->
+            // killpg window is not atomic. `Ok`/`EPERM` means a process owns the
+            // number, so skip. A complete fix needs pidfd or enumeration.
             if !leader_alive
                 && !matches!(
                     rustix::process::test_kill_process(group),
