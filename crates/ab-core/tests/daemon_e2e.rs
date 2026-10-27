@@ -52,6 +52,31 @@ fn start_daemon() -> (thread::JoinHandle<()>, PathBuf) {
     (running, home)
 }
 
+/// First contact with a freshly started daemon.
+///
+/// `start_daemon` returns after the listener is bound, but `macos-latest` has
+/// twice failed the very first `Ping` and passed on a rerun. Retry briefly and
+/// carry the last error into the panic, so a real regression is still visible
+/// instead of being retried away.
+///
+/// The deadline bounds the *retries*, not one call: `client::request` has no
+/// read timeout, so an accepted connection that never answers would block here
+/// instead of hitting the deadline. That mode has not been seen (the flake
+/// returned an error), but it is why this is not a general timeout.
+fn wait_for_ping() {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match client::request(&Request::Ping) {
+            Ok(Response::Pong) => return,
+            other => assert!(
+                Instant::now() < deadline,
+                "the daemon never answered the first ping: {other:?}"
+            ),
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn send_message(target: &str, message: &str) {
     let sent = client::request(&Request::Send {
         target: target.to_string(),
@@ -161,10 +186,7 @@ fn shutdown(running: thread::JoinHandle<()>, home: &std::path::Path) {
 fn daemon_lists_sends_and_reads() {
     let (running, home) = start_daemon();
 
-    assert!(matches!(
-        client::request(&Request::Ping).expect("ping"),
-        Response::Pong
-    ));
+    wait_for_ping();
 
     assert_create_rules();
     send_message("e2e", "bridge-ping");
