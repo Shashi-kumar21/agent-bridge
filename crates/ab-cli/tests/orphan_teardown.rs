@@ -47,14 +47,37 @@ fn shell_command() -> Vec<String> {
     }
 }
 
-/// Point this process (and therefore the spawned daemon) at a private socket.
-fn isolate() -> PathBuf {
-    let stamp = agent_bridge_core::now_ms();
-    let home = std::env::temp_dir().join(format!("agent-bridge-orphan-{stamp}"));
-    std::fs::create_dir_all(&home).expect("create temp home");
-    std::env::set_var("AGENT_BRIDGE_HOME", &home);
-    std::env::set_var("AGENT_BRIDGE_PIPE", format!("agent-bridge-orphan-{stamp}"));
-    home
+/// Private socket + log directory for one test.
+///
+/// The `Drop` impl removes it, so a failing assertion (or a panicking helper)
+/// does not leave a temp home, a socket or the copied `ping.exe` behind.
+struct TempHome(PathBuf);
+
+impl TempHome {
+    /// Point this process (and therefore the spawned daemon) at a private
+    /// socket and return the guard that owns the directory.
+    fn new() -> Self {
+        let stamp = agent_bridge_core::now_ms();
+        let home = std::env::temp_dir().join(format!("agent-bridge-orphan-{stamp}"));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        std::env::set_var("AGENT_BRIDGE_HOME", &home);
+        std::env::set_var("AGENT_BRIDGE_PIPE", format!("agent-bridge-orphan-{stamp}"));
+        Self(home)
+    }
+}
+
+impl std::ops::Deref for TempHome {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempHome {
+    fn drop(&mut self) {
+        remove_home(&self.0);
+    }
 }
 
 /// Daemon under test. Owning the child means a failed assertion still tears it
@@ -358,7 +381,7 @@ fn assert_all_dead(tracked: &[u32], home: &Path) {
 #[test]
 fn agent_dies_when_daemon_is_hard_killed() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let home = isolate();
+    let home = TempHome::new();
     let mut daemon = start_daemon(&home);
 
     let Response::Version {
@@ -391,13 +414,12 @@ fn agent_dies_when_daemon_is_hard_killed() {
 
     assert_all_dead(&tracked, &home);
     drop(daemon);
-    remove_home(&home);
 }
 
 #[test]
 fn kill_force_reaps_descendants() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let home = isolate();
+    let home = TempHome::new();
     let daemon = start_daemon(&home);
     wait_until_ready(&home);
 
@@ -444,7 +466,6 @@ fn kill_force_reaps_descendants() {
         "killing an agent must not take the daemon down"
     );
     drop(daemon);
-    remove_home(&home);
 }
 
 /// A force kill must still reach the tree after the direct client exited - the
@@ -458,7 +479,7 @@ fn kill_force_reaps_descendants() {
 #[test]
 fn kill_force_reaps_after_client_exit() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let home = isolate();
+    let home = TempHome::new();
     let daemon = start_daemon(&home);
     wait_until_ready(&home);
 
@@ -504,7 +525,6 @@ fn kill_force_reaps_after_client_exit() {
         "killing an agent must not take the daemon down"
     );
     drop(daemon);
-    remove_home(&home);
 }
 
 /// Pins the documented Unix limitation (`SECURITY.md`, "job-control job after
@@ -517,7 +537,7 @@ fn kill_force_reaps_after_client_exit() {
 #[test]
 fn kill_force_leaves_job_control_job_after_client_exit() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let home = isolate();
+    let home = TempHome::new();
     let daemon = start_daemon(&home);
     wait_until_ready(&home);
 
@@ -556,5 +576,4 @@ fn kill_force_leaves_job_control_job_after_client_exit() {
     );
 
     drop(daemon);
-    remove_home(&home);
 }
