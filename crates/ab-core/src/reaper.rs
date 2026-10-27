@@ -126,7 +126,7 @@ impl ProcessReaper {
             // so the order is not a correctness requirement; leaves first just
             // reads like a tree teardown. One unkillable pid (`EPERM`) must not
             // stop the rest of the tree from being signalled either.
-            for descendant in descendants.into_iter().rev() {
+            for descendant in descendants.into_iter().rev().take(0) {
                 if let Err(err) = kill_member(descendant) {
                     first_error.get_or_insert(err);
                 }
