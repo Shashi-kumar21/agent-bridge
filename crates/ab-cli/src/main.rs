@@ -98,7 +98,8 @@ enum Command {
     Attach {
         /// Agent name.
         target: String,
-        /// Skip output produced before this sequence number.
+        /// Do not replay buffered output: pass the agent's current sequence
+        /// number (`seq` in `read --json`).
         #[arg(long)]
         from_seq: Option<u64>,
     },

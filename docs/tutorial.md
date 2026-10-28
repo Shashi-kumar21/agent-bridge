@@ -5,7 +5,8 @@ couple of agent terminals, and make them talk to each other - on Windows, macOS
 or Linux, without `tmux`.
 
 Everything below is copy-pasteable. Commands are shown for both shells where
-they differ (`cmd`/PowerShell on Windows, `bash`/`zsh` on macOS and Linux).
+they differ (`cmd`/PowerShell on Windows, `bash`/`zsh` on macOS and Linux), and
+the example paths are placeholders - swap the separators for your OS.
 
 ## 1. The mental model
 
@@ -25,8 +26,9 @@ Two consequences worth knowing up front:
 
 * The daemon must be running. Commands start it automatically, but it is a
   separate background process; stop it with `agent-bridge daemon stop`.
-* Agents die with the daemon. That is deliberate: no orphaned terminals after a
-  crash (see [SECURITY.md](../SECURITY.md)).
+* Agents die with the daemon. That is deliberate: no orphaned **foreground**
+  terminals after a crash (see [SECURITY.md](../SECURITY.md) for the remaining
+  gaps, such as a job-control background job on Unix).
 
 ## 2. Install
 
@@ -57,7 +59,7 @@ protocol : 1
 daemon   : 0.1.1
 pid      : 11228
 teardown : windows job object (kill on job close)
-socket   : \\.\pipe\agent-bridge-shash
+socket   : \\.\pipe\agent-bridge-<user>
 uptime   : 28s ago
 ```
 
@@ -91,13 +93,13 @@ editor.
 
 ```bash
 # a plain shell (cmd.exe on Windows, $SHELL or /bin/sh on Unix)
-agent-bridge new shell
+agent-bridge new tutorial-demo
 
-# a real agent, with a working directory
+# a real agent, with a working directory (Windows)
 agent-bridge new claude --cwd C:\work\project -- claude
 
-# anything else, exactly as you would type it
-agent-bridge new tests --cwd C:\work\project -- cargo watch -x test
+# the same on macOS/Linux
+agent-bridge new tests --cwd ~/work/project -- cargo watch -x test
 ```
 
 Rules of the road:
@@ -119,12 +121,15 @@ id         : 1a181fa5fa9-1
 status     : running
 pid        : 17240
 command    : cmd.exe
-cwd        : C:\Users\shash\agent-bridge
+cwd        : C:\work\agent-bridge
 size       : 120x32
 created    : now
 messages   : 0
 subscribers: 0
 ```
+
+`cwd` is the daemon's working directory here because `new` was called without
+`--cwd`; pass `--cwd` to start the agent somewhere else.
 
 ## 5. See what is running
 
@@ -135,7 +140,7 @@ agent-bridge listagents
 ```
 NAME           STATUS   PID    MSGS  LAST OUTPUT  COMMAND
 -----------------------------------------------------------
-tutorial-demo  running  17240  1     2s ago       cmd.exe
+tutorial-demo  running  17240  0     now          cmd.exe
 ```
 
 * `STATUS` is `running` or `exited` (the daemon keeps the last known state).
@@ -159,12 +164,12 @@ agent-bridge --json listagents
       "status": "running",
       "pid": 17240,
       "command": "cmd.exe",
-      "cwd": "C:\\Users\\shash\\agent-bridge",
+      "cwd": "C:\\work\\agent-bridge",
       "created_at": 1793182031795,
       "last_output_at": 1793182034009,
       "exited_at": null,
       "exit_code": null,
-      "message_count": 1,
+      "message_count": 0,
       "subscribers": 0,
       "cols": 120,
       "rows": 32
@@ -179,12 +184,12 @@ agent-bridge --json listagents
 if a human had typed it.
 
 ```bash
-agent-bridge sendmessage dev "run the test suite and report back"
+agent-bridge sendmessage tutorial-demo "echo hello from agent-bridge"
 agent-bridge sendmessage claude --from dev "tests are green, please review PR #4"
 ```
 
 ```
-sent 29 bytes to dev
+sent 29 bytes to tutorial-demo
 ```
 
 * `--from <label>` is only recorded in the message log; the target sees the text.
@@ -208,7 +213,7 @@ agent-bridge log --limit 200
 
 ```
 2s ago  owner -> tutorial-demo: echo hello from agent-bridge
-1s ago  dev -> qa: tests are green, please review PR #4
+1s ago  dev -> claude: tests are green, please review PR #4
 ```
 
 Messages sent without `--from` are attributed to `owner`.
@@ -219,24 +224,28 @@ Messages sent without `--from` are attributed to `owner`.
 safe to grep and paste:
 
 ```bash
-agent-bridge read dev --lines 60      # default is 40
+agent-bridge read tutorial-demo --lines 10      # default is 40
 ```
 
 If the buffer has rotated, the output starts with
-`--- dev (older output rotated out) ---`.
+`--- tutorial-demo (older output rotated out) ---`.
 
 `attach` is the interactive version: it mirrors the terminal and forwards your
 keystrokes, so you can drive the agent by hand.
 
 ```bash
-agent-bridge attach dev
+agent-bridge attach tutorial-demo
 # ... work in the terminal ...
 # Ctrl-] to detach (the agent keeps running)
 ```
 
-`--from-seq <n>` skips output produced before sequence number `n`, which is
-useful when you only want what happens next. `attach` is interactive and has no
-`--json` mode.
+`--from-seq <n>` controls the initial replay, it does not trim it: if `n` is at
+or above the agent's current sequence number (the `seq` field from
+`agent-bridge --json read`), the buffered output is not replayed at all, so you
+only see output produced from now on. With a lower `n` the **whole** retained
+buffer is replayed, and frames whose sequence is at or below `n` are dropped.
+
+`attach` is interactive and has no `--json` mode.
 
 ## 8. Stop an agent
 
@@ -270,9 +279,12 @@ This is the workflow the project exists for. Terminal 1 runs the developer
 agent, terminal 2 the reviewer; you drive both from a third terminal.
 
 ```bash
-# 1. two agents, each in its own repo checkout
-agent-bridge new dev --cwd C:\work\agent-bridge -- opencode
-agent-bridge new qa  --cwd C:\work\agent-bridge -- opencode
+# 1. two agents, each in its own checkout - one tree for both would make
+#    them fight over the index and HEAD (assumes the repo is at
+#    C:\work\agent-bridge)
+git worktree add ..\agent-bridge-qa -b qa-review origin/dev
+agent-bridge new dev --cwd C:\work\agent-bridge    -- opencode
+agent-bridge new qa  --cwd C:\work\agent-bridge-qa -- opencode
 
 # 2. ask the developer to push a branch and open a PR
 agent-bridge sendmessage dev "implement the resize race fix, push a branch, open a PR into dev"
@@ -300,8 +312,9 @@ terminal, window or OS - it only needs a name and a message.
 
 ## 10. Scripting with `--json`
 
-Every command except `attach` accepts the global `--json` flag and prints the
-raw protocol response. Examples with `jq`:
+Every command except `attach`, `daemon stop`, `daemon run` and `daemon status`
+while the daemon is down accepts the global `--json` flag and prints the raw
+protocol response. Examples with `jq`:
 
 ```bash
 # names of running agents
@@ -326,11 +339,28 @@ scripts without parsing human-readable output.
 | Item | Location / value |
 | --- | --- |
 | State directory | `~/.agent-bridge` (`%USERPROFILE%\.agent-bridge` on Windows) |
-| Override state directory | `AGENT_BRIDGE_HOME=/some/dir` |
+| Override state directory | `AGENT_BRIDGE_HOME` (any directory) |
 | Daemon log | `<state>/daemon.log` (written when the daemon is started in the background) |
 | Socket (Unix) | `<state>/daemon.sock`, directory `0700`, socket `0600` |
-| Socket (Windows) | `\\.\pipe\agent-bridge-<user>`, owner-only DACL |
+| Socket (Windows) | `\\.\pipe\agent-bridge-<user>`, DACL for the owner, `SYSTEM` and Administrators |
 | Agent name inside the child | `AGENT_BRIDGE_AGENT` |
+
+`AGENT_BRIDGE_HOME` is an environment variable, so export it the way your shell
+does. Set it **before** the daemon starts: the daemon inherits the value, and a
+CLI pointed at a different directory will start a second daemon on a different
+socket (on Windows the pipe name comes from the user name, so the running daemon
+keeps answering there).
+
+```bash
+# bash / zsh
+export AGENT_BRIDGE_HOME=/tmp/ab-state
+
+# cmd.exe
+set AGENT_BRIDGE_HOME=C:\work\ab-state
+
+# PowerShell
+$env:AGENT_BRIDGE_HOME = "C:\work\ab-state"
+```
 
 The state directory is created on first use and is private to your OS user. On
 Unix the socket is owner-only; on Windows the named pipe is created with an
@@ -344,16 +374,21 @@ created in this daemon. `agent-bridge listagents` shows the exact names.
 **`agent '<name>' already exists`** - the daemon still remembers an agent with
 that name, even if it has exited. Exited entries are kept for their output and
 log until the daemon restarts, so either pick another name or
-`agent-bridge daemon restart` (which also terminates every live agent).
+`agent-bridge daemon restart` (which also terminates every live agent). There is
+no per-agent removal yet; that is tracked in
+[issue #24](https://github.com/Shashi-kumar21/agent-bridge/issues/24).
 
 **`daemon did not become ready; see ...daemon.log`** - the daemon failed to
 start. The log has the reason; common causes are a stale socket from a killed
 process, a full disk, or antivirus holding the binary.
 
-**`daemon protocol N does not match client M`** - the CLI and the running daemon
-come from different versions. If no agents are live, the CLI restarts the daemon
-itself. If agents are live it refuses, because restarting would kill them; run
-`agent-bridge daemon restart` when you are ready to lose those sessions.
+**`daemon protocol N does not match client M, and K agent session(s) are still
+managed by it`** - the CLI and the running daemon come from different versions.
+The CLI restarts the daemon itself only when it manages **no** agent sessions at
+all; exited entries count too, because `listagents` is never pruned (only a new
+daemon clears them - a restart is the convenient way). Otherwise it refuses, because a restart would kill any
+live agents and discard the exited entries' output; run
+`agent-bridge daemon restart` when you are ready for that.
 
 **Nothing appears in `read`** - the program has not printed anything yet, or it
 is waiting for input. Use `attach` to see the screen and type into it.
@@ -365,7 +400,9 @@ wedged), then install again.
 
 **Everything died when the daemon stopped** - expected. Agents are tied to the
 daemon's lifetime on purpose; the job object (Windows) and the PTY hangup (Unix)
-make sure nothing is left behind after a crash.
+make sure no foreground terminal is left behind after a crash. Background
+job-control jobs on Unix are a documented exception, as are processes that
+detached themselves - see [SECURITY.md](../SECURITY.md).
 
 ## 13. Cheat sheet
 
@@ -380,7 +417,7 @@ make sure nothing is left behind after a crash.
 | Kill it politely / immediately | `agent-bridge kill <name>` / `--force` |
 | Message history | `agent-bridge log --limit 200` |
 | Health and versions | `agent-bridge ping` / `agent-bridge version` |
-| Machine-readable output | add `--json` to any command except `attach` |
+| Machine-readable output | add `--json` (every command except `attach`, `daemon stop`/`run`, and `daemon status` while down) |
 
 ## 14. Where next
 
