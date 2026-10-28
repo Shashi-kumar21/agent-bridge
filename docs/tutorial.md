@@ -213,6 +213,7 @@ agent-bridge log --limit 200
 
 ```
 2s ago  owner -> tutorial-demo: echo hello from agent-bridge
+1s ago  dev -> claude: tests are green, please review PR #4
 ```
 
 Messages sent without `--from` are attributed to `owner`.
@@ -281,7 +282,7 @@ agent, terminal 2 the reviewer; you drive both from a third terminal.
 # 1. two agents, each in its own checkout - one tree for both would make
 #    them fight over the index and HEAD (assumes the repo is at
 #    C:\work\agent-bridge)
-git worktree add ..\agent-bridge-qa -b qa-review dev
+git worktree add ..\agent-bridge-qa -b qa-review origin/dev
 agent-bridge new dev --cwd C:\work\agent-bridge    -- opencode
 agent-bridge new qa  --cwd C:\work\agent-bridge-qa -- opencode
 
@@ -345,7 +346,10 @@ scripts without parsing human-readable output.
 | Agent name inside the child | `AGENT_BRIDGE_AGENT` |
 
 `AGENT_BRIDGE_HOME` is an environment variable, so export it the way your shell
-does:
+does. Set it **before** the daemon starts: the daemon inherits the value, and a
+CLI pointed at a different directory will start a second daemon on a different
+socket (on Windows the pipe name comes from the user name, so the running daemon
+keeps answering there).
 
 ```bash
 # bash / zsh
@@ -381,8 +385,8 @@ process, a full disk, or antivirus holding the binary.
 **`daemon protocol N does not match client M, and K agent session(s) are still
 managed by it`** - the CLI and the running daemon come from different versions.
 The CLI restarts the daemon itself only when it manages **no** agent sessions at
-all; exited entries count too, because `listagents` is never pruned (only a
-restart clears them). Otherwise it refuses, because a restart would kill any
+all; exited entries count too, because `listagents` is never pruned (only a new
+daemon clears them - a restart is the convenient way). Otherwise it refuses, because a restart would kill any
 live agents and discard the exited entries' output; run
 `agent-bridge daemon restart` when you are ready for that.
 
@@ -413,7 +417,7 @@ detached themselves - see [SECURITY.md](../SECURITY.md).
 | Kill it politely / immediately | `agent-bridge kill <name>` / `--force` |
 | Message history | `agent-bridge log --limit 200` |
 | Health and versions | `agent-bridge ping` / `agent-bridge version` |
-| Machine-readable output | add `--json` (every command except `attach` and `daemon stop`/`run`) |
+| Machine-readable output | add `--json` (every command except `attach`, `daemon stop`/`run`, and `daemon status` while down) |
 
 ## 14. Where next
 

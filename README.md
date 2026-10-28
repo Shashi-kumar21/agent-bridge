@@ -85,7 +85,8 @@ Newline-delimited JSON over a local socket:
 
 * Unix: `~/.agent-bridge/daemon.sock` (filesystem socket, dir `0700` / socket
   `0600`)
-* Windows: `\\.\pipe\agent-bridge-<user>` (named pipe with an owner-only DACL)
+* Windows: `\\.\pipe\agent-bridge-<user>` (named pipe with a DACL for
+  the owner, `SYSTEM` and Administrators)
 
 Requests are tagged (`{"cmd":"send", ...}`), responses are tagged
 (`{"kind":"sent", ...}`) and `attach` streams `{"event":"output", ...}` frames
