@@ -109,7 +109,12 @@ impl Agent {
         let pid = child.process_id();
         // Must happen right after spawn: assign the agent to a job object so the
         // kernel kills it if the daemon dies without running its shutdown path.
+        #[cfg(windows)]
         let process_reaper = reaper::install(child.as_ref());
+        // The PTY slave is read from the child's stdin while it is still alive:
+        // on Linux it is the only anchor that survives the client's exit.
+        #[cfg(unix)]
+        let process_reaper = reaper::install(child.as_ref(), reaper::pty_path(pid).as_deref());
         let master = pair.master;
         let writer = master.take_writer()?;
         let reader = master.try_clone_reader()?;
