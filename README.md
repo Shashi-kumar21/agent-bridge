@@ -25,6 +25,13 @@ Unix-only. `agent-bridge` owns the terminals itself through a PTY
 (`ConPTY` on Windows, `openpty` on Unix) via [`portable-pty`], and exposes a
 single local-socket protocol. One implementation, three operating systems.
 
+## Tutorial
+
+New here? **[Tutorial to use](docs/tutorial.md)** walks through install, the
+daemon, spawning agents, messaging between terminals, `read`/`attach`/`kill`,
+scripting with `--json` and troubleshooting - with copy-pasteable commands for
+Windows, macOS and Linux.
+
 ## Install
 
 ```bash
