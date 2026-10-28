@@ -16,10 +16,12 @@
 //!   group. [`ProcessReaper::terminate`] additionally `SIGKILL`s the agent's
 //!   process group and the descendants it finds in a snapshot taken first, which
 //!   covers the jobs an interactive shell moved into their own process group -
-//!   but only while the client is still alive. A process that daemonized before
-//!   the snapshot, or a job-control job left behind after the client exited, is
-//!   not reached; daemon death only reaches the foreground group. All of that is
-//!   documented in `SECURITY.md`.
+//!   but only while the client is still alive. On Linux the PTY slave is also
+//!   swept through `/proc/<pid>/fd`, which keeps reaching the tree after the
+//!   client has exited (the slave number cannot be reused while the daemon holds
+//!   the master). A process that daemonized and closed the terminal, and the
+//!   same post-exit case on macOS, is not reached; daemon death only reaches the
+//!   foreground group. All of that is documented in `SECURITY.md`.
 
 use portable_pty::Child;
 
@@ -37,6 +39,15 @@ pub struct ProcessReaper {
     _job: win32job::Job,
     #[cfg(unix)]
     pid: Option<u32>,
+    /// Slave device of the agent's PTY (for example `/dev/pts/3`), captured
+    /// while the direct client is still alive.
+    ///
+    /// Linux only: it is the anchor for the post-exit sweep. Once the client is
+    /// gone its pid, process group, session and controlling terminal can all be
+    /// reused or disassociated, while the slave number cannot be reused as long
+    /// as this process holds the master.
+    #[cfg(target_os = "linux")]
+    pty: Option<String>,
 }
 
 /// The caller's last observation of the agent's direct client.
@@ -62,8 +73,10 @@ impl ProcessReaper {
     ///   is a session leader, so the group signal reaches the agent and the
     ///   processes that stayed in its group; the snapshot adds the jobs an
     ///   interactive shell moved into their own group (and children that called
-    ///   `setsid`). A process that had already left the tree is *not* reached -
-    ///   see `SECURITY.md`.
+    ///   `setsid`). On Linux a third pass kills every process that still holds
+    ///   the agent's PTY slave open, which is the only anchor left once the
+    ///   client has exited. A process that had already left the tree is *not*
+    ///   reached - see `SECURITY.md`.
     ///
     /// `leader` is the caller's last liveness observation. On Unix it narrows
     /// the pid-reuse hazard: once the leader is gone its pid may have been
@@ -71,7 +84,8 @@ impl ProcessReaper {
     /// when a process owns that number again, and the descendant walk is skipped
     /// entirely (its root would be a stranger). This is best-effort, not a proof
     /// (the probe and the signals are not atomic); a complete fix needs `pidfd`
-    /// or process enumeration.
+    /// or process enumeration. The PTY sweep is unaffected: it is anchored on a
+    /// slave number the daemon still owns.
     ///
     /// Consumes the reaper: once the tree is gone there is nothing left to
     /// guard. Returns an error only when the signal could not be delivered.
@@ -101,36 +115,37 @@ impl ProcessReaper {
             // That narrows the hazard but does not prove it: an unrelated group
             // can reuse the id after its own leader exits, and the probe ->
             // killpg window is not atomic. `Ok`/`EPERM` means a process owns the
-            // number, so skip. A complete fix needs pidfd or enumeration.
-            if leader == LeaderState::Exited
+            // number, so the group signal is skipped. A complete fix needs pidfd
+            // or enumeration.
+            let group_is_stranger = leader == LeaderState::Exited
                 && !matches!(
                     rustix::process::test_kill_process(group),
                     Err(rustix::io::Errno::SRCH)
-                )
-            {
-                return Ok(());
-            }
+                );
             // Snapshot the tree before signalling: once the agent dies its
             // children are reparented and can no longer be found. Skipped when
             // the leader is gone - its pid may name an unrelated tree by now.
-            let descendants = if leader == LeaderState::Alive {
+            let descendants = if leader == LeaderState::Alive && !group_is_stranger {
                 descendants(pid)
             } else {
                 Vec::new()
             };
             let mut first_error = None;
-            if let Err(err) =
-                rustix::process::kill_process_group(group, rustix::process::Signal::KILL)
-            {
-                // The agent may have exited between the liveness check and the
-                // signal; a vanishing group is success, not a failure. Any other
-                // error (`EPERM` after a credential change, a sandbox) must not
-                // skip the sweep: the descendants are already snapshotted and
-                // killing them is still the best chance to avoid a leak.
-                if err != rustix::io::Errno::SRCH {
-                    first_error = Some(BridgeError::Io(std::io::Error::from_raw_os_error(
-                        err.raw_os_error(),
-                    )));
+            if !group_is_stranger {
+                if let Err(err) =
+                    rustix::process::kill_process_group(group, rustix::process::Signal::KILL)
+                {
+                    // The agent may have exited between the liveness check and
+                    // the signal; a vanishing group is success, not a failure.
+                    // Any other error (`EPERM` after a credential change, a
+                    // sandbox) must not skip the sweep: the descendants are
+                    // already snapshotted and killing them is still the best
+                    // chance to avoid a leak.
+                    if err != rustix::io::Errno::SRCH {
+                        first_error = Some(BridgeError::Io(std::io::Error::from_raw_os_error(
+                            err.raw_os_error(),
+                        )));
+                    }
                 }
             }
             // Job-control jobs live in their own process group, so the group
@@ -141,6 +156,26 @@ impl ProcessReaper {
             for descendant in descendants.into_iter().rev() {
                 if let Err(err) = kill_member(descendant) {
                     first_error.get_or_insert(err);
+                }
+            }
+            // The group and the parent chain are both gone once the direct
+            // client exits (the kernel reparents its children and disassociates
+            // the controlling terminal), so a job-control job would survive
+            // them. The PTY slave is the one anchor that outlives the client:
+            // its number stays ours while we hold the master, so every process
+            // that still has it open on stdin/stdout/stderr belongs to this
+            // agent. Two passes, so a process forked between the scan and the
+            // signals is caught as well.
+            #[cfg(target_os = "linux")]
+            if let Some(pty) = &self.pty {
+                // Both passes always run: the second catches a process forked
+                // between the first scan and its signals.
+                for _ in 0..2 {
+                    for member in pty_members(pty) {
+                        if let Err(err) = kill_member(member) {
+                            first_error.get_or_insert(err);
+                        }
+                    }
                 }
             }
             match first_error {
@@ -206,6 +241,100 @@ fn descendants(root: u32) -> Vec<u32> {
     found
 }
 
+/// Slave device of the agent's PTY, read from the child's standard streams.
+///
+/// Must run while the direct client is alive: once it exits, its `/proc` entry
+/// (and with it these fds) is gone. Only a `/dev/pts/N` slave is accepted,
+/// because that is the path the sweep can match against other processes.
+#[cfg(unix)]
+pub fn pty_path(pid: Option<u32>) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let pid = pid?;
+        let proc_dir = format!("/proc/{pid}");
+        // `spawn_command` returns after `exec`, so the child's stdio already
+        // points at the slave; the retry only covers a `/proc` that is briefly
+        // unreadable. It is deliberately short: this runs while the daemon holds
+        // the agent table lock.
+        for _ in 0..10 {
+            let mut readable = false;
+            // Any of the three standard streams is enough: a program may close
+            // or replace stdin, and the sweep matches all three.
+            for fd in ["0", "1", "2"] {
+                if let Ok(target) = std::fs::read_link(format!("{proc_dir}/fd/{fd}")) {
+                    readable = true;
+                    if let Some(path) = target.to_str().filter(|path| path.starts_with("/dev/pts/"))
+                    {
+                        return Some(path.to_string());
+                    }
+                }
+            }
+            if readable {
+                tracing::warn!(
+                    pid,
+                    "the agent's stdio is not a pty; kill --force cannot sweep it after the client exits"
+                );
+                return None;
+            }
+            if !std::path::Path::new(&proc_dir).exists() {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        tracing::warn!(
+            pid,
+            "could not read the agent's pty; kill --force cannot sweep it after the client exits"
+        );
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Every process that still holds `pty` open on stdin, stdout or stderr.
+///
+/// Deliberately fd-based: the slave number cannot be reused while the daemon
+/// holds the master, so a match proves the process inherited this agent's
+/// terminal - unlike a pid, a process group, a session id or a controlling
+/// terminal, none of which survive the client's exit reliably. A process that
+/// closed or redirected its stdio no longer carries the anchor and is not found.
+#[cfg(target_os = "linux")]
+fn pty_members(pty: &str) -> Vec<u32> {
+    let self_pid = std::process::id();
+    let wanted = std::path::Path::new(pty);
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        tracing::warn!(
+            "could not read /proc; processes holding the agent's pty may survive kill --force"
+        );
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        for fd in ["0", "1", "2"] {
+            let link = entry.path().join("fd").join(fd);
+            if std::fs::read_link(&link).is_ok_and(|target| target == wanted) {
+                found.push(pid);
+                break;
+            }
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
 /// SIGKILL one pid, treating "already gone" as success.
 ///
 /// The pid comes from a snapshot, so a process that exited and had its pid
@@ -262,12 +391,24 @@ pub fn install(child: &dyn Child) -> Option<ProcessReaper> {
 
 /// Unix keeps the daemon-death guarantee through the PTY (see the module
 /// docs); the pid is recorded so [`ProcessReaper::terminate`] can signal the
-/// process group.
+/// process group, and on Linux the PTY slave so the tree can be swept after the
+/// client exits.
 #[cfg(unix)]
-pub fn install(child: &dyn Child) -> Option<ProcessReaper> {
-    Some(ProcessReaper {
-        pid: child.process_id(),
-    })
+pub fn install(child: &dyn Child, pty: Option<&str>) -> Option<ProcessReaper> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(ProcessReaper {
+            pid: child.process_id(),
+            pty: pty.map(str::to_string),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pty;
+        Some(ProcessReaper {
+            pid: child.process_id(),
+        })
+    }
 }
 
 /// Human readable description of the platform mechanism, printed by
@@ -276,6 +417,8 @@ pub fn install(child: &dyn Child) -> Option<ProcessReaper> {
 pub const fn mechanism() -> &'static str {
     if cfg!(windows) {
         "windows job object (kill on job close)"
+    } else if cfg!(target_os = "linux") {
+        "pty hangup (SIGHUP) + SIGKILL to the agent group + best-effort tree snapshot + pty fd sweep"
     } else {
         "pty hangup (SIGHUP) + SIGKILL to the agent group + best-effort tree snapshot"
     }

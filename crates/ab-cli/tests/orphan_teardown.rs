@@ -474,8 +474,10 @@ fn kill_force_reaps_descendants() {
 ///
 /// Unix covers the group half of that path only: the orphan stays in the
 /// agent's process group, so `killpg` reaches it without a snapshot. The
-/// job-control half (own process group) is a documented gap once the client has
-/// exited - see [`kill_force_leaves_job_control_job_after_client_exit`].
+/// job-control half (own process group) is covered on Linux by the PTY fd sweep
+/// and is still a documented gap on macOS - see
+/// `kill_force_reaps_job_control_job_after_client_exit` and
+/// `kill_force_leaves_job_control_job_after_client_exit`.
 #[test]
 fn kill_force_reaps_after_client_exit() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -527,16 +529,21 @@ fn kill_force_reaps_after_client_exit() {
     drop(daemon);
 }
 
-/// Pins the documented Unix limitation (`SECURITY.md`, "job-control job after
-/// the client exited"): `kill --force` only snapshots the tree while the direct
-/// client is alive, so a background job that job control moved into its own
-/// process group survives once the client has exited. If this test ever starts
-/// failing because the job died, the limitation is gone - update `SECURITY.md`,
-/// `AGENTS.md` and the help text with it instead of deleting the test.
+/// An agent whose shell put a `sleep` in its own process group and then exited.
+///
+/// Fields drop in declaration order, so the daemon goes before the temp home.
 #[cfg(unix)]
-#[test]
-fn kill_force_leaves_job_control_job_after_client_exit() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+struct JobAfterClientExit {
+    _daemon: DaemonProcess,
+    home: TempHome,
+    agent: u32,
+    orphan: u32,
+}
+
+/// Build the [`JobAfterClientExit`] fixture: job control on, background `sleep`,
+/// shell gone, `sleep` still alive in a process group of its own.
+#[cfg(unix)]
+fn job_control_job_after_client_exit() -> JobAfterClientExit {
     let home = TempHome::new();
     let daemon = start_daemon(&home);
     wait_until_ready(&home);
@@ -555,12 +562,65 @@ fn kill_force_leaves_job_control_job_after_client_exit() {
         "job control should put the orphan in its own process group"
     );
 
-    let _cleanup = Cleanup(vec![agent, orphan]);
     send("orphan", "exit");
     wait_for_exit("orphan");
     assert!(!is_alive(agent), "the direct client should be gone");
 
-    let killed = kill_force(&home);
+    JobAfterClientExit {
+        _daemon: daemon,
+        home,
+        agent,
+        orphan,
+    }
+}
+
+/// A job-control job must die with `kill --force` even after the direct client
+/// exited.
+///
+/// Linux anchors the sweep on the agent's PTY slave (`/proc/<pid>/fd`), so the
+/// job is found although the client's pid, its process group and its session are
+/// all gone by then. macOS has no portable way to read another process's fds, so
+/// that case stays a documented gap - see
+/// `kill_force_leaves_job_control_job_after_client_exit`.
+#[cfg(target_os = "linux")]
+#[test]
+fn kill_force_reaps_job_control_job_after_client_exit() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let setup = job_control_job_after_client_exit();
+    let _cleanup = Cleanup(vec![setup.agent, setup.orphan]);
+    assert!(
+        is_alive(setup.orphan),
+        "the background job should outlive the direct client"
+    );
+
+    let killed = kill_force(&setup.home);
+    assert!(matches!(killed, Response::Ok), "got {killed:?}");
+
+    assert_all_dead(&[setup.orphan], &setup.home);
+    assert!(
+        client::is_running(),
+        "killing an agent must not take the daemon down"
+    );
+}
+
+/// Pins the remaining macOS limitation (`SECURITY.md`, "job-control job after the
+/// client exited"): the PTY fd sweep needs `/proc`, so it only runs on Linux.
+/// macOS would need `lsof` or FFI to enumerate another process's descriptors. If
+/// this test starts failing because the job died, the limitation is gone -
+/// update `SECURITY.md`, `AGENTS.md`, the help text and this test instead of
+/// deleting it.
+#[cfg(all(unix, not(target_os = "linux")))]
+#[test]
+fn kill_force_leaves_job_control_job_after_client_exit() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let setup = job_control_job_after_client_exit();
+    let _cleanup = Cleanup(vec![setup.agent, setup.orphan]);
+    assert!(
+        is_alive(setup.orphan),
+        "the background job should outlive the direct client"
+    );
+
+    let killed = kill_force(&setup.home);
     assert!(matches!(killed, Response::Ok), "got {killed:?}");
     assert!(
         client::is_running(),
@@ -570,10 +630,8 @@ fn kill_force_leaves_job_control_job_after_client_exit() {
     // assertion: this is the documented gap, not a race in the test.
     thread::sleep(Duration::from_millis(500));
     assert!(
-        is_alive(orphan),
+        is_alive(setup.orphan),
         "the documented gap changed: a job-control job was reaped after the \
          client exited - update SECURITY.md/AGENTS.md/help and this test"
     );
-
-    drop(daemon);
 }

@@ -90,7 +90,7 @@ enum Command {
         name: String,
         /// Skip Ctrl-C and kill the agent's process tree immediately
         /// (Windows: whole job; Unix: process group + best-effort tree
-        /// snapshot).
+        /// snapshot, plus a PTY fd sweep on Linux).
         #[arg(long)]
         force: bool,
     },
