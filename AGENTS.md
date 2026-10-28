@@ -107,16 +107,21 @@ A PR is ready for QA only when **all** of these are true:
   (`win32job`, a safe wrapper - required because `unsafe_code = "forbid"`);
   closing the ConPTY only reaps the direct client, not grandchildren that
   opened their own console. On Unix the PTY hangup covers daemon death and
-  `ProcessReaper::terminate` signals the agent's process group and then the
-  descendants in a `ps` snapshot taken first, so job-control jobs are reaped
-  too - but only while the direct client is alive; a job left behind after the
-  client exited, or a process that already detached (daemonized), is a known gap
-  (see `SECURITY.md`).
+  `ProcessReaper::terminate` signals the agent's process group, then the
+  descendants in a `ps` snapshot taken first, and on Linux finally every process
+  that still holds the PTY slave - so job-control jobs are reaped while the
+  direct client is alive, and on Linux also after it exited. macOS keeps that
+  after-exit gap, and a process that already detached (daemonized) is a known gap
+  everywhere (see `SECURITY.md`).
   `kill --force` tears the tree down through the same hook - do not replace it
-  with a bare `child.kill()`, and do not replace the crates with raw FFI. Keep
+  with a bare `child.kill()`, and do not replace the crates with raw FFI. On
+  Linux the PTY fd sweep (`pty_path` / `pty_members` in `reaper.rs`) is what
+  reaches a job-control job after the client exited; it is anchored on the slave
+  number the daemon still owns, so it must run while the master is open. Keep
   `crates/ab-cli/tests/orphan_teardown.rs` green: on Windows all three tests
   fail if the job object stops working (including the exited-client case), on
-  Unix they cover `SIGHUP` plus the group/tree sweep.
+  Unix they cover `SIGHUP` plus the group/tree sweep, and the job-control
+  after-exit case is asserted reaped on Linux and still-leaked on macOS.
 * Keep the daemon single-binary and dependency-light; new deps need a
   justification in the PR.
 
