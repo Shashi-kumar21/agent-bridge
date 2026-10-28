@@ -121,12 +121,15 @@ id         : 1a181fa5fa9-1
 status     : running
 pid        : 17240
 command    : cmd.exe
-cwd        : C:\work\project
+cwd        : C:\work\agent-bridge
 size       : 120x32
 created    : now
 messages   : 0
 subscribers: 0
 ```
+
+`cwd` is the daemon's working directory here because `new` was called without
+`--cwd`; pass `--cwd` to start the agent somewhere else.
 
 ## 5. See what is running
 
@@ -137,7 +140,7 @@ agent-bridge listagents
 ```
 NAME           STATUS   PID    MSGS  LAST OUTPUT  COMMAND
 -----------------------------------------------------------
-tutorial-demo  running  17240  0     0s ago       cmd.exe
+tutorial-demo  running  17240  0     now          cmd.exe
 ```
 
 * `STATUS` is `running` or `exited` (the daemon keeps the last known state).
@@ -161,7 +164,7 @@ agent-bridge --json listagents
       "status": "running",
       "pid": 17240,
       "command": "cmd.exe",
-      "cwd": "C:\\work\\project",
+      "cwd": "C:\\work\\agent-bridge",
       "created_at": 1793182031795,
       "last_output_at": 1793182034009,
       "exited_at": null,
@@ -210,7 +213,6 @@ agent-bridge log --limit 200
 
 ```
 2s ago  owner -> tutorial-demo: echo hello from agent-bridge
-1s ago  dev -> qa: tests are green, please review PR #4
 ```
 
 Messages sent without `--from` are attributed to `owner`.
@@ -277,8 +279,9 @@ agent, terminal 2 the reviewer; you drive both from a third terminal.
 
 ```bash
 # 1. two agents, each in its own checkout - one tree for both would make
-#    them fight over the index and HEAD
-git worktree add ..\agent-bridge-qa dev
+#    them fight over the index and HEAD (assumes the repo is at
+#    C:\work\agent-bridge)
+git worktree add ..\agent-bridge-qa -b qa-review dev
 agent-bridge new dev --cwd C:\work\agent-bridge    -- opencode
 agent-bridge new qa  --cwd C:\work\agent-bridge-qa -- opencode
 
@@ -308,8 +311,8 @@ terminal, window or OS - it only needs a name and a message.
 
 ## 10. Scripting with `--json`
 
-The agent commands (`listagents`, `new`, `sendmessage`, `read`, `kill`, `log`)
-and `daemon start`/`restart` accept the global `--json` flag and print the raw
+Every command except `attach`, `daemon stop`, `daemon run` and `daemon status`
+while the daemon is down accepts the global `--json` flag and prints the raw
 protocol response. Examples with `jq`:
 
 ```bash
@@ -325,10 +328,6 @@ agent-bridge --json read dev --lines 5 | jq -r '.lines[]'
 # messages from the last minute
 agent-bridge --json log --limit 50 | jq -r '.messages[] | "\(.from // "owner") -> \(.target): \(.text)"'
 ```
-
-Two exceptions: `attach` is interactive and has no JSON mode, and
-`daemon stop`/`daemon run`/`daemon status` (when the daemon is down) print plain
-text and ignore `--json`.
 
 Exit codes are `0` on success and `1` on failure, with the reason on stderr
 (`error: agent 'x' not found`). That makes the CLI usable from CI steps and
@@ -349,9 +348,14 @@ scripts without parsing human-readable output.
 does:
 
 ```bash
-export AGENT_BRIDGE_HOME=/tmp/ab-state       # bash / zsh
-set AGENT_BRIDGE_HOME=C:\work\ab-state       # cmd.exe
-$env:AGENT_BRIDGE_HOME = "C:\work\ab-state"  # PowerShell
+# bash / zsh
+export AGENT_BRIDGE_HOME=/tmp/ab-state
+
+# cmd.exe
+set AGENT_BRIDGE_HOME=C:\work\ab-state
+
+# PowerShell
+$env:AGENT_BRIDGE_HOME = "C:\work\ab-state"
 ```
 
 The state directory is created on first use and is private to your OS user. On
@@ -378,9 +382,9 @@ process, a full disk, or antivirus holding the binary.
 managed by it`** - the CLI and the running daemon come from different versions.
 The CLI restarts the daemon itself only when it manages **no** agent sessions at
 all; exited entries count too, because `listagents` is never pruned (only a
-restart clears them). Otherwise it refuses, because restarting would kill the
-live agents; run `agent-bridge daemon restart` when you are ready to lose those
-sessions.
+restart clears them). Otherwise it refuses, because a restart would kill any
+live agents and discard the exited entries' output; run
+`agent-bridge daemon restart` when you are ready for that.
 
 **Nothing appears in `read`** - the program has not printed anything yet, or it
 is waiting for input. Use `attach` to see the screen and type into it.
@@ -393,8 +397,8 @@ wedged), then install again.
 **Everything died when the daemon stopped** - expected. Agents are tied to the
 daemon's lifetime on purpose; the job object (Windows) and the PTY hangup (Unix)
 make sure no foreground terminal is left behind after a crash. Background
-job-control jobs on Unix are the documented exception - see
-[SECURITY.md](../SECURITY.md).
+job-control jobs on Unix are a documented exception, as are processes that
+detached themselves - see [SECURITY.md](../SECURITY.md).
 
 ## 13. Cheat sheet
 
@@ -409,7 +413,7 @@ job-control jobs on Unix are the documented exception - see
 | Kill it politely / immediately | `agent-bridge kill <name>` / `--force` |
 | Message history | `agent-bridge log --limit 200` |
 | Health and versions | `agent-bridge ping` / `agent-bridge version` |
-| Machine-readable output | add `--json` (agent commands and `daemon start`/`restart`) |
+| Machine-readable output | add `--json` (every command except `attach` and `daemon stop`/`run`) |
 
 ## 14. Where next
 
