@@ -56,7 +56,7 @@ It prints the daemon details, so you can confirm what is running:
 
 ```
 protocol : 1
-daemon   : 0.1.1
+daemon   : 0.1.2
 pid      : 11228
 teardown : windows job object (kill on job close)
 socket   : \\.\pipe\agent-bridge-<user>
