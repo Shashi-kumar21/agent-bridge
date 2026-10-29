@@ -53,8 +53,9 @@ You should receive a response within 72 hours.
 * `agent-bridge kill --force` tears the agent's process tree down while the
   daemon stays up: Windows drops the job handle (the kernel terminates the job),
   Unix sends `SIGKILL` to the agent's process group, then to every descendant
-  found in a `ps` snapshot taken just before the signals, and on Linux finally
-  sweeps every process that still holds the agent's PTY slave open on
+  found in a process snapshot taken just before the signals (`ps`, falling back
+  to `/proc/<pid>/stat` on Linux when `ps` is missing or failing), and on Linux
+  finally sweeps every process that still holds the agent's PTY slave open on
   stdin/stdout/stderr. While the direct client is still running, the first two
   passes also reach the jobs an interactive shell moved into their own process
   group and children that called `setsid`. Once the client has exited its pid and
@@ -74,12 +75,15 @@ You should receive a response within 72 hours.
   another process's descriptors there needs `lsof` or FFI - and for a process
   that closed or redirected all three standard streams, which no longer carries
   the PTY anchor.
-* Unix snapshot window: the tree comes from a `ps` snapshot, so a process forked
+* Unix snapshot window: the tree comes from a process snapshot, so a process forked
   after it is not signalled, and a snapshotted pid that exits and is recycled
   before the sweep can be signalled instead. Best-effort by design.
-* Unix `ps` unavailable or failing: `descendants()` logs a warning (with the
-  status and stderr) and the snapshot is skipped, so only the process-group
-  signal and (on Linux) the PTY fd sweep run.
+* Unix `ps` unavailable or failing: **closed on Linux**, where the tree is read
+  from `/proc/<pid>/stat` instead, so a container without procps still gets the
+  snapshot `ps` would have produced. macOS has no `/proc` (enumerating it would need `lsof` or FFI),
+  so there the snapshot is skipped and only the process-group signal runs. When
+  both sources fail - Linux with an unreadable `/proc` - `descendants()` logs one
+  warning with the `ps` failure.
 * Unix already-detached processes: a process that daemonized (double-fork,
   reparented to init) before `kill --force` is not in the snapshot and survives.
   Following it needs cgroups on Linux, or a supervisor / process-enumeration
