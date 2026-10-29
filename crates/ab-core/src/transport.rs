@@ -40,8 +40,8 @@ pub fn endpoint() -> String {
 #[cfg(windows)]
 const PIPE_SDDL: &str = "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)";
 
-/// Listener options carrying the owner-only DACL, falling back to the OS
-/// default if the descriptor cannot be built.
+/// Listener options carrying the explicit DACL from [`PIPE_SDDL`], falling back
+/// to the OS default if the descriptor cannot be built.
 #[cfg(windows)]
 fn pipe_listener_options(name: interprocess::local_socket::Name<'_>) -> ListenerOptions<'_> {
     use interprocess::os::windows::local_socket::ListenerOptionsExt;
