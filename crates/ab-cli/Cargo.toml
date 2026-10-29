@@ -13,7 +13,7 @@ name = "agent-bridge"
 path = "src/main.rs"
 
 [dependencies]
-agent-bridge-core = { path = "../ab-core", version = "0.1.1" }
+agent-bridge-core = { path = "../ab-core", version = "0.1.2" }
 serde_json.workspace = true
 clap.workspace = true
 crossterm.workspace = true

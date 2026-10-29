@@ -154,7 +154,8 @@ pub enum Request {
     Attach {
         /// Agent name.
         target: String,
-        /// Replay buffered output starting after this sequence number.
+        /// Do not replay buffered output when this is at or above the agent's
+        /// current sequence number.
         #[serde(default)]
         from_seq: Option<Seq>,
     },
