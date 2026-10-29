@@ -15,9 +15,9 @@
 //!   closes the master and sends `SIGHUP` to the terminal's foreground process
 //!   group. [`ProcessReaper::terminate`] additionally `SIGKILL`s the agent's
 //!   process group and the descendants it finds in a snapshot taken first (`ps`,
-//!   or `/proc` on Linux when `ps` is unavailable), which covers the jobs an
-//!   interactive shell moved into their own process group - but only while the
-//!   client is still alive. On Linux the PTY slave is also swept through
+//!   or `/proc` on Linux when `ps` is missing or failing), which covers the jobs
+//!   an interactive shell moved into their own process group - but only while
+//!   the client is still alive. On Linux the PTY slave is also swept through
 //!   `/proc/<pid>/fd`, which keeps reaching the tree after the client has exited
 //!   (the slave number cannot be reused while the daemon holds the master). A
 //!   process that daemonized and closed the terminal, and the same post-exit
@@ -70,7 +70,8 @@ impl ProcessReaper {
     ///   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, the kernel terminates every
     ///   process in it, including grandchildren that opened their own console.
     /// * **Unix** - `SIGKILL` to the agent's process group, then to every
-    ///   descendant found in a `ps` snapshot taken before the signals. The child
+    ///   descendant found in a process snapshot taken before the signals (`ps`,
+    ///   or `/proc` on Linux when `ps` is missing or failing). The child
     ///   is a session leader, so the group signal reaches the agent and the
     ///   processes that stayed in its group; the snapshot adds the jobs an
     ///   interactive shell moved into their own group (and children that called
@@ -208,9 +209,15 @@ fn descendants(root: u32) -> Vec<u32> {
             if let Some(children) = proc_children() {
                 return tree_from(&children, root);
             }
+            let sources = if cfg!(target_os = "linux") {
+                "ps or /proc"
+            } else {
+                "ps"
+            };
             tracing::warn!(
                 reason = %reason,
-                "could not enumerate processes; the agent's descendants may survive kill --force"
+                "could not enumerate processes from {}; the agent's descendants may survive kill --force",
+                sources
             );
             Vec::new()
         }
@@ -257,10 +264,11 @@ fn ps_children() -> std::result::Result<Children, String> {
 /// `(pid, ppid)` pairs from `/proc`, keyed by parent - the fallback when `ps`
 /// cannot run.
 ///
-/// Linux always mounts `/proc` for the daemon's own processes, so this works in
-/// minimal containers that ship no procps. `None` means `/proc` itself could not
-/// be read, which is the only failure worth reporting: individual entries can
-/// disappear at any moment (the process exited), so those are skipped silently.
+/// Linux normally mounts `/proc` for the daemon's own processes, so this works
+/// in minimal containers that ship no procps. `None` means `/proc` itself is not
+/// there or unreadable (a chroot or mount namespace without it), which is the
+/// only failure worth reporting: individual entries can disappear at any moment
+/// (the process exited), so those are skipped silently.
 #[cfg(target_os = "linux")]
 fn proc_children() -> Option<Children> {
     let entries = std::fs::read_dir("/proc").ok()?;
@@ -273,9 +281,12 @@ fn proc_children() -> Option<Children> {
         else {
             continue;
         };
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+        // Bytes, not `read_to_string`: `comm` is not required to be UTF-8, and a
+        // skipped entry would take its whole subtree with it.
+        let Ok(stat) = std::fs::read(entry.path().join("stat")) else {
             continue;
         };
+        let stat = String::from_utf8_lossy(&stat);
         // Field 2 is `comm` in parentheses and may itself contain spaces and
         // parentheses, so the numbers start after the *last* `)`: the first
         // token there is the state, the second the parent pid.
@@ -542,6 +553,18 @@ mod tests {
         panic!("{parent} did not fork a child within 5s");
     }
 
+    /// Kills the spawned tree even if an assertion panics, so a failing test does
+    /// not leave `sleep 30` behind.
+    struct KillTree(Vec<u32>);
+
+    impl Drop for KillTree {
+        fn drop(&mut self) {
+            for pid in &self.0 {
+                let _ = kill_member(*pid);
+            }
+        }
+    }
+
     /// The snapshot must not go empty in a container that ships no procps: with
     /// `ps` unreachable, `/proc` has to produce the same child.
     #[test]
@@ -555,14 +578,17 @@ mod tests {
             .expect("spawn /bin/sh");
         let root = client.id();
         let child = child_of(root);
+        let _kill = KillTree(vec![child, root]);
 
         // Both sources agree while `ps` is reachable, so the fallback is the only
-        // difference in the second half of the test.
-        assert_eq!(
-            ps_children().ok().and_then(|map| map.get(&root).cloned()),
-            Some(vec![child]),
-            "ps should see the same child"
-        );
+        // difference in the second half of the test. Skipped when the test itself
+        // runs in the procps-less container this feature is for.
+        if let Ok(map) = ps_children() {
+            assert!(
+                map.get(&root).is_some_and(|pids| pids.contains(&child)),
+                "ps should see the same child: got {map:?}"
+            );
+        }
 
         let found = {
             let _empty = EmptyPath::new();

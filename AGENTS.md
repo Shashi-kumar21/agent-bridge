@@ -109,11 +109,11 @@ A PR is ready for QA only when **all** of these are true:
   opened their own console. On Unix the PTY hangup covers daemon death and
   `ProcessReaper::terminate` signals the agent's process group, then the
   descendants in a `ps` snapshot taken first (Linux falls back to
-  `/proc/<pid>/stat` when `ps` is missing or failing), and on Linux finally every process
-  that still holds the PTY slave - so job-control jobs are reaped while the
-  direct client is alive, and on Linux also after it exited. macOS keeps that
-  after-exit gap, and a process that already detached (daemonized) is a known gap
-  everywhere (see `SECURITY.md`).
+  `/proc/<pid>/stat` when `ps` is missing or failing), and on Linux finally
+  every process that still holds the PTY slave - so job-control jobs are reaped
+  while the direct client is alive, and on Linux also after it exited. macOS
+  keeps that after-exit gap, and a process that already detached (daemonized) is
+  a known gap everywhere (see `SECURITY.md`).
   `kill --force` tears the tree down through the same hook - do not replace it
   with a bare `child.kill()`, and do not replace the crates with raw FFI. On
   Linux the PTY fd sweep (`pty_path` / `pty_members` in `reaper.rs`) is what

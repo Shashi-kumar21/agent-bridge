@@ -80,7 +80,7 @@ You should receive a response within 72 hours.
   before the sweep can be signalled instead. Best-effort by design.
 * Unix `ps` unavailable or failing: **closed on Linux**, where the tree is read
   from `/proc/<pid>/stat` instead, so a container without procps still gets the
-  full snapshot. macOS has no `/proc` (enumerating it would need `lsof` or FFI),
+  snapshot `ps` would have produced. macOS has no `/proc` (enumerating it would need `lsof` or FFI),
   so there the snapshot is skipped and only the process-group signal runs. When
   both sources fail - Linux with an unreadable `/proc` - `descendants()` logs one
   warning with the `ps` failure.

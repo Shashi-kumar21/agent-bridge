@@ -264,7 +264,8 @@ that handle interrupts.
   process in it, including grandchildren that opened their own console.
 * **macOS/Linux**: `SIGKILL` to the agent's process group, plus every descendant
   found in a `ps` snapshot taken first (Linux falls back to `/proc` when `ps` is
-  missing), so jobs moved into their own process group are reached too.
+  missing or failing), so jobs moved into their own process group are reached
+  too.
 * **Linux additionally**: every process that still holds the agent's PTY slave
   on stdin/stdout/stderr is killed, which also reaches a background job after
   the direct client has exited.
