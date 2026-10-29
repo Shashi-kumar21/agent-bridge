@@ -14,14 +14,15 @@
 //!   slave as its controlling terminal, so when the daemon dies the kernel
 //!   closes the master and sends `SIGHUP` to the terminal's foreground process
 //!   group. [`ProcessReaper::terminate`] additionally `SIGKILL`s the agent's
-//!   process group and the descendants it finds in a snapshot taken first, which
-//!   covers the jobs an interactive shell moved into their own process group -
-//!   but only while the client is still alive. On Linux the PTY slave is also
-//!   swept through `/proc/<pid>/fd`, which keeps reaching the tree after the
-//!   client has exited (the slave number cannot be reused while the daemon holds
-//!   the master). A process that daemonized and closed the terminal, and the
-//!   same post-exit case on macOS, is not reached; daemon death only reaches the
-//!   foreground group. All of that is documented in `SECURITY.md`.
+//!   process group and the descendants it finds in a snapshot taken first (`ps`,
+//!   or `/proc` on Linux when `ps` is unavailable), which covers the jobs an
+//!   interactive shell moved into their own process group - but only while the
+//!   client is still alive. On Linux the PTY slave is also swept through
+//!   `/proc/<pid>/fd`, which keeps reaching the tree after the client has exited
+//!   (the slave number cannot be reused while the daemon holds the master). A
+//!   process that daemonized and closed the terminal, and the same post-exit
+//!   case on macOS, is not reached; daemon death only reaches the foreground
+//!   group. All of that is documented in `SECURITY.md`.
 
 use portable_pty::Child;
 
@@ -186,37 +187,60 @@ impl ProcessReaper {
     }
 }
 
-/// Every descendant of `root` in a `ps` snapshot, parents before children.
+/// `pid -> children` map of the process table.
+#[cfg(unix)]
+type Children = std::collections::HashMap<u32, Vec<u32>>;
+
+/// Every descendant of `root`, parents before children.
 ///
-/// `ps` is the only portable way to enumerate processes without unsafe FFI or
-/// a platform crate; it is part of POSIX and present on every target here. The
-/// flags matter: `-axo` works on both procps and BSD `ps`, while the
-/// equivalent `-Axo` makes procps reject `-x` ("must set personality to get -x
-/// option") and the sweep silently finds nothing. The snapshot-to-kill window
-/// is best-effort: a process forked afterwards, one that had already been
-/// reparented, or a snapshotted pid that exits and is recycled before the sweep
-/// is not handled - a complete fix needs `pidfd` or process enumeration.
+/// The tree comes from [`ps_children`] and, if `ps` is missing or failing, from
+/// [`proc_children`] on Linux. When neither source works the snapshot is
+/// skipped with a warning: only the process-group signal and the PTY sweep are
+/// left. The snapshot-to-kill window is best-effort: a process forked
+/// afterwards, one that had already been reparented, or a snapshotted pid that
+/// exits and is recycled before the sweep is not handled - a complete fix needs
+/// `pidfd` or process enumeration.
 #[cfg(unix)]
 fn descendants(root: u32) -> Vec<u32> {
-    let output = match std::process::Command::new("ps")
+    match ps_children() {
+        Ok(children) => tree_from(&children, root),
+        Err(reason) => {
+            if let Some(children) = proc_children() {
+                return tree_from(&children, root);
+            }
+            tracing::warn!(
+                reason = %reason,
+                "could not enumerate processes; the agent's descendants may survive kill --force"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// `(pid, ppid)` pairs from `ps`, keyed by parent.
+///
+/// `ps` is the portable way to enumerate processes without unsafe FFI or a
+/// platform crate; it is part of POSIX and present on every target here. The
+/// flags matter: `-axo` works on both procps and BSD `ps`, while the
+/// equivalent `-Axo` makes procps reject `-x` ("must set personality to get -x
+/// option") and the sweep silently finds nothing.
+///
+/// The `Err` carries why it failed so [`descendants`] can report it if the
+/// Linux fallback fails too.
+#[cfg(unix)]
+fn ps_children() -> std::result::Result<Children, String> {
+    let output = std::process::Command::new("ps")
         .args(["-axo", "pid=,ppid="])
         .output()
-    {
-        Ok(output) => output,
-        Err(err) => {
-            tracing::warn!(error = %err, "could not run ps; the agent's descendants may survive kill --force");
-            return Vec::new();
-        }
-    };
+        .map_err(|err| format!("could not run ps: {err}"))?;
     if !output.status.success() {
-        tracing::warn!(
-            status = ?output.status,
-            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-            "ps failed; the agent's descendants may survive kill --force"
-        );
-        return Vec::new();
+        return Err(format!(
+            "ps exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
-    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    let mut children = Children::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut fields = line.split_whitespace();
         let (Some(child), Some(parent)) = (
@@ -227,6 +251,55 @@ fn descendants(root: u32) -> Vec<u32> {
         };
         children.entry(parent).or_default().push(child);
     }
+    Ok(children)
+}
+
+/// `(pid, ppid)` pairs from `/proc`, keyed by parent - the fallback when `ps`
+/// cannot run.
+///
+/// Linux always mounts `/proc` for the daemon's own processes, so this works in
+/// minimal containers that ship no procps. `None` means `/proc` itself could not
+/// be read, which is the only failure worth reporting: individual entries can
+/// disappear at any moment (the process exited), so those are skipped silently.
+#[cfg(target_os = "linux")]
+fn proc_children() -> Option<Children> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut children = Children::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // Field 2 is `comm` in parentheses and may itself contain spaces and
+        // parentheses, so the numbers start after the *last* `)`: the first
+        // token there is the state, the second the parent pid.
+        let parent = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u32>().ok());
+        let Some(parent) = parent else {
+            continue;
+        };
+        children.entry(parent).or_default().push(pid);
+    }
+    Some(children)
+}
+
+/// [`proc_children`] where the platform has no `/proc` (macOS).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn proc_children() -> Option<Children> {
+    None
+}
+
+/// Descendants of `root` in a `pid -> children` map, parents before children.
+#[cfg(unix)]
+fn tree_from(children: &Children, root: u32) -> Vec<u32> {
     let mut seen = std::collections::HashSet::from([root]);
     let mut found = Vec::new();
     let mut stack = vec![root];
@@ -421,5 +494,99 @@ pub const fn mechanism() -> &'static str {
         "pty hangup (SIGHUP) + SIGKILL to the agent group + best-effort tree snapshot + pty fd sweep"
     } else {
         "pty hangup (SIGHUP) + SIGKILL to the agent group + best-effort tree snapshot"
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{descendants, kill_member, proc_children, ps_children};
+    use std::sync::{Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    /// `PATH` is process-wide, so the test that empties it must not overlap with
+    /// any other test in this binary that spawns a command.
+    static PATH_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Clears `PATH` for [`descendants`] and restores it on drop, including when
+    /// an assertion panics.
+    struct EmptyPath(Option<std::ffi::OsString>);
+
+    impl EmptyPath {
+        fn new() -> Self {
+            let previous = std::env::var_os("PATH");
+            std::env::set_var("PATH", "");
+            Self(previous)
+        }
+    }
+
+    impl Drop for EmptyPath {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// Pid of the single child `parent` forked, waiting briefly for the fork.
+    fn child_of(parent: u32) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(children) = proc_children() {
+                if let Some(pid) = children.get(&parent).and_then(|pids| pids.first()) {
+                    return *pid;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("{parent} did not fork a child within 5s");
+    }
+
+    /// The snapshot must not go empty in a container that ships no procps: with
+    /// `ps` unreachable, `/proc` has to produce the same child.
+    #[test]
+    fn proc_fallback_finds_the_tree_when_ps_is_missing() {
+        let _lock = PATH_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
+        // Spawn while `PATH` still works: the shell needs it to resolve `sleep`.
+        let mut client = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30 & wait"])
+            .spawn()
+            .expect("spawn /bin/sh");
+        let root = client.id();
+        let child = child_of(root);
+
+        // Both sources agree while `ps` is reachable, so the fallback is the only
+        // difference in the second half of the test.
+        assert_eq!(
+            ps_children().ok().and_then(|map| map.get(&root).cloned()),
+            Some(vec![child]),
+            "ps should see the same child"
+        );
+
+        let found = {
+            let _empty = EmptyPath::new();
+            assert!(
+                ps_children().is_err(),
+                "ps must be unreachable with an empty PATH"
+            );
+            descendants(root)
+        };
+
+        assert!(
+            found.contains(&child),
+            "the /proc fallback missed {child}: got {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .all(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists()),
+            "the snapshot contains a pid that is not alive: {found:?}"
+        );
+
+        for pid in found.iter().rev().chain(std::iter::once(&root)) {
+            let _ = kill_member(*pid);
+        }
+        let _ = client.wait();
     }
 }

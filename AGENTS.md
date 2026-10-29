@@ -108,7 +108,8 @@ A PR is ready for QA only when **all** of these are true:
   closing the ConPTY only reaps the direct client, not grandchildren that
   opened their own console. On Unix the PTY hangup covers daemon death and
   `ProcessReaper::terminate` signals the agent's process group, then the
-  descendants in a `ps` snapshot taken first, and on Linux finally every process
+  descendants in a `ps` snapshot taken first (Linux falls back to
+  `/proc/<pid>/stat` when `ps` is missing or failing), and on Linux finally every process
   that still holds the PTY slave - so job-control jobs are reaped while the
   direct client is alive, and on Linux also after it exited. macOS keeps that
   after-exit gap, and a process that already detached (daemonized) is a known gap
