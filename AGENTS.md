@@ -201,6 +201,7 @@ agent-bridge kill smoke --force
 agent-bridge daemon stop
 ```
 
-If a 0.9.x release passes, upgrade, delete the advisory ignore from
-`deny.toml`, delete the dependabot ignore and the CI pin step, and confirm
-`serial` is gone from `Cargo.lock`.
+If a 0.9.x release passes, upgrade, delete both advisory ignores from
+`deny.toml` (`RUSTSEC-2017-0008`, `RUSTSEC-2026-0441`), delete the dependabot
+ignore and the CI pin step, and confirm `serial` and `pin-utils` are gone from
+`Cargo.lock`.

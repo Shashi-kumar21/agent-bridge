@@ -1,16 +1,19 @@
 # Known limitations
 
-Confirmed behaviour of the current `dev` build, with a reproduction for each.
-This is the evidence list behind [`roadmap.md`](roadmap.md); items are not
-planned work until the roadmap section referenced next to them lands.
+Confirmed behaviour of the current `dev` build. Each item has a source anchor
+and, where practical, a reproduction. This is the evidence list behind
+[`roadmap.md`](roadmap.md); items are not planned work until the roadmap section
+referenced next to them lands.
 
 Reproductions assume a throwaway state directory so they do not disturb a real
-daemon:
+daemon. On Windows the state directory does **not** isolate the daemon (see
+§11), so also point the pipe at a throwaway name:
 
 ```bash
 export AGENT_BRIDGE_HOME=/tmp/ab-audit        # bash / zsh
 set AGENT_BRIDGE_HOME=C:\temp\ab-audit        # cmd.exe
 $env:AGENT_BRIDGE_HOME = "C:\temp\ab-audit"   # PowerShell
+$env:AGENT_BRIDGE_PIPE = "agent-bridge-audit" # PowerShell, Windows isolation
 ```
 
 ## 1. Message delivery is "written", never "delivered"
@@ -115,8 +118,9 @@ Tracked as issue
 
 Buffers, message history, PTY handles and job objects are in-memory only
 (`daemon.rs:27-33`). `daemon restart` stops the daemon, which sends Ctrl-C to
-every agent (`daemon.rs:101-110`) and then exits; the next daemon starts empty.
-There is no session adoption.
+every agent, force-kills any that are still running after ~500 ms
+(`daemon.rs:101-110`, `agent.rs:404-415`), and then exits; the next daemon
+starts empty. There is no session adoption.
 
 ```bash
 agent-bridge new keep -- cmd.exe
@@ -150,7 +154,8 @@ The child gets everything the daemon has, plus `TERM` and
 the daemon's environment is present in every agent.
 
 ```bash
-export MY_SECRET=abc
+export MY_SECRET=abc                  # set it before the daemon starts
+agent-bridge daemon restart           # or stop/start, so the daemon inherits it
 agent-bridge new envtest -- /bin/sh
 agent-bridge sendmessage envtest 'echo "$MY_SECRET"'
 agent-bridge read envtest --lines 5

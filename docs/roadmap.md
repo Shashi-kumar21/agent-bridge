@@ -5,16 +5,15 @@ execution order**; a phase starts only when the previous one meets its acceptanc
 criteria and the Definition of Done (Section 11). Planned work described here is
 not implemented until the checklist item lands with tests and documentation.
 
-Status: Phase 1 (audit and architecture map) is in review in this PR. Phases 2-9
-are open; Section 10 is explicitly out of scope until P0/P1 is stable.
+Status: Phase 1 (audit and architecture map) is complete as of the commit that
+added this file. Phases 2-9 are open; Section 10 is explicitly out of scope until
+P0/P1 is stable.
 
 See [`architecture.md`](architecture.md) for the current implementation and
 [`known-limitations.md`](known-limitations.md) for the limitations this roadmap
 addresses.
 
 ---
-
-# Agent-Bridge Improvement Tasks
 
 > **Goal:** Evolve Agent-Bridge from a cross-platform terminal-session
 > manager into a reliable, secure, agent-accessible communication
@@ -100,8 +99,8 @@ semantics, including cases where the result is uncertain.
 
 **Acceptance criterion:** N concurrent senders each sending M messages to one target
 produce zero interleaved bytes in the target's input, and every message ends in a
-documented terminal status (`written`, `failed` or `unknown`). The test is deterministic
-and runs on all three CI operating systems.
+documented terminal status (`written`, `failed` or `unknown`; `queued` is a transient
+state). The test is deterministic and runs on all three CI operating systems.
 
 ## 3. Readiness, replies, and output cursors
 

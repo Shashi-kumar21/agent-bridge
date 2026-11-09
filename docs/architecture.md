@@ -66,13 +66,14 @@ Module map (`crates/ab-core/src`):
   buffer, message history, subscriber list, reaper.
 * Shutdown: `Request::Shutdown` sets an `AtomicBool` (`daemon.rs:223-226`); the
   accept loop observes it, calls `Inner::stop_agents` (`daemon.rs:94`,
-  `:101-110`), which sends Ctrl-C to every agent and lets the process exit.
+  `:101-110`), which sends Ctrl-C to every agent, force-kills the ones still
+  running after ~500 ms (`agent.rs:404-415`), and then lets the process exit.
 
 ## 3. Request lifecycle (non-streaming)
 
-1. CLI builds a [`Request`], calls `client::request` (`client.rs:21`).
+1. CLI builds a [`Request`], calls `client::request` (`client.rs:16-35`).
 2. `request` opens a fresh connection, writes one NDJSON line and reads one line
-   back (`client.rs:22-48`); the connection is then dropped.
+   back (`client.rs:16-35`); the connection is then dropped.
 3. Daemon-side `serve_connection` reads one line, parses it, and either
    dispatches to `Inner::handle` or routes it to `stream_attach`
    (`daemon.rs:294-322`).
@@ -103,7 +104,7 @@ pipelining: a second request on the same connection is never read.
    retained buffer as one frame tagged with the *current* `seq`
    (`daemon.rs:343-365`), then streams live events until exit or disconnect
    (`daemon.rs:380-408`). Because the replay and the live stream can repeat a
-   sequence number, clients drop non-increasing `seq` (`client.rs:66-84`).
+   sequence number, clients drop non-increasing `seq` (`client.rs:79-83`).
 
 Sequence numbers count output chunks, not bytes, and are process-local: they
 restart from zero in a new daemon.
@@ -152,7 +153,7 @@ is never authenticated.
 * State directory: `~/.agent-bridge` or `AGENT_BRIDGE_HOME` (`paths.rs:20-33`).
   Created with mode `0700` on Unix (`paths.rs:53-61`).
 * Unix socket: `daemon.sock` in that directory, mode `0600`
-  (`paths.rs:36-38`, `transport.rs:92-98`).
+  (`paths.rs:34-36`, `transport.rs:92-98`).
 * Windows: named pipe `\\.\pipe\agent-bridge-<user>` (user name sanitised) or
   `AGENT_BRIDGE_PIPE` (`transport.rs:10-21`), with an explicit DACL granting
   owner, `SYSTEM` and Administrators (`transport.rs:41`).
@@ -177,11 +178,12 @@ is never authenticated.
 
 * Unit tests live next to the code (`buffer.rs`, `protocol.rs`, `transport.rs`,
   `reaper.rs` on Linux).
-* `crates/ab-cli/tests/daemon_e2e.rs` exercises a real daemon over the real
+* `crates/ab-core/tests/daemon_e2e.rs` exercises a real daemon over the real
   endpoint; `crates/ab-cli/tests/orphan_teardown.rs` covers process lifetime.
-* CI (`.github/workflows/ci.yml`) runs `fmt`, `clippy -D warnings`, `deny`,
-  `coverage`, `build` and `test` on Windows, macOS and Linux for pushes to
-  `main`/`dev` and for pull requests.
+* CI (`.github/workflows/ci.yml`) runs `build` and `test` on the
+  Windows/macOS/Linux matrix; `fmt`, `clippy -D warnings`, `deny` and
+  `coverage` run on Linux only. All jobs run for pushes to `main`/`dev` and for
+  pull requests.
 
 ## 10. Related documents
 
