@@ -27,6 +27,10 @@ single local-socket protocol. One implementation, three operating systems.
 
 ## Tutorial
 
+Docs: **[Tutorial to use](docs/tutorial.md)** (hands-on), **[architecture](docs/architecture.md)**
+(how it works), **[known limitations](docs/known-limitations.md)** (with reproductions),
+**[roadmap](docs/roadmap.md)** (phased plan).
+
 New here? **[Tutorial to use](docs/tutorial.md)** walks through install, the
 daemon, spawning agents, messaging between terminals, `read`/`attach`/`kill`,
 scripting with `--json` and troubleshooting - with copy-pasteable commands for
