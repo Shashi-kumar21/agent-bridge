@@ -19,17 +19,20 @@ $env:AGENT_BRIDGE_PIPE = "agent-bridge-audit" # PowerShell, Windows isolation
 ## 1. Message delivery is "written", never "delivered"
 
 `sendmessage` writes bytes into the target's PTY and returns
-`Sent { bytes }` (`daemon.rs:167-190`, `protocol.rs:238-244`). The target
-application may be mid-render, waiting at a prompt, or not reading at all. There
-is no acknowledgement, no retry and no delivery status.
+`Sent { bytes, message_id, status }` (`daemon.rs:219-282`). The status records
+what the daemon's write path did, not what the target did: the application may
+be mid-render, waiting at a prompt, or not reading at all. There is no retry and
+no application-level acknowledgement, so `written` does not mean the request was
+understood or executed.
 
 ```bash
 agent-bridge new shell -- cmd.exe            # or /bin/sh
-agent-bridge sendmessage shell "echo hi"     # "sent ... bytes"
+agent-bridge sendmessage shell "echo hi"     # "sent msg 1 to shell (written, ...)"
 agent-bridge kill shell --force              # nothing observed the message
 ```
 
-Roadmap §2.
+Roadmap §2 (application-level acknowledgement only where a receiving
+integration can send one).
 
 ## 2. A blocked write stalls every sender, with no timeout or queue
 
@@ -37,11 +40,15 @@ Roadmap §2.
 (`agent.rs:286-297`). There is no write timeout and no bounded queue: if the
 target stops draining its PTY, every `sendmessage` to that agent blocks in its
 connection thread until the OS write completes or the daemon is restarted.
+Message ids and statuses exist, but nothing can time out or reorder a blocked
+write yet (Phase 2B).
 
-There is also no message size limit; a large message is one `write_all` under
-the lock.
+The payload limit is separate and already enforced: 64 KiB by default,
+`AGENT_BRIDGE_MAX_MESSAGE` (clamped to 1 KiB..=1 MiB) raises or lowers it, and
+an oversized message is rejected with `too_large` before any record is created
+(`delivery.rs:34-42`, `daemon.rs:231-240`).
 
-Roadmap §2 (`queued`/`written`/`failed`/`unknown`, bounded queue, timeouts).
+Roadmap §2 (bounded queue, timeouts).
 
 ## 3. Large messages are not atomic at the terminal level
 
@@ -75,8 +82,8 @@ Roadmap §6 (VT screen model and snapshot).
 
 ## 5. No byte offset cursor; `seq` counts chunks
 
-`Read` returns the current `seq` (`protocol.rs:227-237`); `Attach --from-seq`
-only decides whether to replay the *whole* retained buffer (`daemon.rs:352-365`).
+`Read` returns the current `seq` (`protocol.rs:333-342`); `Attach --from-seq`
+only decides whether to replay the *whole* retained buffer (`daemon.rs:490-503`).
 Because `seq` increments per PTY chunk, not per byte, callers cannot resume from
 an arbitrary offset, and a replay frame carries the newest `seq` for bytes that
 may include older chunks.
@@ -99,7 +106,7 @@ Roadmap §3 (cursor semantics that report what is actually available).
 
 ## 7. Exited agents are never removed; names cannot be reused
 
-The agent map is only inserted into (`daemon.rs:161-162`); there is no removal
+The agent map is only inserted into (`daemon.rs:213-214`); there is no removal
 path. `listagents` keeps showing exited entries with their buffers and message
 history, and `new` with that name fails with `agent '<name>' already exists`.
 
@@ -117,9 +124,9 @@ Tracked as issue
 ## 8. Daemon restart kills live agents and discards exited state
 
 Buffers, message history, PTY handles and job objects are in-memory only
-(`daemon.rs:27-33`). `daemon restart` stops the daemon, which sends Ctrl-C to
+(`daemon.rs:79-85`). `daemon restart` stops the daemon, which sends Ctrl-C to
 every agent, force-kills any that are still running after ~500 ms
-(`daemon.rs:101-110`, `agent.rs:404-415`), and then exits; the next daemon
+(`daemon.rs:153-162`, `agent.rs:410-428`), and then exits; the next daemon
 starts empty. There is no session adoption.
 
 ```bash
@@ -183,7 +190,7 @@ Roadmap §4 (document the endpoints, add per-instance isolation).
 Access control is the endpoint itself: socket `0600` in a `0700` directory, or a
 pipe DACL for owner/`SYSTEM`/Administrators (`transport.rs:79-98`,
 `transport.rs:41`). There is no caller authentication, no per-session policy and
-no audit trail; `from` is an unauthenticated label (`daemon.rs:181-190`).
+no audit trail; `from` is an unauthenticated label (`daemon.rs:219-282`).
 
 ```bash
 agent-bridge kill dev --force        # any local process can do this
@@ -195,7 +202,7 @@ Roadmap §4 (threat model, policy, identity, audit).
 
 Retention is a fixed 256 KiB ring (`buffer.rs:6`); there is no way to raise it.
 An attach client that cannot keep up with 1024 queued events is disconnected
-silently (`agent.rs:24`, `:361-368`) - the CLI sees the stream close, not an
+silently (`agent.rs:24`, `:374-381`) - the CLI sees the stream close, not an
 error.
 
 Roadmap §3 (configurable sizes, explicit drop signalling).
@@ -203,11 +210,12 @@ Roadmap §3 (configurable sizes, explicit drop signalling).
 ## 14. Message history is per-agent and bounded at 500
 
 `record_message` keeps the newest 500 entries (`agent.rs:20`, `:318-327`), and
-the global log keeps 1000 (`daemon.rs:24`). Both are in-memory and vanish with
-the daemon. There is no persistence and no per-message identifier, so entries
-cannot be referenced later.
+the global id-indexed log keeps 2000 (`daemon.rs:25`, `:29-63`). Both are
+in-memory and vanish with the daemon. Ids are unique only for one daemon
+lifetime, so `messagestatus` returns `not_found` after a restart even though the
+id was valid before; there is no persistence.
 
-Roadmap §2 (message ids, status lookup) and §7 (optional metadata persistence).
+Roadmap §7 (optional metadata persistence).
 
 ## 15. Windows: a process forked before job assignment is outside the job
 

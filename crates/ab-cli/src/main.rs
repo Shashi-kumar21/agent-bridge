@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use agent_bridge_core::client;
 use agent_bridge_core::daemon::Daemon;
 use agent_bridge_core::paths;
-use agent_bridge_core::protocol::{Request, Response, DEFAULT_COLS, DEFAULT_ROWS};
+use agent_bridge_core::protocol::{DeliveryStatus, Request, Response, DEFAULT_COLS, DEFAULT_ROWS};
 use agent_bridge_core::Result;
 use clap::{Parser, Subcommand};
 
@@ -109,6 +109,20 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Show the delivery status of one message.
+    #[command(visible_alias = "msg-status")]
+    Messagestatus {
+        /// Message id printed by `sendmessage` or `log`.
+        id: u64,
+    },
+    /// List messages that are still queued or being written.
+    Pending {
+        /// Agent name.
+        target: String,
+        /// Maximum entries.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Check whether the daemon answers.
     Ping,
     /// Print protocol and daemon details.
@@ -179,12 +193,37 @@ fn run(cli: Cli) -> Result<()> {
                 enter: Some(!no_enter),
                 from,
             })?;
-            match (&response, json) {
-                (Response::Sent { bytes, .. }, false) => {
-                    println!("sent {bytes} bytes to {target}");
-                    Ok(())
+            let failure = match &response {
+                Response::Sent {
+                    message_id,
+                    status: DeliveryStatus::Failed { detail, .. },
+                    ..
+                } => Some((*message_id, detail.clone())),
+                _ => None,
+            };
+            if json {
+                emit(response, json)?;
+            } else if let Response::Sent {
+                target,
+                bytes,
+                message_id,
+                status,
+            } = &response
+            {
+                if failure.is_none() {
+                    println!(
+                        "sent msg {message_id} to {target} ({}, {bytes} bytes)",
+                        fmt::status_line(status)
+                    );
                 }
-                _ => emit(response, json),
+            } else {
+                emit(response, json)?;
+            }
+            match failure {
+                Some((id, detail)) => {
+                    Err(agent_bridge_core::BridgeError::DeliveryFailed { id, detail })
+                }
+                None => Ok(()),
             }
         }
         Command::New {
@@ -256,7 +295,32 @@ fn run(cli: Cli) -> Result<()> {
             let response = client::request(&Request::Log { limit: Some(limit) })?;
             match (&response, json) {
                 (Response::Messages { messages }, false) => {
-                    fmt::print_messages(messages);
+                    fmt::print_messages(messages, "no messages yet");
+                    Ok(())
+                }
+                _ => emit(response, json),
+            }
+        }
+        Command::Messagestatus { id } => {
+            ensure_daemon(true)?;
+            let response = client::request(&Request::MessageStatus { id })?;
+            match (&response, json) {
+                (Response::Message { message }, false) => {
+                    fmt::print_message(message);
+                    Ok(())
+                }
+                _ => emit(response, json),
+            }
+        }
+        Command::Pending { target, limit } => {
+            ensure_daemon(true)?;
+            let response = client::request(&Request::Pending {
+                target,
+                limit: Some(limit),
+            })?;
+            match (&response, json) {
+                (Response::Messages { messages }, false) => {
+                    fmt::print_messages(messages, "no pending messages");
                     Ok(())
                 }
                 _ => emit(response, json),
@@ -306,8 +370,17 @@ fn emit(response: Response, json: bool) -> Result<()> {
             truncated,
             ..
         } => fmt::print_output(&agent, &lines, truncated),
-        Response::Sent { target, bytes } => println!("sent {bytes} bytes to {target}"),
-        Response::Messages { messages } => fmt::print_messages(&messages),
+        Response::Sent {
+            target,
+            bytes,
+            message_id,
+            status,
+        } => println!(
+            "sent msg {message_id} to {target} ({}, {bytes} bytes)",
+            fmt::status_line(&status)
+        ),
+        Response::Message { message } => fmt::print_message(&message),
+        Response::Messages { messages } => fmt::print_messages(&messages, "no messages yet"),
         Response::Error { .. } => unreachable!("handled above"),
     }
     Ok(())
@@ -461,12 +534,61 @@ fn skew_restart_is_safe(live_agents: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::skew_restart_is_safe;
+    use super::{skew_restart_is_safe, Cli, Command};
+    use clap::Parser;
 
     #[test]
     fn skew_restart_requires_idle_daemon() {
         assert!(skew_restart_is_safe(0));
         assert!(!skew_restart_is_safe(1));
         assert!(!skew_restart_is_safe(7));
+    }
+
+    #[test]
+    fn parses_message_status_and_alias() {
+        let cli = Cli::try_parse_from(["agent-bridge", "messagestatus", "42"]).expect("parse");
+        assert!(matches!(cli.command, Command::Messagestatus { id: 42 }));
+
+        let alias = Cli::try_parse_from(["agent-bridge", "msg-status", "7"]).expect("parse alias");
+        assert!(matches!(alias.command, Command::Messagestatus { id: 7 }));
+    }
+
+    #[test]
+    fn parses_pending_with_limit() {
+        let cli =
+            Cli::try_parse_from(["agent-bridge", "pending", "dev", "--limit", "5"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Pending { target, limit: 5 } if target == "dev"
+        ));
+    }
+
+    #[test]
+    fn sendmessage_keeps_its_flags() {
+        let cli = Cli::try_parse_from([
+            "agent-bridge",
+            "sendmessage",
+            "dev",
+            "--from",
+            "qa",
+            "--no-enter",
+            "hello",
+            "world",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Sendmessage {
+                target,
+                message,
+                from,
+                no_enter,
+            } => {
+                assert_eq!(target, "dev");
+                assert_eq!(message, ["hello", "world"]);
+                assert_eq!(from.as_deref(), Some("qa"));
+                assert!(no_enter);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

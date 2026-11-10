@@ -14,19 +14,71 @@ use interprocess::local_socket::Stream;
 use tracing::{debug, error, info};
 
 use crate::agent::{Agent, SpawnConfig};
+use crate::delivery;
 use crate::error::{BridgeError, Result};
 use crate::protocol::{
-    validate_name, AgentInfo, ErrorCode, Event, Message, Millis, Request, Response, DEFAULT_COLS,
-    DEFAULT_ROWS, PROTOCOL_VERSION,
+    validate_name, AgentInfo, DeliveryStatus, ErrorCode, Event, Message, MessageId, Millis,
+    Request, Response, DEFAULT_COLS, DEFAULT_ROWS, PROTOCOL_VERSION,
 };
 use crate::transport;
 
-const MAX_LOG: usize = 1000;
+const MAX_LOG: usize = 2000;
 const HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// Bounded, id-indexed message history.
+struct MessageLog {
+    entries: BTreeMap<MessageId, Message>,
+    order: VecDeque<MessageId>,
+}
+
+impl MessageLog {
+    fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, message: Message) {
+        let id = message.id;
+        self.entries.insert(id, message);
+        self.order.push_back(id);
+        while self.order.len() > MAX_LOG {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, id: MessageId) -> Option<&Message> {
+        self.entries.get(&id)
+    }
+
+    fn recent(&self, limit: usize) -> Vec<Message> {
+        let skip = self.order.len().saturating_sub(limit);
+        self.order
+            .iter()
+            .skip(skip)
+            .filter_map(|id| self.entries.get(id).cloned())
+            .collect()
+    }
+
+    fn pending(&self, target: &str, limit: usize) -> Vec<Message> {
+        let mut messages: Vec<Message> = self
+            .entries
+            .values()
+            .filter(|message| message.target == target && message.status.is_pending())
+            .cloned()
+            .collect();
+        let skip = messages.len().saturating_sub(limit);
+        messages.drain(..skip);
+        messages
+    }
+}
 
 struct Inner {
     agents: Mutex<BTreeMap<String, Arc<Agent>>>,
-    log: Mutex<VecDeque<Message>>,
+    messages: Mutex<MessageLog>,
     started_at: Millis,
     shutdown: AtomicBool,
     endpoint: String,
@@ -56,7 +108,7 @@ impl Daemon {
         Self {
             inner: Arc::new(Inner {
                 agents: Mutex::new(BTreeMap::new()),
-                log: Mutex::new(VecDeque::new()),
+                messages: Mutex::new(MessageLog::new()),
                 started_at: crate::now_ms(),
                 shutdown: AtomicBool::new(false),
                 endpoint,
@@ -172,22 +224,61 @@ impl Inner {
             } => {
                 let agent = self.get(&target)?;
                 let enter = enter.unwrap_or(true);
-                let text = message.clone();
-                let mut payload = message.into_bytes();
+                let mut payload = message.clone().into_bytes();
                 if enter {
                     payload.push(b'\r');
                 }
-                let bytes = agent.write_bytes(&payload)?;
+                let limit = delivery::max_message_bytes();
+                if payload.len() > limit {
+                    return Err(BridgeError::MessageTooLarge {
+                        bytes: payload.len(),
+                        limit,
+                        env: delivery::MAX_MESSAGE_ENV,
+                    });
+                }
+
+                let id = delivery::next_message_id();
+                let now = crate::now_ms();
                 let record = Message {
+                    id,
                     target: target.clone(),
-                    from: from.clone(),
-                    text,
-                    at: crate::now_ms(),
+                    from,
+                    text: message,
+                    at: now,
+                    updated_at: now,
+                    bytes: 0,
+                    status: DeliveryStatus::Queued,
                 };
+                self.store_message(record.clone());
                 agent.record_message(record.clone());
-                self.push_log(record.clone());
-                agent_publish(&agent, record);
-                Ok(Response::Sent { target, bytes })
+                agent_publish(&agent, &record);
+
+                self.set_status(&agent, &target, id, DeliveryStatus::Writing, 0);
+                let status = match agent.write_bytes(&payload) {
+                    Ok(bytes) => {
+                        self.set_status(&agent, &target, id, DeliveryStatus::Written, bytes);
+                        DeliveryStatus::Written
+                    }
+                    Err(err) => {
+                        let failure = DeliveryStatus::Failed {
+                            code: err.code(),
+                            detail: err.to_string(),
+                        };
+                        self.set_status(&agent, &target, id, failure.clone(), 0);
+                        failure
+                    }
+                };
+                let bytes = if status == DeliveryStatus::Written {
+                    payload.len()
+                } else {
+                    0
+                };
+                Ok(Response::Sent {
+                    target,
+                    bytes,
+                    message_id: id,
+                    status,
+                })
             }
             Request::Read { target, lines } => {
                 let agent = self.get(&target)?;
@@ -220,6 +311,28 @@ impl Inner {
             Request::Log { limit } => Ok(Response::Messages {
                 messages: self.log(limit.unwrap_or(50)),
             }),
+            Request::MessageStatus { id } => {
+                let message = self
+                    .messages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(id)
+                    .cloned();
+                match message {
+                    Some(message) => Ok(Response::Message { message }),
+                    None => Err(BridgeError::MessageNotFound(id)),
+                }
+            }
+            Request::Pending { target, limit } => {
+                // An unknown agent is an error, matching `sendmessage`.
+                let _ = self.get(&target)?;
+                let messages = self
+                    .messages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pending(&target, limit.unwrap_or(50));
+                Ok(Response::Messages { messages })
+            }
             Request::Shutdown => {
                 self.shutdown.store(true, Ordering::SeqCst);
                 Ok(Response::Ok)
@@ -249,33 +362,58 @@ impl Inner {
         agents.values().map(|agent| agent.info()).collect()
     }
 
-    fn push_log(&self, message: Message) {
-        let mut log = self
-            .log
+    fn store_message(&self, message: Message) {
+        self.messages
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        log.push_back(message);
-        while log.len() > MAX_LOG {
-            log.pop_front();
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(message);
+    }
+
+    fn set_status(
+        &self,
+        agent: &Arc<Agent>,
+        target: &str,
+        id: MessageId,
+        status: DeliveryStatus,
+        bytes: usize,
+    ) {
+        let at = crate::now_ms();
+        {
+            let mut log = self
+                .messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(record) = log.entries.get_mut(&id) {
+                record.status = status.clone();
+                record.bytes = bytes;
+                record.updated_at = at;
+            }
         }
+        agent.update_message(id, status.clone(), bytes, at);
+        agent.publish(Event::MessageStatus {
+            agent: target.to_string(),
+            id,
+            status,
+            at,
+        });
     }
 
     fn log(&self, limit: usize) -> Vec<Message> {
-        let log = self
-            .log
+        self.messages
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let skip = log.len().saturating_sub(limit);
-        log.iter().skip(skip).cloned().collect()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recent(limit)
     }
 }
 
-fn agent_publish(agent: &Arc<Agent>, message: Message) {
+fn agent_publish(agent: &Arc<Agent>, message: &Message) {
     agent.publish(Event::Message {
         agent: message.target.clone(),
-        from: message.from,
-        text: message.text,
+        id: message.id,
+        from: message.from.clone(),
+        text: message.text.clone(),
         at: message.at,
+        status: message.status.clone(),
     });
 }
 
@@ -417,4 +555,60 @@ fn write_frame<W: Write, T: serde::Serialize>(writer: &mut W, value: &T) -> std:
     frame.push(b'\n');
     writer.write_all(&frame)?;
     writer.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeliveryStatus, Message, MessageLog, MAX_LOG};
+
+    fn record(id: u64, target: &str, status: DeliveryStatus) -> Message {
+        Message {
+            id,
+            target: target.to_string(),
+            from: None,
+            text: format!("m{id}"),
+            at: id,
+            updated_at: id,
+            bytes: 0,
+            status,
+        }
+    }
+
+    #[test]
+    fn recent_returns_the_last_entries_in_order() {
+        let mut log = MessageLog::new();
+        log.insert(record(1, "dev", DeliveryStatus::Written));
+        log.insert(record(2, "dev", DeliveryStatus::Queued));
+        log.insert(record(3, "dev", DeliveryStatus::Writing));
+
+        let recent: Vec<u64> = log.recent(2).iter().map(|m| m.id).collect();
+        assert_eq!(recent, [2, 3]);
+        assert_eq!(log.recent(10).len(), 3);
+    }
+
+    #[test]
+    fn pending_filters_by_target_and_status() {
+        let mut log = MessageLog::new();
+        log.insert(record(1, "dev", DeliveryStatus::Written));
+        log.insert(record(2, "dev", DeliveryStatus::Queued));
+        log.insert(record(3, "dev", DeliveryStatus::Writing));
+        log.insert(record(4, "qa", DeliveryStatus::Queued));
+
+        let pending: Vec<u64> = log.pending("dev", 10).iter().map(|m| m.id).collect();
+        assert_eq!(pending, [2, 3]);
+        assert_eq!(log.pending("dev", 1).len(), 1);
+        assert_eq!(log.pending("qa", 10).len(), 1);
+        assert!(log.pending("nobody", 10).is_empty());
+    }
+
+    #[test]
+    fn the_log_is_bounded() {
+        let mut log = MessageLog::new();
+        for id in 1..=(MAX_LOG as u64 + 5) {
+            log.insert(record(id, "dev", DeliveryStatus::Written));
+        }
+        assert_eq!(log.recent(MAX_LOG + 100).len(), MAX_LOG);
+        assert!(log.get(1).is_none());
+        assert!(log.get(MAX_LOG as u64 + 5).is_some());
+    }
 }

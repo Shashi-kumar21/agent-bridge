@@ -17,6 +17,7 @@ pub mod agent;
 pub mod buffer;
 pub mod client;
 pub mod daemon;
+pub mod delivery;
 pub mod error;
 pub mod paths;
 pub mod protocol;
@@ -25,7 +26,8 @@ pub mod transport;
 
 pub use error::{BridgeError, Result};
 pub use protocol::{
-    AgentInfo, AgentStatus, ErrorCode, Event, Message, Request, Response, PROTOCOL_VERSION,
+    AgentInfo, AgentStatus, DeliveryStatus, ErrorCode, Event, Message, MessageId, Request,
+    Response, PROTOCOL_VERSION,
 };
 
 /// Current wall clock in milliseconds since the Unix epoch.

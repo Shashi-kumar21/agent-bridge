@@ -7,8 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Bumped whenever the request/response shape changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Bumped whenever the wire shape changes. New `cmd`/`event` tags are unknown
+/// to older daemons, so additive changes bump it too; the CLI compares it for
+/// equality and restarts a daemon only when no agent is live.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Default terminal width for spawned agents.
 pub const DEFAULT_COLS: u16 = 120;
@@ -21,6 +23,12 @@ pub type Seq = u64;
 
 /// Milliseconds since the Unix epoch.
 pub type Millis = u64;
+
+/// Daemon-wide message identifier, starting at 1.
+///
+/// Unique for the lifetime of one daemon process. The message history is
+/// in-memory only, so an id from a previous daemon is eventually `not_found`.
+pub type MessageId = u64;
 
 /// Machine readable error categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +44,29 @@ pub enum ErrorCode {
     NotRunning,
     /// Unexpected internal failure.
     Internal,
+    /// The message is larger than the configured limit.
+    TooLarge,
+    /// The per-agent write queue is full.
+    QueueFull,
+    /// A queue or write deadline expired.
+    Timeout,
+}
+
+impl ErrorCode {
+    /// Stable `snake_case` label, identical to the wire form.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::BadRequest => "bad_request",
+            Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
+            Self::NotRunning => "not_running",
+            Self::Internal => "internal",
+            Self::TooLarge => "too_large",
+            Self::QueueFull => "queue_full",
+            Self::Timeout => "timeout",
+        }
+    }
 }
 
 /// Lifecycle state of an agent session.
@@ -81,17 +112,78 @@ pub struct AgentInfo {
     pub rows: u16,
 }
 
-/// One delivered inter-agent message.
+/// Delivery lifecycle of one message.
+///
+/// `Queued` and `Writing` are transient; `Written`, `Failed` and `Unknown` are
+/// terminal for the caller. `Unknown` means the writer started but the outcome
+/// could not be confirmed in time; the daemon may amend it later to `Written`
+/// or `Failed`. A message is never reported as delivered or acknowledged:
+/// writing bytes into a PTY only proves the bytes were accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DeliveryStatus {
+    /// Accepted by the daemon, waiting for a queue slot.
+    Queued,
+    /// The daemon handed the message to the writer; it may still be waiting
+    /// for the writer lock or inside the PTY write.
+    Writing,
+    /// The write and flush returned successfully.
+    #[default]
+    Written,
+    /// The message was never written, or the write failed.
+    Failed {
+        /// Machine readable cause.
+        code: ErrorCode,
+        /// Human readable detail.
+        detail: String,
+    },
+    /// The write started but its outcome is not confirmed yet.
+    Unknown,
+}
+
+impl DeliveryStatus {
+    /// `true` while the daemon may still change the status.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Queued | Self::Writing)
+    }
+
+    /// Short label used by the CLI and the message log.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Writing => "writing",
+            Self::Written => "written",
+            Self::Failed { .. } => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One inter-agent message and its delivery status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    /// Daemon-wide identifier (0 for records from a v1 daemon).
+    #[serde(default)]
+    pub id: MessageId,
     /// Recipient agent name.
     pub target: String,
     /// Optional sender label (`--from`).
     pub from: Option<String>,
     /// Message body as delivered to the PTY.
     pub text: String,
-    /// Delivery timestamp (ms since epoch).
+    /// Enqueue timestamp (ms since epoch).
     pub at: Millis,
+    /// Last status change (ms since epoch).
+    #[serde(default)]
+    pub updated_at: Millis,
+    /// Payload bytes accepted by the PTY (0 until written).
+    #[serde(default)]
+    pub bytes: usize,
+    /// Current delivery status (v1 records default to `written`).
+    #[serde(default)]
+    pub status: DeliveryStatus,
 }
 
 /// Client to daemon commands.
@@ -181,6 +273,19 @@ pub enum Request {
         #[serde(default)]
         limit: Option<usize>,
     },
+    /// Delivery status of one message.
+    MessageStatus {
+        /// Identifier returned by `Send` (or the message event).
+        id: MessageId,
+    },
+    /// Messages that are still queued or being written.
+    Pending {
+        /// Agent name.
+        target: String,
+        /// Maximum entries to return.
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     /// Ask the daemon to exit.
     Shutdown,
 }
@@ -235,12 +340,24 @@ pub enum Response {
         /// Last sequence number included.
         seq: Seq,
     },
-    /// Message accepted and written to the PTY.
+    /// Message accepted, with its delivery status.
     Sent {
         /// Recipient.
         target: String,
-        /// Bytes written including the trailing newline.
+        /// Bytes accepted by the PTY, including the appended carriage return
+        /// (0 while queued or when the write failed).
         bytes: usize,
+        /// Daemon-wide message identifier.
+        #[serde(default)]
+        message_id: MessageId,
+        /// Status at the time the response was sent.
+        #[serde(default)]
+        status: DeliveryStatus,
+    },
+    /// One message record.
+    Message {
+        /// The message and its current status.
+        message: Message,
     },
     /// Message history.
     Messages {
@@ -274,15 +391,32 @@ pub enum Event {
         /// Base64 encoded raw bytes.
         data: String,
     },
-    /// A message was delivered to this agent.
+    /// A message was accepted for this agent.
     Message {
         /// Agent name.
         agent: String,
+        /// Daemon-wide message identifier.
+        #[serde(default)]
+        id: MessageId,
         /// Sender label.
         from: Option<String>,
         /// Message body.
         text: String,
         /// Timestamp.
+        at: Millis,
+        /// Delivery status at enqueue time.
+        #[serde(default)]
+        status: DeliveryStatus,
+    },
+    /// A message changed delivery status.
+    MessageStatus {
+        /// Agent name.
+        agent: String,
+        /// Daemon-wide message identifier.
+        id: MessageId,
+        /// New status.
+        status: DeliveryStatus,
+        /// Timestamp of the change.
         at: Millis,
     },
     /// The agent process terminated.
@@ -310,7 +444,10 @@ pub fn validate_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_name, Response};
+    use super::{
+        validate_name, DeliveryStatus, ErrorCode, Event, Message, Request, Response,
+        PROTOCOL_VERSION,
+    };
 
     #[test]
     fn accepts_reasonable_names() {
@@ -342,6 +479,125 @@ mod tests {
             Response::Version {
                 protocol: 1,
                 pid: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn protocol_is_two() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
+    #[test]
+    fn error_code_labels_match_the_wire_form() {
+        for code in [
+            ErrorCode::BadRequest,
+            ErrorCode::NotFound,
+            ErrorCode::Conflict,
+            ErrorCode::NotRunning,
+            ErrorCode::Internal,
+            ErrorCode::TooLarge,
+            ErrorCode::QueueFull,
+            ErrorCode::Timeout,
+        ] {
+            let wire = serde_json::to_string(&code).expect("serialize");
+            assert_eq!(wire, format!("\"{}\"", code.label()));
+        }
+    }
+
+    /// A message from a v1 daemon has no id, status or byte count.
+    #[test]
+    fn legacy_message_frame_defaults_to_written() {
+        let legacy = r#"{"target":"dev","from":"qa","text":"hi","at":7}"#;
+        let parsed: Message = serde_json::from_str(legacy).expect("legacy message");
+        assert_eq!(parsed.id, 0);
+        assert_eq!(parsed.bytes, 0);
+        assert_eq!(parsed.status, DeliveryStatus::Written);
+        assert!(matches!(parsed.status, DeliveryStatus::Written));
+    }
+
+    #[test]
+    fn delivery_status_round_trips_with_tag() {
+        let failed = DeliveryStatus::Failed {
+            code: ErrorCode::TooLarge,
+            detail: "too big".to_string(),
+        };
+        let json = serde_json::to_string(&failed).expect("serialize");
+        assert!(json.contains("\"state\":\"failed\""));
+        assert!(json.contains("\"code\":\"too_large\""));
+        let parsed: DeliveryStatus = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, failed);
+
+        let queued = serde_json::to_string(&DeliveryStatus::Queued).expect("serialize");
+        assert_eq!(queued, r#"{"state":"queued"}"#);
+    }
+
+    #[test]
+    fn sent_frame_round_trips() {
+        let sent = Response::Sent {
+            target: "dev".to_string(),
+            bytes: 3,
+            message_id: 42,
+            status: DeliveryStatus::Written,
+        };
+        let json = serde_json::to_string(&sent).expect("serialize");
+        let parsed: Response = serde_json::from_str(&json).expect("deserialize");
+        match parsed {
+            Response::Sent {
+                message_id,
+                status,
+                bytes,
+                ..
+            } => {
+                assert_eq!(message_id, 42);
+                assert_eq!(bytes, 3);
+                assert_eq!(status, DeliveryStatus::Written);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// A v1 `Sent` frame carries no id or status; v2 clients must not fail.
+    #[test]
+    fn legacy_sent_frame_still_parses() {
+        let legacy = r#"{"kind":"sent","target":"dev","bytes":3}"#;
+        let parsed: Response = serde_json::from_str(legacy).expect("legacy sent");
+        assert!(matches!(
+            parsed,
+            Response::Sent {
+                message_id: 0,
+                status: DeliveryStatus::Written,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn message_status_request_round_trips() {
+        let request = Request::MessageStatus { id: 9 };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert!(json.contains("\"cmd\":\"message_status\""));
+        let parsed: Request = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(parsed, Request::MessageStatus { id: 9 }));
+    }
+
+    #[test]
+    fn message_status_event_round_trips() {
+        let event = Event::MessageStatus {
+            agent: "dev".to_string(),
+            id: 1,
+            status: DeliveryStatus::Writing,
+            at: 5,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(json.contains("\"event\":\"message_status\""));
+        let parsed: Event = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            parsed,
+            Event::MessageStatus {
+                id: 1,
+                status: DeliveryStatus::Writing,
                 ..
             }
         ));

@@ -70,6 +70,12 @@ agent-bridge attach dev          # Ctrl-] detaches
 `sendmessage` writes into the target PTY exactly as if a human typed it, so any
 interactive CLI works: Claude Code, OpenCode, a shell, a REPL, an editor.
 
+Every message gets a daemon-wide id and a delivery status: `queued`, `writing`,
+`written`, `failed` or `unknown`. `written` only means the daemon's PTY write
+returned; it is not an acknowledgement from the target application. Payloads
+are limited to 64 KiB by default; export `AGENT_BRIDGE_MAX_MESSAGE` (1 KiB..1
+MiB) before `daemon start`/`restart`, because the daemon reads it.
+
 ## Commands
 
 | Command | Purpose |
@@ -77,11 +83,13 @@ interactive CLI works: Claude Code, OpenCode, a shell, a REPL, an editor.
 | `agent-bridge daemon start\|stop\|restart\|status\|run` | manage the background daemon |
 | `agent-bridge listagents` | table of agents (name, status, pid, messages, last output) |
 | `agent-bridge new <name> [-- <cmd...>]` | spawn an agent in a daemon-owned PTY |
-| `agent-bridge sendmessage <name> <text>` | type text into another agent's terminal |
+| `agent-bridge sendmessage <name> <text>` | type text into another agent's terminal; prints the message id and status |
+| `agent-bridge messagestatus <id>` | delivery status of one message (alias `msg-status`) |
+| `agent-bridge pending <name>` | messages for an agent that are still queued or being written |
 | `agent-bridge read <name> --lines N` | ANSI-stripped tail of its output |
 | `agent-bridge attach <name>` | live mirror + keyboard passthrough |
 | `agent-bridge kill <name>` | Ctrl-C first; `--force` kills the agent's process tree immediately (Windows: whole job; Unix: process group + best-effort tree snapshot from `ps` or `/proc`, plus a PTY fd sweep on Linux) |
-| `agent-bridge log` | global message history |
+| `agent-bridge log` | global message history (id, status, sender, body) |
 | `agent-bridge ping` / `version` | health, protocol details, daemon pid and teardown mechanism |
 
 Every command supports `--json` for scripting and for the Tauri UI.
