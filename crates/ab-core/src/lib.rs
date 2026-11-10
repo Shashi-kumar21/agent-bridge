@@ -17,6 +17,7 @@ pub mod agent;
 pub mod buffer;
 pub mod client;
 pub mod daemon;
+pub mod delivery;
 pub mod error;
 pub mod paths;
 pub mod protocol;

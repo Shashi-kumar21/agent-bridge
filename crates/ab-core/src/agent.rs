@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 
 use crate::buffer::OutputBuffer;
 use crate::error::{BridgeError, Result};
-use crate::protocol::{AgentInfo, AgentStatus, Event, Message, Millis};
+use crate::protocol::{AgentInfo, AgentStatus, DeliveryStatus, Event, Message, MessageId, Millis};
 use crate::reaper::{self, ProcessReaper};
 
 const MAX_MESSAGES: usize = 500;
@@ -323,6 +323,19 @@ impl Agent {
         messages.push_back(message);
         while messages.len() > MAX_MESSAGES {
             messages.pop_front();
+        }
+    }
+
+    /// Update the stored record for `id` when it is still in history.
+    pub fn update_message(&self, id: MessageId, status: DeliveryStatus, bytes: usize, at: Millis) {
+        let mut messages = self
+            .messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = messages.iter_mut().find(|record| record.id == id) {
+            record.status = status;
+            record.bytes = bytes;
+            record.updated_at = at;
         }
     }
 

@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use agent_bridge_core::protocol::{AgentInfo, AgentStatus, Message};
+use agent_bridge_core::protocol::{AgentInfo, AgentStatus, DeliveryStatus, Message};
 
 /// Format a timestamp as a coarse age ("4s ago").
 #[must_use]
@@ -90,6 +90,30 @@ pub fn print_output(agent: &str, lines: &[String], truncated: bool) {
     }
 }
 
+/// Print one message record and its delivery status.
+pub fn print_message(message: &Message) {
+    let from = message.from.as_deref().unwrap_or("owner");
+    println!("id       : {}", message.id);
+    println!("target   : {}", message.target);
+    println!("from     : {from}");
+    println!("status   : {}", status_line(&message.status));
+    println!("bytes    : {}", message.bytes);
+    println!("queued   : {}", human_age(message.at));
+    println!("updated  : {}", human_age(message.updated_at));
+    println!("text     : {}", message.text);
+}
+
+/// `label (detail)` for a delivery status.
+#[must_use]
+pub fn status_line(status: &DeliveryStatus) -> String {
+    match status {
+        DeliveryStatus::Failed { code, detail } => {
+            format!("failed ({}): {detail}", code.label())
+        }
+        other => other.label().to_string(),
+    }
+}
+
 /// Print the global message log.
 pub fn print_messages(messages: &[Message]) {
     if messages.is_empty() {
@@ -99,8 +123,9 @@ pub fn print_messages(messages: &[Message]) {
     for message in messages {
         let from = message.from.as_deref().unwrap_or("owner");
         println!(
-            "{}  {from} -> {}: {}",
-            human_age(message.at),
+            "#{} {:<8} {from} -> {}: {}",
+            message.id,
+            status_line(&message.status),
             message.target,
             message.text
         );

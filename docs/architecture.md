@@ -111,20 +111,29 @@ restart from zero in a new daemon.
 
 ## 5. Message (input) lifecycle
 
-1. `Send` assembles `message` + optional `\r` (`daemon.rs:167-180`).
-2. `Agent::write_bytes` checks liveness, takes the writer mutex, and calls
-   `write_all` + `flush` (`agent.rs:286-297`). Because the mutex is held for the
-   whole payload, two concurrent senders cannot interleave *within* a call; there
-   is no queue, so a slow or blocked write simply blocks the caller's thread.
-3. After the write succeeds, the message is recorded on the agent (bounded to
-   500 entries, `agent.rs:20`, `:318-327`), appended to the global log (bounded
-   to 1000, `daemon.rs:24`, `:252-261`), and published to subscribers as
-   `Event::Message` (`daemon.rs:181-190`).
-4. The response is `Sent { target, bytes }` (`protocol.rs:238-244`). It means
-   "bytes were accepted by the PTY", not that the target application read,
-   understood or acted on them.
-5. `Input` (used by `attach`) writes base64 keystrokes through the same
-   `write_bytes` path (`daemon.rs:207-214`).
+1. `Send` validates the target, appends the optional `\r`, and rejects a
+   payload above the size limit with `too_large` (`daemon.rs:219-282`,
+   `delivery.rs:34-42`). The limit is 64 KiB by default and is configurable
+   with `AGENT_BRIDGE_MAX_MESSAGE` (clamped to 1 KiB..1 MiB).
+2. The daemon allocates a daemon-wide `message_id` (`delivery.rs:25`), stores
+   the record as `queued` in the bounded id-indexed log (2000 entries,
+   `daemon.rs:29-63`, `:365-370`) and publishes `Event::Message`.
+3. `Agent::write_bytes` checks liveness, takes the writer mutex, and calls
+   `write_all` + `flush` (`agent.rs:286-297`). The mutex is held for the whole
+   payload, so two concurrent senders cannot interleave bytes within a call;
+   there is still no queue, so a blocked write blocks the caller's thread
+   (roadmap §2, Phase 2B).
+4. The status moves `queued -> writing -> written`, or to
+   `failed { code, detail }` when the agent has exited or the write fails;
+   every change is published as `Event::MessageStatus` (`daemon.rs:372-399`).
+   `MessageStatus` and `Pending` read the same records (`daemon.rs:314-333`).
+   `unknown` is defined for the queued writer in Phase 2B and is not emitted
+   by the synchronous path.
+5. The response is `Sent { target, bytes, message_id, status }`
+   (`protocol.rs:341-353`). It means "bytes were accepted by the PTY", never
+   that the target application read, understood or acted on them.
+6. `Input` (used by `attach`) still writes base64 keystrokes through the same
+   `write_bytes` path (`agent.rs:286-297`).
 
 The `from` field is a caller-supplied label, stored and forwarded verbatim; it
 is never authenticated.
@@ -179,7 +188,9 @@ is never authenticated.
 * Unit tests live next to the code (`buffer.rs`, `protocol.rs`, `transport.rs`,
   `reaper.rs` on Linux).
 * `crates/ab-core/tests/daemon_e2e.rs` exercises a real daemon over the real
-  endpoint; `crates/ab-cli/tests/orphan_teardown.rs` covers process lifetime.
+  endpoint, including message ids, `messagestatus`, `pending` and the
+  oversize rejection; `crates/ab-cli/tests/orphan_teardown.rs` covers process
+  lifetime.
 * CI (`.github/workflows/ci.yml`) runs `build` and `test` on the
   Windows/macOS/Linux matrix; `fmt`, `clippy -D warnings`, `deny` and
   `coverage` run on Linux only. All jobs run for pushes to `main`/`dev` and for

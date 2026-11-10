@@ -19,17 +19,20 @@ $env:AGENT_BRIDGE_PIPE = "agent-bridge-audit" # PowerShell, Windows isolation
 ## 1. Message delivery is "written", never "delivered"
 
 `sendmessage` writes bytes into the target's PTY and returns
-`Sent { bytes }` (`daemon.rs:167-190`, `protocol.rs:238-244`). The target
-application may be mid-render, waiting at a prompt, or not reading at all. There
-is no acknowledgement, no retry and no delivery status.
+`Sent { bytes, message_id, status }` (`daemon.rs:219-282`). The status records
+what the daemon's write path did, not what the target did: the application may
+be mid-render, waiting at a prompt, or not reading at all. There is no retry and
+no application-level acknowledgement, so `written` does not mean the request was
+understood or executed.
 
 ```bash
 agent-bridge new shell -- cmd.exe            # or /bin/sh
-agent-bridge sendmessage shell "echo hi"     # "sent ... bytes"
+agent-bridge sendmessage shell "echo hi"     # "sent msg 1 to shell (written, ...)"
 agent-bridge kill shell --force              # nothing observed the message
 ```
 
-Roadmap §2.
+Roadmap §2 (application-level acknowledgement only where a receiving
+integration can send one).
 
 ## 2. A blocked write stalls every sender, with no timeout or queue
 
@@ -37,6 +40,8 @@ Roadmap §2.
 (`agent.rs:286-297`). There is no write timeout and no bounded queue: if the
 target stops draining its PTY, every `sendmessage` to that agent blocks in its
 connection thread until the OS write completes or the daemon is restarted.
+Message ids and statuses exist, but nothing can time out or reorder a blocked
+write yet (Phase 2B).
 
 There is also no message size limit; a large message is one `write_all` under
 the lock.
@@ -202,12 +207,13 @@ Roadmap §3 (configurable sizes, explicit drop signalling).
 
 ## 14. Message history is per-agent and bounded at 500
 
-`record_message` keeps the newest 500 entries (`agent.rs:20`, `:318-327`), and
-the global log keeps 1000 (`daemon.rs:24`). Both are in-memory and vanish with
-the daemon. There is no persistence and no per-message identifier, so entries
-cannot be referenced later.
+`record_message` keeps the newest 500 entries (`agent.rs:20`, `:318-329`), and
+the global id-indexed log keeps 2000 (`daemon.rs:24`, `:29-63`). Both are
+in-memory and vanish with the daemon. Ids are unique only for one daemon
+lifetime, so `messagestatus` returns `not_found` after a restart even though the
+id was valid before; there is no persistence.
 
-Roadmap §2 (message ids, status lookup) and §7 (optional metadata persistence).
+Roadmap §7 (optional metadata persistence).
 
 ## 15. Windows: a process forked before job assignment is outside the job
 

@@ -75,7 +75,7 @@ that the target application accepted, understood, or completed the request.
 
 Implement a minimal, explicit delivery lifecycle:
 
--   [ ] Add a unique `message_id` to every message.
+-   [x] Add a unique `message_id` to every message.
 -   [ ] Add a per-session write queue so simultaneous senders cannot interleave bytes.
 -   [ ] Ensure each message is written atomically at the application layer, as far as the PTY API permits.
 -   [ ] Support multi-line messages safely. Investigate bracketed paste where supported, but provide a documented fallback because terminal applications differ.

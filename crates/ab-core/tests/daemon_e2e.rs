@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use agent_bridge_core::client;
 use agent_bridge_core::daemon::Daemon;
-use agent_bridge_core::protocol::{AgentStatus, Request, Response};
+use agent_bridge_core::protocol::{AgentStatus, DeliveryStatus, ErrorCode, Request, Response};
 use agent_bridge_core::Event;
 
 /// Command that echoes whatever is typed into its PTY.
@@ -77,7 +77,7 @@ fn wait_for_ping() {
     }
 }
 
-fn send_message(target: &str, message: &str) {
+fn send_message(target: &str, message: &str) -> u64 {
     let sent = client::request(&Request::Send {
         target: target.to_string(),
         message: message.to_string(),
@@ -85,7 +85,71 @@ fn send_message(target: &str, message: &str) {
         from: Some("qa".to_string()),
     })
     .expect("send message");
-    assert!(matches!(sent, Response::Sent { .. }), "got {sent:?}");
+    match sent {
+        Response::Sent {
+            message_id,
+            status,
+            bytes,
+            ..
+        } => {
+            assert!(message_id > 0, "message ids start at 1");
+            assert_eq!(status, DeliveryStatus::Written);
+            assert!(bytes > 0);
+            message_id
+        }
+        other => panic!("expected a sent response, got {other:?}"),
+    }
+}
+
+fn assert_message_status(id: u64) {
+    match client::request(&Request::MessageStatus { id }).expect("message status") {
+        Response::Message { message } => {
+            assert_eq!(message.id, id);
+            assert_eq!(message.target, "e2e");
+            assert_eq!(message.status, DeliveryStatus::Written);
+            assert!(message.bytes > 0);
+            assert!(message.updated_at >= message.at);
+            assert!(message.text.contains("bridge-ping"));
+        }
+        other => panic!("unexpected status response: {other:?}"),
+    }
+
+    match client::request(&Request::Pending {
+        target: "e2e".to_string(),
+        limit: None,
+    })
+    .expect("pending")
+    {
+        Response::Messages { messages } => {
+            assert!(
+                messages.is_empty(),
+                "nothing should stay queued: {messages:?}"
+            );
+        }
+        other => panic!("unexpected pending response: {other:?}"),
+    }
+
+    match client::request(&Request::MessageStatus { id: u64::MAX }).expect("missing status") {
+        Response::Error { code, .. } => assert_eq!(code, ErrorCode::NotFound),
+        other => panic!("unexpected missing-status response: {other:?}"),
+    }
+}
+
+/// The daemon rejects an oversized payload before recording it.
+fn assert_oversize_rejected() {
+    std::env::set_var("AGENT_BRIDGE_MAX_MESSAGE", "1024");
+    let response = client::request(&Request::Send {
+        target: "e2e".to_string(),
+        message: "x".repeat(2048),
+        enter: Some(true),
+        from: None,
+    })
+    .expect("oversize send");
+    std::env::remove_var("AGENT_BRIDGE_MAX_MESSAGE");
+    match response {
+        Response::Error { code, .. } => assert_eq!(code, ErrorCode::TooLarge),
+        other => panic!("unexpected oversize response: {other:?}"),
+    }
 }
 
 /// Poll `read` until the PTY echoes `needle`.
@@ -131,6 +195,8 @@ fn assert_list_and_log() {
         Response::Messages { messages } => {
             assert_eq!(messages.len(), 2);
             assert!(messages.iter().all(|m| m.from.as_deref() == Some("qa")));
+            assert!(messages.iter().all(|m| m.id > 0));
+            assert!(messages.iter().all(|m| m.status == DeliveryStatus::Written));
         }
         other => panic!("unexpected log response: {other:?}"),
     }
@@ -189,8 +255,10 @@ fn daemon_lists_sends_and_reads() {
     wait_for_ping();
 
     assert_create_rules();
-    send_message("e2e", "bridge-ping");
+    let id = send_message("e2e", "bridge-ping");
     wait_for_echo("e2e", "bridge-ping");
+    assert_message_status(id);
+    assert_oversize_rejected();
     assert_attach_stream();
     assert_list_and_log();
 
