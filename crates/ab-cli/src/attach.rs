@@ -51,7 +51,7 @@ pub fn run(target: &str, from_seq: Option<u64>) -> Result<()> {
                     let _ = write!(
                         stdout,
                         "\r\n\x1b[2m[bridge]\x1b[0m message {id} {}\r\n",
-                        status.label()
+                        crate::fmt::status_line(&status)
                     );
                     let _ = stdout.flush();
                 }

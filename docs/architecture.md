@@ -53,21 +53,21 @@ Module map (`crates/ab-core/src`):
 
 * The daemon is a single process (`crates/ab-cli/src/main.rs`, `DaemonAction::Run`).
   `Daemon::run` binds the endpoint, then loops on `listener.accept()`
-  (`daemon.rs:74-92`).
-* Every accepted connection gets its own thread (`daemon.rs:78`). There is no
+  (`daemon.rs:120-143`).
+* Every accepted connection gets its own thread (`daemon.rs:130`). There is no
   connection pool and no request queue: concurrency is one thread per client, and
-  shared state is protected by mutexes (`Inner::agents`, `Inner::log`,
-  `daemon.rs:27-33`).
+  shared state is protected by mutexes (`Inner::agents`, `Inner::messages`,
+  `daemon.rs:79-85`).
 * Each agent starts two threads: a PTY reader pump (`agent.rs:150-153`) and a
   child waiter that polls `try_wait` every 120 ms (`agent.rs:155-158`,
   `:191`).
 * Per-agent mutable state lives behind mutexes inside `Agent`
   (`agent.rs:60-69`): PTY writer, PTY master (resize), child handle, output
   buffer, message history, subscriber list, reaper.
-* Shutdown: `Request::Shutdown` sets an `AtomicBool` (`daemon.rs:223-226`); the
-  accept loop observes it, calls `Inner::stop_agents` (`daemon.rs:94`,
-  `:101-110`), which sends Ctrl-C to every agent, force-kills the ones still
-  running after ~500 ms (`agent.rs:404-415`), and then lets the process exit.
+* Shutdown: `Request::Shutdown` sets an `AtomicBool` (`Inner::shutdown`, `daemon.rs:336-339`); the
+  accept loop observes it, calls `Inner::stop_agents` (`daemon.rs:146`,
+  `:153-162`), which sends Ctrl-C to every agent, force-kills the ones still
+  running after ~500 ms (`agent.rs:410-428`), and then lets the process exit.
 
 ## 3. Request lifecycle (non-streaming)
 
@@ -76,12 +76,12 @@ Module map (`crates/ab-core/src`):
    back (`client.rs:16-35`); the connection is then dropped.
 3. Daemon-side `serve_connection` reads one line, parses it, and either
    dispatches to `Inner::handle` or routes it to `stream_attach`
-   (`daemon.rs:294-322`).
+   (`serve_connection`, `daemon.rs:432-459`).
 4. `Inner::handle` maps errors to `Response::Error` with an `ErrorCode`
-   (`daemon.rs:112-120`); `try_handle` implements the match
-   (`daemon.rs:123-231`).
+   (`daemon.rs:164-172`); `try_handle` implements the match
+   (`daemon.rs:175-343`).
 5. The response is serialized as one line with the whole frame built before the
-   write, so frames cannot interleave mid-line (`daemon.rs:413-420`).
+   write, so frames cannot interleave mid-line (`write_frame`, `daemon.rs:551-558`).
 
 Every request except `Attach` is one request and one response. There is no
 pipelining: a second request on the same connection is never read.
@@ -94,16 +94,16 @@ pipelining: a second request on the same connection is never read.
    (`buffer.rs:6`); the oldest bytes are dropped and `truncated` is latched.
 3. The chunk is stamped with the next sequence number (`agent.rs:177`) and
    published to subscribers as a base64 `Event::Output` (`agent.rs:178-182`).
-4. Subscribers are bounded channels of 1024 events (`agent.rs:24`, `:343`). A
+4. Subscribers are bounded channels of 1024 events (`agent.rs:24`, `:355-356`). A
    subscriber that cannot keep up is dropped and logged
-   (`agent.rs:361-368`).
+   (`agent.rs:374-381`).
 5. `Read` returns ANSI-stripped tail lines plus the current `seq`
-   (`daemon.rs:192-201`, `agent.rs:309-315`, `buffer.rs:63-77`). This is a line
+   (`daemon.rs:283-292`, `agent.rs:309-315`, `buffer.rs:63-77`). This is a line
    view of raw bytes, not a terminal screen.
 6. `Attach` subscribes first, sends `Hello`, optionally replays the whole
    retained buffer as one frame tagged with the *current* `seq`
-   (`daemon.rs:343-365`), then streams live events until exit or disconnect
-   (`daemon.rs:380-408`). Because the replay and the live stream can repeat a
+   (`daemon.rs:481-503`), then streams live events until exit or disconnect
+   (`daemon.rs:518-546`). Because the replay and the live stream can repeat a
    sequence number, clients drop non-increasing `seq` (`client.rs:79-83`).
 
 Sequence numbers count output chunks, not bytes, and are process-local: they
@@ -117,7 +117,7 @@ restart from zero in a new daemon.
    with `AGENT_BRIDGE_MAX_MESSAGE` (clamped to 1 KiB..1 MiB).
 2. The daemon allocates a daemon-wide `message_id` (`delivery.rs:25`), stores
    the record as `queued` in the bounded id-indexed log (2000 entries,
-   `daemon.rs:29-63`, `:365-370`) and publishes `Event::Message`.
+   `daemon.rs:29-78`, `:365-370`) and publishes `Event::Message`.
 3. `Agent::write_bytes` checks liveness, takes the writer mutex, and calls
    `write_all` + `flush` (`agent.rs:286-297`). The mutex is held for the whole
    payload, so two concurrent senders cannot interleave bytes within a call;
@@ -130,7 +130,7 @@ restart from zero in a new daemon.
    `unknown` is defined for the queued writer in Phase 2B and is not emitted
    by the synchronous path.
 5. The response is `Sent { target, bytes, message_id, status }`
-   (`protocol.rs:341-353`). It means "bytes were accepted by the PTY", never
+   (`protocol.rs:344-356`). It means "bytes were accepted by the PTY", never
    that the target application read, understood or acted on them.
 6. `Input` (used by `attach`) still writes base64 keystrokes through the same
    `write_bytes` path (`agent.rs:286-297`).

@@ -115,19 +115,20 @@ pub fn status_line(status: &DeliveryStatus) -> String {
 }
 
 /// Print the global message log.
-pub fn print_messages(messages: &[Message]) {
+pub fn print_messages(messages: &[Message], empty: &str) {
     if messages.is_empty() {
-        println!("no messages yet");
+        println!("{empty}");
         return;
     }
     for message in messages {
         let from = message.from.as_deref().unwrap_or("owner");
+        let status = match &message.status {
+            DeliveryStatus::Failed { code, .. } => format!("failed ({})", code.label()),
+            other => other.label().to_string(),
+        };
         println!(
             "#{} {:<8} {from} -> {}: {}",
-            message.id,
-            status_line(&message.status),
-            message.target,
-            message.text
+            message.id, status, message.target, message.text
         );
     }
 }

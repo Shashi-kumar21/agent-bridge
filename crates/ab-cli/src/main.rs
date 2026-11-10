@@ -195,9 +195,10 @@ fn run(cli: Cli) -> Result<()> {
             })?;
             let failure = match &response {
                 Response::Sent {
-                    status: DeliveryStatus::Failed { code, detail },
+                    message_id,
+                    status: DeliveryStatus::Failed { detail, .. },
                     ..
-                } => Some(format!("delivery failed ({}): {detail}", code.label())),
+                } => Some((*message_id, detail.clone())),
                 _ => None,
             };
             if json {
@@ -209,15 +210,19 @@ fn run(cli: Cli) -> Result<()> {
                 status,
             } = &response
             {
-                println!(
-                    "sent msg {message_id} to {target} ({}, {bytes} bytes)",
-                    fmt::status_line(status)
-                );
+                if failure.is_none() {
+                    println!(
+                        "sent msg {message_id} to {target} ({}, {bytes} bytes)",
+                        fmt::status_line(status)
+                    );
+                }
             } else {
                 emit(response, json)?;
             }
             match failure {
-                Some(message) => Err(agent_bridge_core::BridgeError::Daemon(message)),
+                Some((id, detail)) => {
+                    Err(agent_bridge_core::BridgeError::DeliveryFailed { id, detail })
+                }
                 None => Ok(()),
             }
         }
@@ -290,7 +295,7 @@ fn run(cli: Cli) -> Result<()> {
             let response = client::request(&Request::Log { limit: Some(limit) })?;
             match (&response, json) {
                 (Response::Messages { messages }, false) => {
-                    fmt::print_messages(messages);
+                    fmt::print_messages(messages, "no messages yet");
                     Ok(())
                 }
                 _ => emit(response, json),
@@ -315,7 +320,7 @@ fn run(cli: Cli) -> Result<()> {
             })?;
             match (&response, json) {
                 (Response::Messages { messages }, false) => {
-                    fmt::print_messages(messages);
+                    fmt::print_messages(messages, "no pending messages");
                     Ok(())
                 }
                 _ => emit(response, json),
@@ -375,7 +380,7 @@ fn emit(response: Response, json: bool) -> Result<()> {
             fmt::status_line(&status)
         ),
         Response::Message { message } => fmt::print_message(&message),
-        Response::Messages { messages } => fmt::print_messages(&messages),
+        Response::Messages { messages } => fmt::print_messages(&messages, "no messages yet"),
         Response::Error { .. } => unreachable!("handled above"),
     }
     Ok(())

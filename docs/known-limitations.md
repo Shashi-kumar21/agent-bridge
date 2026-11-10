@@ -43,10 +43,12 @@ connection thread until the OS write completes or the daemon is restarted.
 Message ids and statuses exist, but nothing can time out or reorder a blocked
 write yet (Phase 2B).
 
-There is also no message size limit; a large message is one `write_all` under
-the lock.
+The payload limit is separate and already enforced: 64 KiB by default,
+`AGENT_BRIDGE_MAX_MESSAGE` (clamped to 1 KiB..=1 MiB) raises or lowers it, and
+an oversized message is rejected with `too_large` before any record is created
+(`delivery.rs:34-42`, `daemon.rs:231-240`).
 
-Roadmap §2 (`queued`/`written`/`failed`/`unknown`, bounded queue, timeouts).
+Roadmap §2 (bounded queue, timeouts).
 
 ## 3. Large messages are not atomic at the terminal level
 
@@ -80,8 +82,8 @@ Roadmap §6 (VT screen model and snapshot).
 
 ## 5. No byte offset cursor; `seq` counts chunks
 
-`Read` returns the current `seq` (`protocol.rs:227-237`); `Attach --from-seq`
-only decides whether to replay the *whole* retained buffer (`daemon.rs:352-365`).
+`Read` returns the current `seq` (`protocol.rs:333-342`); `Attach --from-seq`
+only decides whether to replay the *whole* retained buffer (`daemon.rs:490-503`).
 Because `seq` increments per PTY chunk, not per byte, callers cannot resume from
 an arbitrary offset, and a replay frame carries the newest `seq` for bytes that
 may include older chunks.
@@ -104,7 +106,7 @@ Roadmap §3 (cursor semantics that report what is actually available).
 
 ## 7. Exited agents are never removed; names cannot be reused
 
-The agent map is only inserted into (`daemon.rs:161-162`); there is no removal
+The agent map is only inserted into (`daemon.rs:213-214`); there is no removal
 path. `listagents` keeps showing exited entries with their buffers and message
 history, and `new` with that name fails with `agent '<name>' already exists`.
 
@@ -122,9 +124,9 @@ Tracked as issue
 ## 8. Daemon restart kills live agents and discards exited state
 
 Buffers, message history, PTY handles and job objects are in-memory only
-(`daemon.rs:27-33`). `daemon restart` stops the daemon, which sends Ctrl-C to
+(`daemon.rs:79-85`). `daemon restart` stops the daemon, which sends Ctrl-C to
 every agent, force-kills any that are still running after ~500 ms
-(`daemon.rs:101-110`, `agent.rs:404-415`), and then exits; the next daemon
+(`daemon.rs:153-162`, `agent.rs:410-428`), and then exits; the next daemon
 starts empty. There is no session adoption.
 
 ```bash
@@ -188,7 +190,7 @@ Roadmap §4 (document the endpoints, add per-instance isolation).
 Access control is the endpoint itself: socket `0600` in a `0700` directory, or a
 pipe DACL for owner/`SYSTEM`/Administrators (`transport.rs:79-98`,
 `transport.rs:41`). There is no caller authentication, no per-session policy and
-no audit trail; `from` is an unauthenticated label (`daemon.rs:181-190`).
+no audit trail; `from` is an unauthenticated label (`daemon.rs:219-282`).
 
 ```bash
 agent-bridge kill dev --force        # any local process can do this
@@ -200,15 +202,15 @@ Roadmap §4 (threat model, policy, identity, audit).
 
 Retention is a fixed 256 KiB ring (`buffer.rs:6`); there is no way to raise it.
 An attach client that cannot keep up with 1024 queued events is disconnected
-silently (`agent.rs:24`, `:361-368`) - the CLI sees the stream close, not an
+silently (`agent.rs:24`, `:374-381`) - the CLI sees the stream close, not an
 error.
 
 Roadmap §3 (configurable sizes, explicit drop signalling).
 
 ## 14. Message history is per-agent and bounded at 500
 
-`record_message` keeps the newest 500 entries (`agent.rs:20`, `:318-329`), and
-the global id-indexed log keeps 2000 (`daemon.rs:24`, `:29-63`). Both are
+`record_message` keeps the newest 500 entries (`agent.rs:20`, `:318-327`), and
+the global id-indexed log keeps 2000 (`daemon.rs:25`, `:29-63`). Both are
 in-memory and vanish with the daemon. Ids are unique only for one daemon
 lifetime, so `messagestatus` returns `not_found` after a restart even though the
 id was valid before; there is no persistence.

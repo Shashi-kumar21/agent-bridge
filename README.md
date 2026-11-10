@@ -73,7 +73,8 @@ interactive CLI works: Claude Code, OpenCode, a shell, a REPL, an editor.
 Every message gets a daemon-wide id and a delivery status: `queued`, `writing`,
 `written`, `failed` or `unknown`. `written` only means the daemon's PTY write
 returned; it is not an acknowledgement from the target application. Payloads
-are limited to 64 KiB by default (`AGENT_BRIDGE_MAX_MESSAGE`).
+are limited to 64 KiB by default; export `AGENT_BRIDGE_MAX_MESSAGE` (1 KiB..1
+MiB) before `daemon start`/`restart`, because the daemon reads it.
 
 ## Commands
 

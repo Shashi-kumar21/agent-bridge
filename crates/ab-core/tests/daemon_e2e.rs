@@ -137,6 +137,7 @@ fn assert_message_status(id: u64) {
 
 /// The daemon rejects an oversized payload before recording it.
 fn assert_oversize_rejected() {
+    let before = message_count();
     std::env::set_var("AGENT_BRIDGE_MAX_MESSAGE", "1024");
     let response = client::request(&Request::Send {
         target: "e2e".to_string(),
@@ -149,6 +150,18 @@ fn assert_oversize_rejected() {
     match response {
         Response::Error { code, .. } => assert_eq!(code, ErrorCode::TooLarge),
         other => panic!("unexpected oversize response: {other:?}"),
+    }
+    assert_eq!(
+        message_count(),
+        before,
+        "a rejected payload must not create a message record"
+    );
+}
+
+fn message_count() -> usize {
+    match client::request(&Request::Log { limit: Some(10) }).expect("log") {
+        Response::Messages { messages } => messages.len(),
+        other => panic!("unexpected log response: {other:?}"),
     }
 }
 

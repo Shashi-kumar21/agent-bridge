@@ -7,7 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Bumped whenever the request/response shape changes incompatibly.
+/// Bumped whenever the wire shape changes. New `cmd`/`event` tags are unknown
+/// to older daemons, so additive changes bump it too; the CLI compares it for
+/// equality and restarts a daemon only when no agent is live.
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Default terminal width for spawned agents.
@@ -122,7 +124,8 @@ pub struct AgentInfo {
 pub enum DeliveryStatus {
     /// Accepted by the daemon, waiting for a queue slot.
     Queued,
-    /// The writer thread is inside the PTY write.
+    /// The daemon handed the message to the writer; it may still be waiting
+    /// for the writer lock or inside the PTY write.
     Writing,
     /// The write and flush returned successfully.
     #[default]
@@ -341,7 +344,8 @@ pub enum Response {
     Sent {
         /// Recipient.
         target: String,
-        /// Bytes written including the trailing newline (0 while queued).
+        /// Bytes accepted by the PTY, including the appended carriage return
+        /// (0 while queued or when the write failed).
         bytes: usize,
         /// Daemon-wide message identifier.
         #[serde(default)]

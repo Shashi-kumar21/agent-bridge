@@ -51,6 +51,15 @@ pub enum BridgeError {
     #[error("message '{0}' not found (ids are per daemon; a restart clears history)")]
     MessageNotFound(u64),
 
+    /// A message was accepted but the daemon could not write it.
+    #[error("message {id} failed: {detail}")]
+    DeliveryFailed {
+        /// Message identifier.
+        id: u64,
+        /// Cause reported by the write path.
+        detail: String,
+    },
+
     /// Generic daemon-side failure.
     #[error("{0}")]
     Daemon(String),
@@ -62,7 +71,9 @@ impl BridgeError {
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::AgentNotFound(_) | Self::MessageNotFound(_) => ErrorCode::NotFound,
-            Self::AgentExists(_) | Self::AgentExited(_) => ErrorCode::Conflict,
+            Self::AgentExists(_) | Self::AgentExited(_) | Self::DeliveryFailed { .. } => {
+                ErrorCode::Conflict
+            }
             Self::InvalidName(_) | Self::Protocol(_) => ErrorCode::BadRequest,
             Self::MessageTooLarge { .. } => ErrorCode::TooLarge,
             Self::DaemonNotRunning(_) | Self::Daemon(_) => ErrorCode::NotRunning,
