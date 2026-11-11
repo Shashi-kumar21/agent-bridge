@@ -292,6 +292,7 @@ impl Agent {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             message_count,
+            queued: self.queue.depth(),
             subscribers: self.subscriber_count.load(Ordering::SeqCst),
             cols: self.cols.load(Ordering::SeqCst),
             rows: self.rows.load(Ordering::SeqCst),

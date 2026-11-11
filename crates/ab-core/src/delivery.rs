@@ -363,6 +363,12 @@ impl WriteQueue {
         }
     }
 
+    /// Jobs waiting for the writer, not counting the write in flight.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.normal.len() + self.urgent.len()
+    }
+
     /// Stop admitting work and wake blocked callers. The writer drains what is
     /// already queued and marks it failed.
     pub fn close(&self) {
@@ -480,7 +486,9 @@ pub fn admission_status(error: AdmissionError) -> DeliveryStatus {
     match error {
         AdmissionError::Full => DeliveryStatus::Failed {
             code: ErrorCode::QueueFull,
-            detail: "write queue is full; raise AGENT_BRIDGE_QUEUE_LIMIT or retry".to_string(),
+            detail: "write queue is full; raise AGENT_BRIDGE_QUEUE_LIMIT / \
+                     AGENT_BRIDGE_QUEUE_BYTES or retry"
+                .to_string(),
         },
         AdmissionError::Closed => DeliveryStatus::Failed {
             code: ErrorCode::Conflict,
@@ -850,6 +858,50 @@ mod tests {
             }
             other => panic!("unexpected outcome: {other:?}"),
         }
+    }
+
+    #[test]
+    fn byte_budget_admission_waits_for_its_deadline() {
+        let sink = MockSink::default();
+        sink.block(true);
+        // Eight channel slots, but room for only one six-byte payload.
+        let (queue, _running) = queue(sink.clone(), 8, 8);
+
+        let (first, first_rx) = job(b"aaaaaa", false);
+        queue.submit(first, Duration::from_secs(1)).expect("first");
+        assert!(
+            sink.wait_started(Instant::now() + Duration::from_secs(2)),
+            "the writer should start the first job"
+        );
+
+        let started = Instant::now();
+        let (second, _rejected) = job(b"bbbbbb", false);
+        assert_eq!(
+            queue.submit(second, Duration::from_millis(150)),
+            Err(AdmissionError::Full),
+            "the byte budget must hold the second payload back"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(100),
+            "admission should wait for the deadline, waited {waited:?}"
+        );
+
+        // Once the blocked write finishes its bytes are released and the same
+        // payload is admitted.
+        sink.release();
+        assert!(matches!(
+            first_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(WriteOutcome::Written { .. })
+        ));
+        let (second, second_rx) = job(b"bbbbbb", false);
+        queue
+            .submit(second, Duration::from_secs(1))
+            .expect("budget released");
+        assert!(matches!(
+            second_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(WriteOutcome::Written { .. })
+        ));
     }
 
     #[test]

@@ -330,7 +330,7 @@ impl Inner {
                         status: outcome.status(),
                     }),
                     Err(WaitError::Timeout) => {
-                        let status = self.mark_unknown(&agent, &target, id);
+                        let status = self.status_on_timeout(&agent, &target, id);
                         Ok(Response::Sent {
                             target,
                             bytes: 0,
@@ -487,11 +487,12 @@ impl Inner {
             .map(|message| message.status.clone())
     }
 
-    /// Mark a still-pending message `unknown` after the caller's write timeout.
+    /// Status to report when the caller's write wait expires.
     ///
-    /// If the writer already recorded a terminal status, return that instead so
-    /// the timeout cannot downgrade a completed write.
-    fn mark_unknown(&self, agent: &Arc<Agent>, target: &str, id: MessageId) -> DeliveryStatus {
+    /// Only a message whose write actually started becomes `unknown`: a message
+    /// still waiting for a queue slot stays `queued`, and a terminal status is
+    /// returned unchanged so a timeout can never downgrade a completed write.
+    fn status_on_timeout(&self, agent: &Arc<Agent>, target: &str, id: MessageId) -> DeliveryStatus {
         let at = crate::now_ms();
         let mut log = self
             .messages
@@ -500,8 +501,10 @@ impl Inner {
         let Some(record) = log.entries.get_mut(&id) else {
             return DeliveryStatus::Unknown;
         };
-        if !record.status.is_pending() {
-            return record.status.clone();
+        match record.status {
+            DeliveryStatus::Queued => return DeliveryStatus::Queued,
+            DeliveryStatus::Writing => {}
+            _ => return record.status.clone(),
         }
         record.status = DeliveryStatus::Unknown;
         record.bytes = 0;
@@ -574,14 +577,14 @@ fn apply_status(
             record.status = status.clone();
             record.bytes = bytes;
             record.updated_at = at;
+            agent.update_message(id, status.clone(), bytes, at);
+            agent.publish(Event::MessageStatus {
+                agent: target.to_string(),
+                id,
+                status,
+                at,
+            });
         }
-        agent.update_message(id, status.clone(), bytes, at);
-        agent.publish(Event::MessageStatus {
-            agent: target.to_string(),
-            id,
-            status,
-            at,
-        });
     }
 }
 

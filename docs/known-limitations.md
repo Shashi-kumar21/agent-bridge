@@ -37,9 +37,10 @@ integration can send one).
 
 ## 2. A blocked PTY write cannot be cancelled
 
-Each agent has one writer thread and a bounded queue (`delivery.rs:294-373`), so
-a slow target no longer blocks the caller's connection thread and memory stays
-bounded (128 jobs / 2 MiB per agent by default). Admission waits
+Each agent has one writer thread and a bounded queue (`delivery.rs:294-378`), so
+a slow target no longer blocks *other* senders' writes and memory stays bounded
+(128 jobs / 2 MiB per agent by default). A caller still waits up to
+`--write-timeout` (forever with `0`) for its own message. Admission waits
 `--queue-timeout` (5 s, `0` fails fast) and a full queue returns
 `failed { code: queue_full }`.
 
@@ -47,12 +48,13 @@ The remaining gap is the OS write itself: once `write_all` is inside the PTY
 there is no portable way to cancel it. `--write-timeout` (5 s by default, `0`
 waits forever) makes the caller return `unknown`; the writer keeps waiting and
 amends the record to `written`/`failed` when the syscall returns
-(`delivery.rs:437-476`, `daemon.rs:463-526`). A target that never drains its PTY
-therefore holds one queue slot until it exits or the daemon is restarted, and
-new messages to that agent eventually fail with `queue_full`.
+(`delivery.rs:443-482`, `daemon.rs:463-533`). A target that never drains its PTY
+therefore keeps the in-flight byte reservation and the channel fills up behind
+it until the agent exits or the daemon is restarted; new messages to that agent
+eventually fail with `queue_full`.
 
 Urgent jobs (Ctrl-C, `attach` keystrokes) use a separate channel and may pass a
-queued message between writes; they never split a payload (`agent.rs:330-364`).
+queued message between writes; they never split a payload (`agent.rs:331-365`).
 
 ## 3. Large messages are not atomic at the terminal level
 
@@ -86,8 +88,8 @@ Roadmap §6 (VT screen model and snapshot).
 
 ## 5. No byte offset cursor; `seq` counts chunks
 
-`Read` returns the current `seq` (`protocol.rs:345-353`); `Attach --from-seq`
-only decides whether to replay the *whole* retained buffer (`daemon.rs:664-666`).
+`Read` returns the current `seq` (`protocol.rs:345-355`); `Attach --from-seq`
+only decides whether to replay the *whole* retained buffer (`daemon.rs:672-673`).
 Because `seq` increments per PTY chunk, not per byte, callers cannot resume from
 an arbitrary offset, and a replay frame carries the newest `seq` for bytes that
 may include older chunks.
@@ -128,9 +130,9 @@ Tracked as issue
 ## 8. Daemon restart kills live agents and discards exited state
 
 Buffers, message history, PTY handles and job objects are in-memory only
-(`daemon.rs:79-85`). `daemon restart` stops the daemon, which sends Ctrl-C to
+(`daemon.rs:87-93`). `daemon restart` stops the daemon, which sends Ctrl-C to
 every agent, force-kills any that are still running after ~500 ms
-(`daemon.rs:153-162`, `agent.rs:478-496`), and then exits; the next daemon
+(`daemon.rs:161-170`, `agent.rs:479-497`), and then exits; the next daemon
 starts empty. There is no session adoption.
 
 ```bash

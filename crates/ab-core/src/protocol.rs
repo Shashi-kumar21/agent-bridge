@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the wire shape changes. New `cmd`/`event` tags are unknown
 /// to older daemons, so additive changes bump it too; the CLI compares it for
 /// equality and restarts a daemon only when no agent is live.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Default terminal width for spawned agents.
 pub const DEFAULT_COLS: u16 = 120;
@@ -104,6 +104,10 @@ pub struct AgentInfo {
     pub exit_code: Option<i32>,
     /// Number of messages routed to this agent.
     pub message_count: usize,
+    /// Jobs waiting in the agent's write queue, not counting the write in
+    /// flight.
+    #[serde(default)]
+    pub queued: usize,
     /// Number of live attach subscribers.
     pub subscribers: usize,
     /// PTY width.
@@ -114,18 +118,17 @@ pub struct AgentInfo {
 
 /// Delivery lifecycle of one message.
 ///
-/// `Queued` and `Writing` are transient; `Written`, `Failed` and `Unknown` are
-/// terminal for the caller. `Unknown` means the writer started but the outcome
-/// could not be confirmed in time; the daemon may amend it later to `Written`
-/// or `Failed`. A message is never reported as delivered or acknowledged:
-/// writing bytes into a PTY only proves the bytes were accepted.
+/// `Queued` and `Writing` are transient. `Written` and `Failed` are terminal;
+/// `Unknown` means the write started but the caller stopped waiting, and the
+/// daemon may still amend it to `Written` or `Failed`. A message is never
+/// reported as delivered or acknowledged: writing bytes into a PTY only proves
+/// the bytes were accepted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum DeliveryStatus {
-    /// Accepted by the daemon, waiting for a queue slot.
+    /// Accepted by the daemon and waiting in the agent's write queue.
     Queued,
-    /// The daemon handed the message to the writer; it may still be waiting
-    /// for the writer lock or inside the PTY write.
+    /// The writer is currently writing this job into the PTY.
     Writing,
     /// The write and flush returned successfully.
     #[default]
@@ -137,7 +140,8 @@ pub enum DeliveryStatus {
         /// Human readable detail.
         detail: String,
     },
-    /// The write started but its outcome is not confirmed yet.
+    /// The write started but its outcome was not confirmed before the
+    /// caller's deadline; the daemon may still amend it to `Written`/`Failed`.
     Unknown,
 }
 
@@ -145,7 +149,7 @@ impl DeliveryStatus {
     /// `true` while the daemon may still change the status.
     #[must_use]
     pub fn is_pending(&self) -> bool {
-        matches!(self, Self::Queued | Self::Writing)
+        matches!(self, Self::Queued | Self::Writing | Self::Unknown)
     }
 
     /// Short label used by the CLI and the message log.
@@ -228,7 +232,8 @@ pub enum Request {
         /// Milliseconds to wait for a free queue slot. `0` fails fast.
         #[serde(default)]
         queue_timeout_ms: Option<u64>,
-        /// Milliseconds to wait for the write. `0` waits forever.
+        /// Milliseconds to wait for the write. `0` waits forever. Ignored
+        /// when `wait` is false.
         #[serde(default)]
         write_timeout_ms: Option<u64>,
         /// Wait for a terminal status before replying (default true).
@@ -287,7 +292,7 @@ pub enum Request {
         /// Identifier returned by `Send` (or the message event).
         id: MessageId,
     },
-    /// Messages that are still queued or being written.
+    /// Messages that may still change: queued, writing or unknown.
     Pending {
         /// Agent name.
         target: String,
@@ -494,8 +499,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_is_two() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+    fn protocol_is_three() {
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[test]

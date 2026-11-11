@@ -24,11 +24,12 @@ pub fn print_agents(agents: &[AgentInfo]) {
         println!("no agents. create one with: agent-bridge new <name>");
         return;
     }
-    let mut rows: Vec<[String; 6]> = vec![[
+    let mut rows: Vec<[String; 7]> = vec![[
         "NAME".to_string(),
         "STATUS".to_string(),
         "PID".to_string(),
         "MSGS".to_string(),
+        "QUEUED".to_string(),
         "LAST OUTPUT".to_string(),
         "COMMAND".to_string(),
     ]];
@@ -43,6 +44,7 @@ pub fn print_agents(agents: &[AgentInfo]) {
                 .pid
                 .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
             agent.message_count.to_string(),
+            agent.queued.to_string(),
             agent
                 .last_output_at
                 .map_or_else(|| "-".to_string(), human_age),
@@ -77,6 +79,7 @@ pub fn print_agent(agent: &AgentInfo) {
         println!("exit code  : {code}");
     }
     println!("messages   : {}", agent.message_count);
+    println!("queued     : {}", agent.queued);
     println!("subscribers: {}", agent.subscribers);
 }
 
@@ -133,8 +136,8 @@ pub fn print_messages(messages: &[Message], empty: &str) {
     }
 }
 
-fn print_table(rows: &[[String; 6]]) {
-    let mut widths = [0_usize; 6];
+fn print_table<const N: usize>(rows: &[[String; N]]) {
+    let mut widths = [0_usize; N];
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
             widths[index] = widths[index].max(cell.chars().count());

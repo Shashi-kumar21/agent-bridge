@@ -227,10 +227,18 @@ fn run(cli: Cli) -> Result<()> {
             } = &response
             {
                 if failure.is_none() {
-                    println!(
-                        "sent msg {message_id} to {target} ({}, {bytes} bytes)",
-                        fmt::status_line(status)
-                    );
+                    if matches!(status, DeliveryStatus::Written) {
+                        println!(
+                            "sent msg {message_id} to {target} ({}, {bytes} bytes)",
+                            fmt::status_line(status)
+                        );
+                    } else {
+                        // `queued`/`unknown` have no confirmed byte count.
+                        println!(
+                            "sent msg {message_id} to {target} ({})",
+                            fmt::status_line(status)
+                        );
+                    }
                 }
             } else {
                 emit(response, json)?;
