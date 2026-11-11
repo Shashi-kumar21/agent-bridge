@@ -14,7 +14,7 @@ use interprocess::local_socket::Stream;
 use tracing::{debug, error, info};
 
 use crate::agent::{Agent, SpawnConfig};
-use crate::delivery;
+use crate::delivery::{self, JobEvent};
 use crate::error::{BridgeError, Result};
 use crate::protocol::{
     validate_name, AgentInfo, DeliveryStatus, ErrorCode, Event, Message, MessageId, Millis,
@@ -76,9 +76,17 @@ impl MessageLog {
     }
 }
 
+/// Why a caller stopped waiting for a write outcome.
+enum WaitError {
+    /// The write deadline expired.
+    Timeout,
+    /// The writer channel closed without an outcome.
+    Closed,
+}
+
 struct Inner {
     agents: Mutex<BTreeMap<String, Arc<Agent>>>,
-    messages: Mutex<MessageLog>,
+    messages: Arc<Mutex<MessageLog>>,
     started_at: Millis,
     shutdown: AtomicBool,
     endpoint: String,
@@ -108,7 +116,7 @@ impl Daemon {
         Self {
             inner: Arc::new(Inner {
                 agents: Mutex::new(BTreeMap::new()),
-                messages: Mutex::new(MessageLog::new()),
+                messages: Arc::new(Mutex::new(MessageLog::new())),
                 started_at: crate::now_ms(),
                 shutdown: AtomicBool::new(false),
                 endpoint,
@@ -221,6 +229,9 @@ impl Inner {
                 message,
                 enter,
                 from,
+                queue_timeout_ms,
+                write_timeout_ms,
+                wait,
             } => {
                 let agent = self.get(&target)?;
                 let enter = enter.unwrap_or(true);
@@ -253,32 +264,96 @@ impl Inner {
                 agent.record_message(record.clone());
                 agent_publish(&agent, &record);
 
-                self.set_status(&agent, &target, id, DeliveryStatus::Writing, 0);
-                let status = match agent.write_bytes(&payload) {
-                    Ok(bytes) => {
-                        self.set_status(&agent, &target, id, DeliveryStatus::Written, bytes);
-                        DeliveryStatus::Written
-                    }
-                    Err(err) => {
-                        let failure = DeliveryStatus::Failed {
-                            code: err.code(),
-                            detail: err.to_string(),
-                        };
-                        self.set_status(&agent, &target, id, failure.clone(), 0);
-                        failure
-                    }
-                };
-                let bytes = if status == DeliveryStatus::Written {
-                    payload.len()
+                let wait = wait.unwrap_or(true);
+                let queue_timeout = delivery::timeout_from_millis(
+                    queue_timeout_ms,
+                    delivery::DEFAULT_QUEUE_TIMEOUT,
+                );
+                let write_timeout = delivery::timeout_from_millis(
+                    write_timeout_ms,
+                    delivery::DEFAULT_WRITE_TIMEOUT,
+                );
+
+                let (ack, ack_rx) = crossbeam_channel::unbounded();
+                let observer = self.message_observer(&agent, &target, id);
+                if let Err(error) = agent.enqueue_message(
+                    payload.clone(),
+                    observer,
+                    wait.then_some(ack),
+                    queue_timeout,
+                ) {
+                    let status = delivery::admission_status(error);
+                    self.set_status(&agent, &target, id, status.clone(), 0);
+                    return Ok(Response::Sent {
+                        target,
+                        bytes: 0,
+                        message_id: id,
+                        status,
+                    });
+                }
+
+                if !wait {
+                    let status = self.current_status(id).unwrap_or(DeliveryStatus::Queued);
+                    let bytes = if status == DeliveryStatus::Written {
+                        payload.len()
+                    } else {
+                        0
+                    };
+                    return Ok(Response::Sent {
+                        target,
+                        bytes,
+                        message_id: id,
+                        status,
+                    });
+                }
+
+                let waited = if write_timeout.is_zero() {
+                    // `0` means wait forever; a dropped ack means the writer
+                    // stopped without reporting.
+                    ack_rx.recv().map_or(Err(WaitError::Closed), Ok)
                 } else {
-                    0
+                    match ack_rx.recv_timeout(write_timeout) {
+                        Ok(outcome) => Ok(outcome),
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            Err(WaitError::Timeout)
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            Err(WaitError::Closed)
+                        }
+                    }
                 };
-                Ok(Response::Sent {
-                    target,
-                    bytes,
-                    message_id: id,
-                    status,
-                })
+                match waited {
+                    Ok(outcome) => Ok(Response::Sent {
+                        target,
+                        bytes: outcome.bytes(),
+                        message_id: id,
+                        status: outcome.status(),
+                    }),
+                    Err(WaitError::Timeout) => {
+                        let status = self.mark_unknown(&agent, &target, id);
+                        Ok(Response::Sent {
+                            target,
+                            bytes: 0,
+                            message_id: id,
+                            status,
+                        })
+                    }
+                    Err(WaitError::Closed) => {
+                        let status =
+                            self.current_status(id)
+                                .unwrap_or_else(|| DeliveryStatus::Failed {
+                                    code: ErrorCode::Conflict,
+                                    detail: "writer stopped before reporting the result"
+                                        .to_string(),
+                                });
+                        Ok(Response::Sent {
+                            target,
+                            bytes: 0,
+                            message_id: id,
+                            status,
+                        })
+                    }
+                }
             }
             Request::Read { target, lines } => {
                 let agent = self.get(&target)?;
@@ -377,17 +452,128 @@ impl Inner {
         status: DeliveryStatus,
         bytes: usize,
     ) {
-        let at = crate::now_ms();
-        {
-            let mut log = self
-                .messages
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(record) = log.entries.get_mut(&id) {
-                record.status = status.clone();
-                record.bytes = bytes;
-                record.updated_at = at;
+        apply_status(&self.messages, agent, target, id, status, bytes);
+    }
+
+    /// Status callback handed to the writer thread for one message job.
+    ///
+    /// The writer calls this from its own thread: `Started` publishes
+    /// `writing`, `Done` publishes the terminal status. The job is already in
+    /// the store, so an amended status (after a caller timeout) still lands.
+    fn message_observer(
+        &self,
+        agent: &Arc<Agent>,
+        target: &str,
+        id: MessageId,
+    ) -> delivery::JobObserver {
+        let messages = Arc::clone(&self.messages);
+        let agent = Arc::clone(agent);
+        let target = target.to_string();
+        Box::new(move |event| match event {
+            JobEvent::Started => apply_writing(&messages, &agent, &target, id),
+            JobEvent::Done(outcome) => {
+                let bytes = outcome.bytes();
+                apply_status(&messages, &agent, &target, id, outcome.status(), bytes);
             }
+        })
+    }
+
+    /// Current stored status for `id`.
+    fn current_status(&self, id: MessageId) -> Option<DeliveryStatus> {
+        self.messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .map(|message| message.status.clone())
+    }
+
+    /// Mark a still-pending message `unknown` after the caller's write timeout.
+    ///
+    /// If the writer already recorded a terminal status, return that instead so
+    /// the timeout cannot downgrade a completed write.
+    fn mark_unknown(&self, agent: &Arc<Agent>, target: &str, id: MessageId) -> DeliveryStatus {
+        let at = crate::now_ms();
+        let mut log = self
+            .messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = log.entries.get_mut(&id) else {
+            return DeliveryStatus::Unknown;
+        };
+        if !record.status.is_pending() {
+            return record.status.clone();
+        }
+        record.status = DeliveryStatus::Unknown;
+        record.bytes = 0;
+        record.updated_at = at;
+        // Keep the log lock until the agent copy and the event are updated, so
+        // a concurrent `Done` cannot interleave a `written` before this
+        // `unknown` and leave the two histories disagreeing.
+        agent.update_message(id, DeliveryStatus::Unknown, 0, at);
+        agent.publish(Event::MessageStatus {
+            agent: target.to_string(),
+            id,
+            status: DeliveryStatus::Unknown,
+            at,
+        });
+        drop(log);
+        DeliveryStatus::Unknown
+    }
+
+    fn log(&self, limit: usize) -> Vec<Message> {
+        self.messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recent(limit)
+    }
+}
+
+fn apply_writing(messages: &Mutex<MessageLog>, agent: &Agent, target: &str, id: MessageId) {
+    let at = crate::now_ms();
+    {
+        let mut log = messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = log.entries.get_mut(&id) else {
+            return;
+        };
+        // A caller timeout may already have marked the record `unknown`; never
+        // downgrade that to `writing` when the queued job finally starts.
+        if !matches!(record.status, DeliveryStatus::Queued) {
+            return;
+        }
+        record.status = DeliveryStatus::Writing;
+        record.bytes = 0;
+        record.updated_at = at;
+        // Status writers serialize on this lock, so the agent copy and the
+        // published event follow the same order as the daemon log.
+        agent.update_message(id, DeliveryStatus::Writing, 0, at);
+        agent.publish(Event::MessageStatus {
+            agent: target.to_string(),
+            id,
+            status: DeliveryStatus::Writing,
+            at,
+        });
+    }
+}
+
+fn apply_status(
+    messages: &Mutex<MessageLog>,
+    agent: &Agent,
+    target: &str,
+    id: MessageId,
+    status: DeliveryStatus,
+    bytes: usize,
+) {
+    let at = crate::now_ms();
+    {
+        let mut log = messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = log.entries.get_mut(&id) {
+            record.status = status.clone();
+            record.bytes = bytes;
+            record.updated_at = at;
         }
         agent.update_message(id, status.clone(), bytes, at);
         agent.publish(Event::MessageStatus {
@@ -396,13 +582,6 @@ impl Inner {
             status,
             at,
         });
-    }
-
-    fn log(&self, limit: usize) -> Vec<Message> {
-        self.messages
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .recent(limit)
     }
 }
 

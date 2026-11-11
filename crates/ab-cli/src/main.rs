@@ -49,7 +49,8 @@ enum Command {
     Sendmessage {
         /// Target agent name.
         target: String,
-        /// Message body. Pass `--` first if it starts with a dash.
+        /// Message body. Options must come before it; pass `--` first if the
+        /// body itself starts with a dash.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         message: Vec<String>,
         /// Sender label recorded in the message log.
@@ -58,6 +59,15 @@ enum Command {
         /// Do not press Enter after typing the message.
         #[arg(long)]
         no_enter: bool,
+        /// Maximum wait for a free queue slot (`0` = fail fast).
+        #[arg(long, default_value = "5s", value_parser = parse_timeout)]
+        queue_timeout: Duration,
+        /// Maximum wait for the PTY write (`0` = wait forever).
+        #[arg(long, default_value = "5s", value_parser = parse_timeout)]
+        write_timeout: Duration,
+        /// Return after the message is queued instead of waiting for the write.
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Spawn a new agent inside a daemon-owned PTY.
     New {
@@ -184,6 +194,9 @@ fn run(cli: Cli) -> Result<()> {
             message,
             from,
             no_enter,
+            queue_timeout,
+            write_timeout,
+            no_wait,
         } => {
             ensure_daemon(true)?;
             let text = message.join(" ");
@@ -192,6 +205,9 @@ fn run(cli: Cli) -> Result<()> {
                 message: text,
                 enter: Some(!no_enter),
                 from,
+                queue_timeout_ms: Some(duration_millis(queue_timeout)),
+                write_timeout_ms: Some(duration_millis(write_timeout)),
+                wait: Some(!no_wait),
             })?;
             let failure = match &response {
                 Response::Sent {
@@ -532,9 +548,38 @@ fn skew_restart_is_safe(live_agents: usize) -> bool {
     live_agents == 0
 }
 
+/// Parse a CLI timeout: `500` / `500ms`, `5s`, `2m`; `0` means "no wait".
+fn parse_timeout(raw: &str) -> std::result::Result<Duration, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("empty timeout (use e.g. 5s, 500ms, 0)".to_string());
+    }
+    let (number, multiplier) = if let Some(value) = raw.strip_suffix("ms") {
+        (value, 1_u64)
+    } else if let Some(value) = raw.strip_suffix('s') {
+        (value, 1000)
+    } else if let Some(value) = raw.strip_suffix('m') {
+        (value, 60_000)
+    } else {
+        (raw, 1)
+    };
+    let value: u64 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid timeout '{raw}' (use e.g. 5s, 500ms, 0)"))?;
+    Ok(Duration::from_millis(value.saturating_mul(multiplier))
+        .min(agent_bridge_core::delivery::MAX_TIMEOUT))
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{skew_restart_is_safe, Cli, Command};
+    use std::time::Duration;
+
+    use super::{duration_millis, parse_timeout, skew_restart_is_safe, Cli, Command};
     use clap::Parser;
 
     #[test]
@@ -582,13 +627,64 @@ mod tests {
                 message,
                 from,
                 no_enter,
+                queue_timeout,
+                write_timeout,
+                no_wait,
             } => {
                 assert_eq!(target, "dev");
                 assert_eq!(message, ["hello", "world"]);
                 assert_eq!(from.as_deref(), Some("qa"));
                 assert!(no_enter);
+                assert_eq!(queue_timeout, Duration::from_secs(5));
+                assert_eq!(write_timeout, Duration::from_secs(5));
+                assert!(!no_wait);
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sendmessage_parses_timeouts_and_no_wait() {
+        let cli = Cli::try_parse_from([
+            "agent-bridge",
+            "sendmessage",
+            "dev",
+            "--queue-timeout",
+            "0",
+            "--write-timeout",
+            "250ms",
+            "--no-wait",
+            "hi",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Sendmessage {
+                queue_timeout,
+                write_timeout,
+                no_wait,
+                ..
+            } => {
+                assert_eq!(queue_timeout, Duration::ZERO);
+                assert_eq!(write_timeout, Duration::from_millis(250));
+                assert!(no_wait);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timeouts_reject_garbage_and_clamp() {
+        assert_eq!(parse_timeout("5s").expect("5s"), Duration::from_secs(5));
+        assert_eq!(parse_timeout("2m").expect("2m"), Duration::from_secs(120));
+        assert_eq!(
+            parse_timeout("500").expect("plain ms"),
+            Duration::from_millis(500)
+        );
+        assert!(parse_timeout("soon").is_err());
+        assert_eq!(
+            parse_timeout("999999m").expect("clamp"),
+            agent_bridge_core::delivery::MAX_TIMEOUT
+        );
+        assert_eq!(duration_millis(Duration::from_millis(250)), 250);
     }
 }

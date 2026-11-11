@@ -1,7 +1,7 @@
 //! One PTY-backed agent session owned by the daemon.
 
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -13,11 +13,19 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use tracing::{debug, warn};
 
 use crate::buffer::OutputBuffer;
+use crate::delivery::{self, Job, WriteOutcome, WriteQueue};
 use crate::error::{BridgeError, Result};
 use crate::protocol::{AgentInfo, AgentStatus, DeliveryStatus, Event, Message, MessageId, Millis};
 use crate::reaper::{self, ProcessReaper};
 
 const MAX_MESSAGES: usize = 500;
+
+/// How long an urgent write (Ctrl-C, attach keystroke) waits for the writer to
+/// acknowledge before the caller moves on. The bytes are still queued.
+const URGENT_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long an urgent write waits for a free urgent slot.
+const URGENT_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Per-subscriber event queue depth. A consumer that falls this far behind is
 /// disconnected instead of growing daemon memory without bound.
@@ -52,13 +60,13 @@ pub struct Agent {
     pid: Option<u32>,
     cols: AtomicU16,
     rows: AtomicU16,
-    running: AtomicBool,
+    running: Arc<AtomicBool>,
     exit_code: Mutex<Option<i32>>,
     exited_at: Mutex<Option<Millis>>,
     last_output_at: Mutex<Option<Millis>>,
     buffer: Mutex<OutputBuffer>,
     messages: Mutex<VecDeque<Message>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    queue: Arc<WriteQueue>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     subscribers: Mutex<Vec<Sender<Event>>>,
@@ -118,6 +126,13 @@ impl Agent {
         let master = pair.master;
         let writer = master.take_writer()?;
         let reader = master.try_clone_reader()?;
+        let running = Arc::new(AtomicBool::new(true));
+        let queue = WriteQueue::spawn(
+            writer,
+            delivery::QueueConfig::from_env(),
+            Arc::clone(&running),
+            config.name.clone(),
+        )?;
 
         let agent = Arc::new(Self {
             id: format!(
@@ -132,13 +147,13 @@ impl Agent {
             pid,
             cols: AtomicU16::new(config.cols),
             rows: AtomicU16::new(config.rows),
-            running: AtomicBool::new(true),
+            running,
             exit_code: Mutex::new(None),
             exited_at: Mutex::new(None),
             last_output_at: Mutex::new(None),
             buffer: Mutex::new(OutputBuffer::new(crate::buffer::DEFAULT_CAPACITY)),
             messages: Mutex::new(VecDeque::new()),
-            writer: Mutex::new(writer),
+            queue,
             master: Mutex::new(master),
             child: Mutex::new(child),
             subscribers: Mutex::new(Vec::new()),
@@ -218,6 +233,7 @@ impl Agent {
                         .exited_at
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(crate::now_ms());
+                    self.queue.close();
                     self.publish(Event::Exit {
                         agent: self.name.clone(),
                         code: Some(code),
@@ -282,18 +298,70 @@ impl Agent {
         }
     }
 
-    /// Write raw bytes into the PTY (as if typed).
+    /// Queue one message payload for the agent's writer.
+    ///
+    /// Returns once the job is admitted, or an admission error when the queue
+    /// stayed full until `timeout`. `observer`/`ack` travel with the job.
+    pub fn enqueue_message(
+        &self,
+        bytes: Vec<u8>,
+        observer: delivery::JobObserver,
+        ack: Option<Sender<WriteOutcome>>,
+        timeout: Duration,
+    ) -> std::result::Result<(), delivery::AdmissionError> {
+        if !self.is_running() {
+            return Err(delivery::AdmissionError::Closed);
+        }
+        self.queue.submit(
+            Job {
+                bytes,
+                observer: Some(observer),
+                ack,
+                urgent: false,
+            },
+            timeout,
+        )
+    }
+
+    /// Write raw bytes into the PTY as an urgent job (Ctrl-C, attach input).
+    ///
+    /// Waits up to two seconds for the writer to acknowledge. A timeout is not
+    /// an error: the bytes stay queued and the writer will still send them.
     pub fn write_bytes(&self, bytes: &[u8]) -> Result<usize> {
         if !self.is_running() {
             return Err(BridgeError::AgentExited(self.name.clone()));
         }
-        let mut writer = self
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        writer.write_all(bytes)?;
-        writer.flush()?;
-        Ok(bytes.len())
+        let rx = self.submit_urgent(bytes)?;
+        match rx.recv_timeout(URGENT_ACK_TIMEOUT) {
+            Ok(WriteOutcome::Written { bytes }) => Ok(bytes),
+            Ok(WriteOutcome::Failed { detail, .. }) => Err(BridgeError::Daemon(detail)),
+            Err(_) => Ok(bytes.len()),
+        }
+    }
+
+    /// Submit an urgent job without waiting for its acknowledgement.
+    ///
+    /// Used by `kill`: Ctrl-C must be queued before the grace period starts, but
+    /// shutdown must not stall for the full ack timeout per agent.
+    fn submit_urgent(&self, bytes: &[u8]) -> Result<crossbeam_channel::Receiver<WriteOutcome>> {
+        let (ack, rx) = crossbeam_channel::unbounded();
+        self.queue
+            .submit_urgent(
+                Job {
+                    bytes: bytes.to_vec(),
+                    observer: None,
+                    ack: Some(ack),
+                    urgent: true,
+                },
+                URGENT_QUEUE_TIMEOUT,
+            )
+            .map_err(|error| match error {
+                delivery::AdmissionError::Full => {
+                    BridgeError::Daemon("urgent write queue is full".to_string())
+                }
+                delivery::AdmissionError::Closed => BridgeError::AgentExited(self.name.clone()),
+            })?;
+        Ok(rx)
     }
 
     /// Replay of the retained output.
@@ -414,7 +482,7 @@ impl Agent {
         if !self.is_running() {
             return Ok(());
         }
-        let _ = self.write_bytes(b"\x03");
+        let _ = self.submit_urgent(b"\x03");
         for _ in 0..10 {
             if !self.is_running() {
                 return Ok(());

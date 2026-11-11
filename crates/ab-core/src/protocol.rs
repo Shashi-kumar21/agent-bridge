@@ -225,6 +225,15 @@ pub enum Request {
         /// Optional sender label recorded in the message log.
         #[serde(default)]
         from: Option<String>,
+        /// Milliseconds to wait for a free queue slot. `0` fails fast.
+        #[serde(default)]
+        queue_timeout_ms: Option<u64>,
+        /// Milliseconds to wait for the write. `0` waits forever.
+        #[serde(default)]
+        write_timeout_ms: Option<u64>,
+        /// Wait for a terminal status before replying (default true).
+        #[serde(default)]
+        wait: Option<bool>,
     },
     /// Read the tail of an agent's output buffer.
     Read {
@@ -580,6 +589,60 @@ mod tests {
         assert!(json.contains("\"cmd\":\"message_status\""));
         let parsed: Request = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(parsed, Request::MessageStatus { id: 9 }));
+    }
+
+    /// v2A `Send` frames have no queue/write timeout or `wait`; they must still
+    /// parse and use the daemon defaults.
+    #[test]
+    fn legacy_send_frame_parses_with_defaults() {
+        let legacy = r#"{"cmd":"send","target":"dev","message":"hi"}"#;
+        let parsed: Request = serde_json::from_str(legacy).expect("legacy send");
+        match parsed {
+            Request::Send {
+                target,
+                message,
+                enter,
+                from,
+                queue_timeout_ms,
+                write_timeout_ms,
+                wait,
+            } => {
+                assert_eq!(target, "dev");
+                assert_eq!(message, "hi");
+                assert_eq!(enter, None);
+                assert_eq!(from, None);
+                assert_eq!(queue_timeout_ms, None);
+                assert_eq!(write_timeout_ms, None);
+                assert_eq!(wait, None);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_timeouts_round_trip() {
+        let request = Request::Send {
+            target: "dev".to_string(),
+            message: "hi".to_string(),
+            enter: Some(false),
+            from: Some("qa".to_string()),
+            queue_timeout_ms: Some(250),
+            write_timeout_ms: Some(0),
+            wait: Some(false),
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert!(json.contains("\"queue_timeout_ms\":250"));
+        assert!(json.contains("\"wait\":false"));
+        let parsed: Request = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            parsed,
+            Request::Send {
+                queue_timeout_ms: Some(250),
+                write_timeout_ms: Some(0),
+                wait: Some(false),
+                ..
+            }
+        ));
     }
 
     #[test]

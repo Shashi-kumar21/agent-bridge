@@ -76,6 +76,15 @@ returned; it is not an acknowledgement from the target application. Payloads
 are limited to 64 KiB by default; export `AGENT_BRIDGE_MAX_MESSAGE` (1 KiB..1
 MiB) before `daemon start`/`restart`, because the daemon reads it.
 
+Each agent has a bounded write queue (128 jobs / 2 MiB by default,
+`AGENT_BRIDGE_QUEUE_LIMIT` and `AGENT_BRIDGE_QUEUE_BYTES`) and one writer thread,
+so concurrent senders cannot interleave bytes. `sendmessage` waits for the
+terminal status by default; `--queue-timeout` (5s), `--write-timeout` (5s, `0`
+waits forever) and `--no-wait` control the wait. A blocked PTY write returns
+`unknown` and is amended when the syscall returns. Options must come **before**
+the message text, because the text is a trailing argument
+(`sendmessage dev --no-wait "run the tests"`).
+
 ## Commands
 
 | Command | Purpose |
@@ -83,7 +92,7 @@ MiB) before `daemon start`/`restart`, because the daemon reads it.
 | `agent-bridge daemon start\|stop\|restart\|status\|run` | manage the background daemon |
 | `agent-bridge listagents` | table of agents (name, status, pid, messages, last output) |
 | `agent-bridge new <name> [-- <cmd...>]` | spawn an agent in a daemon-owned PTY |
-| `agent-bridge sendmessage <name> <text>` | type text into another agent's terminal; prints the message id and status |
+| `agent-bridge sendmessage <name> [--from L] [--queue-timeout 5s] [--write-timeout 5s] [--no-wait] <text>` | type text into another agent's terminal; prints the message id and status |
 | `agent-bridge messagestatus <id>` | delivery status of one message (alias `msg-status`) |
 | `agent-bridge pending <name>` | messages for an agent that are still queued or being written |
 | `agent-bridge read <name> --lines N` | ANSI-stripped tail of its output |

@@ -76,14 +76,14 @@ that the target application accepted, understood, or completed the request.
 Implement a minimal, explicit delivery lifecycle:
 
 -   [x] Add a unique `message_id` to every message.
--   [ ] Add a per-session write queue so simultaneous senders cannot interleave bytes.
--   [ ] Ensure each message is written atomically at the application layer, as far as the PTY API permits.
+-   [x] Add a per-session write queue so simultaneous senders cannot interleave bytes.
+-   [x] Ensure each message is written atomically at the application layer, as far as the PTY API permits.
 -   [ ] Support multi-line messages safely. Investigate bracketed paste where supported, but provide a documented fallback because terminal applications differ.
--   [ ] Return a clear result such as `queued`, `written`, `failed`, or `unknown`; do not label `written` as `delivered` or `acknowledged`.
+-   [x] Return a clear result such as `queued`, `written`, `failed`, or `unknown`; do not label `written` as `delivered` or `acknowledged`.
 -   [ ] Add optional application-level acknowledgement only where a receiving agent integration can explicitly send one.
--   [ ] Add configurable write timeouts and bounded queue sizes.
--   [ ] Define queue behavior when the target exits, is unavailable, or the queue is full.
--   [ ] Prevent unbounded memory growth and expose queue length/status.
+-   [x] Add configurable write timeouts and bounded queue sizes.
+-   [x] Define queue behavior when the target exits, is unavailable, or the queue is full.
+-   [x] Prevent unbounded memory growth and expose queue length/status.
 -   [ ] Add tests for concurrent senders, large messages, Unicode, multi-line input, target exit, timeout, and queue overflow.
 
 **Suggested conceptual API (adapt to existing conventions):**
