@@ -19,7 +19,7 @@ $env:AGENT_BRIDGE_PIPE = "agent-bridge-audit" # PowerShell, Windows isolation
 ## 1. Message delivery is "written", never "delivered"
 
 `sendmessage` writes bytes into the target's PTY and returns
-`Sent { bytes, message_id, status }` (`daemon.rs:227-330`). The status records
+`Sent { bytes, message_id, status }` (`daemon.rs:237-374`). The status records
 what the daemon's write path did, not what the target did: the application may
 be mid-render, waiting at a prompt, or not reading at all. A bounded queue and a
 single writer per agent make the *write* orderly, but there is no retry and no
@@ -48,7 +48,7 @@ The remaining gap is the OS write itself: once `write_all` is inside the PTY
 there is no portable way to cancel it. `--write-timeout` (5 s by default, `0`
 waits forever) makes the caller return `unknown`; the writer keeps waiting and
 amends the record to `written`/`failed` when the syscall returns
-(`delivery.rs:443-482`, `daemon.rs:463-533`). A target that never drains its PTY
+(`delivery.rs:443-482`, `daemon.rs:489-559`). A target that never drains its PTY
 therefore keeps the in-flight byte reservation and the channel fills up behind
 it until the agent exits or the daemon is restarted; new messages to that agent
 eventually fail with `queue_full`.
@@ -89,7 +89,7 @@ Roadmap §6 (VT screen model and snapshot).
 ## 5. No byte offset cursor; `seq` counts chunks
 
 `Read` returns the current `seq` (`protocol.rs:345-355`); `Attach --from-seq`
-only decides whether to replay the *whole* retained buffer (`daemon.rs:672-673`).
+only decides whether to replay the *whole* retained buffer (`daemon.rs:707-708`).
 Because `seq` increments per PTY chunk, not per byte, callers cannot resume from
 an arbitrary offset, and a replay frame carries the newest `seq` for bytes that
 may include older chunks.
@@ -112,7 +112,7 @@ Roadmap §3 (cursor semantics that report what is actually available).
 
 ## 7. Exited agents are never removed; names cannot be reused
 
-The agent map is only inserted into (`daemon.rs:222`); there is no removal
+The agent map is only inserted into (`daemon.rs:232`); there is no removal
 path. `listagents` keeps showing exited entries with their buffers and message
 history, and `new` with that name fails with `agent '<name>' already exists`.
 
@@ -132,7 +132,7 @@ Tracked as issue
 Buffers, message history, PTY handles and job objects are in-memory only
 (`daemon.rs:87-93`). `daemon restart` stops the daemon, which sends Ctrl-C to
 every agent, force-kills any that are still running after ~500 ms
-(`daemon.rs:161-170`, `agent.rs:479-497`), and then exits; the next daemon
+(`daemon.rs:171-180`, `agent.rs:479-497`), and then exits; the next daemon
 starts empty. There is no session adoption.
 
 ```bash
@@ -196,7 +196,7 @@ Roadmap §4 (document the endpoints, add per-instance isolation).
 Access control is the endpoint itself: socket `0600` in a `0700` directory, or a
 pipe DACL for owner/`SYSTEM`/Administrators (`transport.rs:79-98`,
 `transport.rs:41`). There is no caller authentication, no per-session policy and
-no audit trail; `from` is an unauthenticated label (`daemon.rs:227-330`).
+no audit trail; `from` is an unauthenticated label (`daemon.rs:237-374`).
 
 ```bash
 agent-bridge kill dev --force        # any local process can do this
@@ -216,7 +216,7 @@ Roadmap §3 (configurable sizes, explicit drop signalling).
 ## 14. Message history is per-agent and bounded at 500
 
 `record_message` keeps the newest 500 entries (`agent.rs:21`, `:386-390`), and
-the global id-indexed log keeps 2000 (`daemon.rs:25`, `:29-79`). Both are
+the global id-indexed log keeps 2000 (`daemon.rs:25`, `:29-77`). Both are
 in-memory and vanish with the daemon. Ids are unique only for one daemon
 lifetime, so `messagestatus` returns `not_found` after a restart even though the
 id was valid before; there is no persistence.

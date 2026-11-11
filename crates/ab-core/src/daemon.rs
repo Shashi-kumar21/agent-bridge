@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use crossbeam_channel::select;
-use interprocess::local_socket::traits::Listener;
+use interprocess::local_socket::traits::{Listener, Stream as _};
 use interprocess::local_socket::Stream;
 use tracing::{debug, error, info};
 
@@ -134,6 +134,16 @@ impl Daemon {
         while !self.inner.shutdown.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok(stream) => {
+                    // BSD `accept()` inherits `O_NONBLOCK` from the listener
+                    // (Linux does not), while `interprocess` only resets the
+                    // mode for `ListenerNonblockingMode::Both`. Serve every
+                    // connection in blocking mode explicitly; otherwise a
+                    // request or response larger than the socket buffer can
+                    // fail with `WouldBlock` on macOS.
+                    if let Err(err) = stream.set_nonblocking(false) {
+                        error!(error = %err, "could not make an accepted connection blocking");
+                        continue;
+                    }
                     let inner = Arc::clone(&self.inner);
                     thread::spawn(move || {
                         if let Err(err) = serve_connection(&inner, stream) {
@@ -331,9 +341,16 @@ impl Inner {
                     }),
                     Err(WaitError::Timeout) => {
                         let status = self.status_on_timeout(&agent, &target, id);
+                        // A `Done` that landed just after the deadline still
+                        // carries its byte count; everything else is 0.
+                        let bytes = if matches!(status, DeliveryStatus::Written) {
+                            payload.len()
+                        } else {
+                            0
+                        };
                         Ok(Response::Sent {
                             target,
-                            bytes: 0,
+                            bytes,
                             message_id: id,
                             status,
                         })
@@ -452,7 +469,16 @@ impl Inner {
         status: DeliveryStatus,
         bytes: usize,
     ) {
-        apply_status(&self.messages, agent, target, id, status, bytes);
+        let notify = |status: DeliveryStatus, bytes: usize, at: Millis| {
+            agent.update_message(id, status.clone(), bytes, at);
+            agent.publish(Event::MessageStatus {
+                agent: target.to_string(),
+                id,
+                status,
+                at,
+            });
+        };
+        apply_status(&self.messages, id, status, bytes, &notify);
     }
 
     /// Status callback handed to the writer thread for one message job.
@@ -469,11 +495,22 @@ impl Inner {
         let messages = Arc::clone(&self.messages);
         let agent = Arc::clone(agent);
         let target = target.to_string();
-        Box::new(move |event| match event {
-            JobEvent::Started => apply_writing(&messages, &agent, &target, id),
-            JobEvent::Done(outcome) => {
-                let bytes = outcome.bytes();
-                apply_status(&messages, &agent, &target, id, outcome.status(), bytes);
+        Box::new(move |event| {
+            let notify = |status: DeliveryStatus, bytes: usize, at: Millis| {
+                agent.update_message(id, status.clone(), bytes, at);
+                agent.publish(Event::MessageStatus {
+                    agent: target.clone(),
+                    id,
+                    status,
+                    at,
+                });
+            };
+            match event {
+                JobEvent::Started => apply_writing(&messages, id, &notify),
+                JobEvent::Done(outcome) => {
+                    let bytes = outcome.bytes();
+                    apply_status(&messages, id, outcome.status(), bytes, &notify);
+                }
             }
         })
     }
@@ -493,34 +530,16 @@ impl Inner {
     /// still waiting for a queue slot stays `queued`, and a terminal status is
     /// returned unchanged so a timeout can never downgrade a completed write.
     fn status_on_timeout(&self, agent: &Arc<Agent>, target: &str, id: MessageId) -> DeliveryStatus {
-        let at = crate::now_ms();
-        let mut log = self
-            .messages
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(record) = log.entries.get_mut(&id) else {
-            return DeliveryStatus::Unknown;
+        let notify = |status: DeliveryStatus, bytes: usize, at: Millis| {
+            agent.update_message(id, status.clone(), bytes, at);
+            agent.publish(Event::MessageStatus {
+                agent: target.to_string(),
+                id,
+                status,
+                at,
+            });
         };
-        match record.status {
-            DeliveryStatus::Queued => return DeliveryStatus::Queued,
-            DeliveryStatus::Writing => {}
-            _ => return record.status.clone(),
-        }
-        record.status = DeliveryStatus::Unknown;
-        record.bytes = 0;
-        record.updated_at = at;
-        // Keep the log lock until the agent copy and the event are updated, so
-        // a concurrent `Done` cannot interleave a `written` before this
-        // `unknown` and leave the two histories disagreeing.
-        agent.update_message(id, DeliveryStatus::Unknown, 0, at);
-        agent.publish(Event::MessageStatus {
-            agent: target.to_string(),
-            id,
-            status: DeliveryStatus::Unknown,
-            at,
-        });
-        drop(log);
-        DeliveryStatus::Unknown
+        status_after_timeout(&self.messages, id, &notify)
     }
 
     fn log(&self, limit: usize) -> Vec<Message> {
@@ -531,61 +550,77 @@ impl Inner {
     }
 }
 
-fn apply_writing(messages: &Mutex<MessageLog>, agent: &Agent, target: &str, id: MessageId) {
+type StatusNotify<'a> = &'a dyn Fn(DeliveryStatus, usize, Millis);
+
+/// Publish `queued -> writing`.
+///
+/// Status writers serialize on the message-log lock, so the agent copy and the
+/// event follow the same order as the daemon log. A caller timeout may already
+/// have marked the record `unknown`; never downgrade that to `writing`.
+fn apply_writing(messages: &Mutex<MessageLog>, id: MessageId, notify: StatusNotify<'_>) {
     let at = crate::now_ms();
-    {
-        let mut log = messages
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(record) = log.entries.get_mut(&id) else {
-            return;
-        };
-        // A caller timeout may already have marked the record `unknown`; never
-        // downgrade that to `writing` when the queued job finally starts.
-        if !matches!(record.status, DeliveryStatus::Queued) {
-            return;
-        }
-        record.status = DeliveryStatus::Writing;
-        record.bytes = 0;
-        record.updated_at = at;
-        // Status writers serialize on this lock, so the agent copy and the
-        // published event follow the same order as the daemon log.
-        agent.update_message(id, DeliveryStatus::Writing, 0, at);
-        agent.publish(Event::MessageStatus {
-            agent: target.to_string(),
-            id,
-            status: DeliveryStatus::Writing,
-            at,
-        });
+    let mut log = messages
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(record) = log.entries.get_mut(&id) else {
+        return;
+    };
+    if !matches!(record.status, DeliveryStatus::Queued) {
+        return;
     }
+    record.status = DeliveryStatus::Writing;
+    record.bytes = 0;
+    record.updated_at = at;
+    notify(DeliveryStatus::Writing, 0, at);
 }
 
+/// Publish the writer's terminal status (or amend an earlier `unknown`).
 fn apply_status(
     messages: &Mutex<MessageLog>,
-    agent: &Agent,
-    target: &str,
     id: MessageId,
     status: DeliveryStatus,
     bytes: usize,
+    notify: StatusNotify<'_>,
 ) {
     let at = crate::now_ms();
-    {
-        let mut log = messages
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(record) = log.entries.get_mut(&id) {
-            record.status = status.clone();
-            record.bytes = bytes;
-            record.updated_at = at;
-            agent.update_message(id, status.clone(), bytes, at);
-            agent.publish(Event::MessageStatus {
-                agent: target.to_string(),
-                id,
-                status,
-                at,
-            });
-        }
+    let mut log = messages
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(record) = log.entries.get_mut(&id) {
+        record.status = status.clone();
+        record.bytes = bytes;
+        record.updated_at = at;
+        notify(status, bytes, at);
     }
+}
+
+/// Status to report when the caller's write wait expires.
+///
+/// Only a message whose write actually started becomes `unknown`: a message
+/// still waiting for a queue slot stays `queued`, and a terminal status is
+/// returned unchanged so a timeout can never downgrade a completed write.
+fn status_after_timeout(
+    messages: &Mutex<MessageLog>,
+    id: MessageId,
+    notify: StatusNotify<'_>,
+) -> DeliveryStatus {
+    let at = crate::now_ms();
+    let mut log = messages
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(record) = log.entries.get_mut(&id) else {
+        return DeliveryStatus::Unknown;
+    };
+    match record.status {
+        DeliveryStatus::Queued => return DeliveryStatus::Queued,
+        DeliveryStatus::Writing => {}
+        _ => return record.status.clone(),
+    }
+    record.status = DeliveryStatus::Unknown;
+    record.bytes = 0;
+    record.updated_at = at;
+    notify(DeliveryStatus::Unknown, 0, at);
+    DeliveryStatus::Unknown
 }
 
 fn agent_publish(agent: &Arc<Agent>, message: &Message) {
@@ -741,7 +776,10 @@ fn write_frame<W: Write, T: serde::Serialize>(writer: &mut W, value: &T) -> std:
 
 #[cfg(test)]
 mod tests {
-    use super::{DeliveryStatus, Message, MessageLog, MAX_LOG};
+    use super::{
+        apply_status, apply_writing, status_after_timeout, DeliveryStatus, Message, MessageLog,
+        Millis, Mutex, MAX_LOG,
+    };
 
     fn record(id: u64, target: &str, status: DeliveryStatus) -> Message {
         Message {
@@ -775,12 +813,58 @@ mod tests {
         log.insert(record(2, "dev", DeliveryStatus::Queued));
         log.insert(record(3, "dev", DeliveryStatus::Writing));
         log.insert(record(4, "qa", DeliveryStatus::Queued));
+        log.insert(record(5, "dev", DeliveryStatus::Unknown));
 
         let pending: Vec<u64> = log.pending("dev", 10).iter().map(|m| m.id).collect();
-        assert_eq!(pending, [2, 3]);
+        assert_eq!(pending, [2, 3, 5], "unknown is still in flight");
         assert_eq!(log.pending("dev", 1).len(), 1);
         assert_eq!(log.pending("qa", 10).len(), 1);
         assert!(log.pending("nobody", 10).is_empty());
+    }
+
+    /// Timeout transitions: only a started write becomes `unknown`; a queued
+    /// one stays queued and a terminal one is never downgraded.
+    #[test]
+    fn timeout_only_marks_a_started_write_unknown() {
+        let log = Mutex::new(MessageLog::new());
+        log.lock()
+            .expect("log")
+            .insert(record(1, "dev", DeliveryStatus::Queued));
+
+        let seen: Mutex<Vec<(DeliveryStatus, usize)>> = Mutex::new(Vec::new());
+        let notify = |status: DeliveryStatus, bytes: usize, _at: Millis| {
+            seen.lock().expect("seen").push((status, bytes));
+        };
+
+        assert_eq!(
+            status_after_timeout(&log, 1, &notify),
+            DeliveryStatus::Queued,
+            "a message that never started must not be reported unknown"
+        );
+        assert!(seen.lock().expect("seen").is_empty());
+
+        apply_writing(&log, 1, &notify);
+        assert_eq!(
+            status_after_timeout(&log, 1, &notify),
+            DeliveryStatus::Unknown
+        );
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            [(DeliveryStatus::Writing, 0), (DeliveryStatus::Unknown, 0)]
+        );
+
+        // The writer finishing later amends the unknown record.
+        apply_status(&log, 1, DeliveryStatus::Written, 7, &notify);
+        assert_eq!(
+            log.lock().expect("log").get(1).expect("record").status,
+            DeliveryStatus::Written
+        );
+        assert_eq!(
+            status_after_timeout(&log, 1, &notify),
+            DeliveryStatus::Written,
+            "a timeout must never downgrade a completed write"
+        );
+        assert_eq!(log.lock().expect("log").get(1).expect("record").bytes, 7);
     }
 
     #[test]

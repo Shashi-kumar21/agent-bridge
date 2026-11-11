@@ -768,6 +768,7 @@ mod tests {
         queue
             .submit(second, Duration::from_secs(1))
             .expect("second fills the channel");
+        assert_eq!(queue.depth(), 1, "in-flight jobs are not queued");
 
         let started = Instant::now();
         assert_eq!(

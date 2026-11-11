@@ -83,7 +83,9 @@ spawns) and one writer thread, so concurrent senders cannot interleave bytes.
 `--write-timeout` (5s, `0` waits forever) and `--no-wait` control the wait. A
 write that is still blocked when `--write-timeout` expires returns `unknown`
 and is amended when the syscall returns; a message that has not started yet
-stays `queued` and is still delivered later. `listagents` shows the queue
+stays `queued` and is still delivered later. Note that `0` means fail fast for
+`--queue-timeout` but wait forever for `--write-timeout`. `sendmessage` exits 0
+for `queued`/`unknown` too; only `written` is a confirmed PTY write. `listagents` shows the queue
 depth. Options must come **before** the message text, because the text is a
 trailing argument (`sendmessage dev --no-wait "run the tests"`).
 
@@ -92,7 +94,7 @@ trailing argument (`sendmessage dev --no-wait "run the tests"`).
 | Command | Purpose |
 | --- | --- |
 | `agent-bridge daemon start\|stop\|restart\|status\|run` | manage the background daemon |
-| `agent-bridge listagents` | table of agents (name, status, pid, messages, last output) |
+| `agent-bridge listagents` | table of agents (name, status, pid, messages, queued, last output) |
 | `agent-bridge new <name> [-- <cmd...>]` | spawn an agent in a daemon-owned PTY |
 | `agent-bridge sendmessage <name> [--from L] [--queue-timeout 5s] [--write-timeout 5s] [--no-wait] <text>` | type text into another agent's terminal; prints the message id and status |
 | `agent-bridge messagestatus <id>` | delivery status of one message (alias `msg-status`) |

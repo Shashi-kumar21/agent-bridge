@@ -40,7 +40,7 @@ Module map (`crates/ab-core/src`):
 
 | File | Role |
 | --- | --- |
-| `protocol.rs` | Wire types, `PROTOCOL_VERSION`, name validation (`validate_name`, `:302`) |
+| `protocol.rs` | Wire types, `PROTOCOL_VERSION`, name validation (`validate_name`, `:451`) |
 | `delivery.rs` | Message ids, size limit, bounded write queue, writer thread, timeouts |
 | `transport.rs` | Listener/connect, Unix socket permissions, Windows pipe DACL (`:41`) |
 | `daemon.rs` | Accept loop, request handlers, attach streaming |
@@ -54,8 +54,8 @@ Module map (`crates/ab-core/src`):
 
 * The daemon is a single process (`crates/ab-cli/src/main.rs`, `DaemonAction::Run`).
   `Daemon::run` binds the endpoint, then loops on `listener.accept()`
-  (`daemon.rs:128-157`).
-* Every accepted connection gets its own thread (`daemon.rs:138`). There is no
+  (`daemon.rs:128-167`).
+* Every accepted connection gets its own thread (`daemon.rs:148`). There is no
   connection pool and no request queue: concurrency is one thread per client, and
   shared state is protected by mutexes (`Inner::agents`, `Inner::messages`,
   `daemon.rs:87-93`).
@@ -66,9 +66,9 @@ Module map (`crates/ab-core/src`):
 * Per-agent mutable state lives behind mutexes inside `Agent`
   (`agent.rs:54-75`): PTY master (resize), child handle, output buffer, message
   history, subscriber list, reaper, and the write-queue handle.
-* Shutdown: `Request::Shutdown` sets an `AtomicBool` (`Inner::shutdown`, `daemon.rs:411-414`); the
-  accept loop observes it, calls `Inner::stop_agents` (`daemon.rs:156`,
-  `:161-170`), which sends Ctrl-C to every agent, force-kills the ones still
+* Shutdown: `Request::Shutdown` sets an `AtomicBool` (`Inner::shutdown`, `daemon.rs:428-431`); the
+  accept loop observes it, calls `Inner::stop_agents` (`daemon.rs:164`,
+  `:171-180`), which sends Ctrl-C to every agent, force-kills the ones still
   running after ~500 ms (`agent.rs:479-497`), and then lets the process exit.
 
 ## 3. Request lifecycle (non-streaming)
@@ -78,12 +78,12 @@ Module map (`crates/ab-core/src`):
    back (`client.rs:16-35`); the connection is then dropped.
 3. Daemon-side `serve_connection` reads one line, parses it, and either
    dispatches to `Inner::handle` or routes it to `stream_attach`
-   (`serve_connection`, `daemon.rs:614-643`).
+   (`serve_connection`, `daemon.rs:649-677`).
 4. `Inner::handle` maps errors to `Response::Error` with an `ErrorCode`
-   (`daemon.rs:172-181`); `try_handle` implements the match
-   (`daemon.rs:183-419`).
+   (`daemon.rs:182-191`); `try_handle` implements the match
+   (`daemon.rs:193-436`).
 5. The response is serialized as one line with the whole frame built before the
-   write, so frames cannot interleave mid-line (`write_frame`, `daemon.rs:733-739`).
+   write, so frames cannot interleave mid-line (`write_frame`, `daemon.rs:768-774`).
 
 Every request except `Attach` is one request and one response. There is no
 pipelining: a second request on the same connection is never read.
@@ -100,12 +100,12 @@ pipelining: a second request on the same connection is never read.
    subscriber that cannot keep up is dropped and logged
    (`agent.rs:438-453`).
 5. `Read` returns ANSI-stripped tail lines plus the current `seq`
-   (`daemon.rs:358-367`, `agent.rs:378-385`, `buffer.rs:63-77`). This is a line
+   (`daemon.rs:375-384`, `agent.rs:378-385`, `buffer.rs:63-77`). This is a line
    view of raw bytes, not a terminal screen.
 6. `Attach` subscribes first, sends `Hello`, optionally replays the whole
    retained buffer as one frame tagged with the *current* `seq`
-   (`daemon.rs:672-687`), then streams live events until exit or disconnect
-   (`daemon.rs:700-729`). Because the replay and the live stream can repeat a
+   (`daemon.rs:707-722`), then streams live events until exit or disconnect
+   (`daemon.rs:735-765`). Because the replay and the live stream can repeat a
    sequence number, clients drop non-increasing `seq` (`client.rs:79-83`).
 
 Sequence numbers count output chunks, not bytes, and are process-local: they
@@ -115,11 +115,11 @@ restart from zero in a new daemon.
 
 1. `Send` validates the target, appends the optional `\r`, and rejects a
    payload above the size limit with `too_large` before allocating an id
-   (`daemon.rs:227-250`, `delivery.rs:75-85`). The limit is 64 KiB by default
+   (`daemon.rs:237-260`, `delivery.rs:75-85`). The limit is 64 KiB by default
    and is configurable with `AGENT_BRIDGE_MAX_MESSAGE` (clamped to 1 KiB..1 MiB).
 2. The daemon allocates a daemon-wide `message_id` (`delivery.rs:66`), stores
    the record as `queued` in the bounded id-indexed log (2000 entries,
-   `daemon.rs:29-78`) and publishes `Event::Message`.
+   `daemon.rs:29-77`) and publishes `Event::Message`.
 3. The payload becomes one `delivery::Job` and is admitted to the agent's
    bounded queue (`delivery.rs:294-378`). The defaults are 128 jobs and 2 MiB
    per agent, configurable with `AGENT_BRIDGE_QUEUE_LIMIT` and
@@ -137,13 +137,14 @@ restart from zero in a new daemon.
    A message that is still `queued` at the deadline stays `queued` and keeps
    waiting; `unknown` is only used after the write started. The writer amends an
    `unknown` record to `written`/`failed` when the syscall returns
-   (`daemon.rs:463-533`, `:531-589`). `pending` lists `queued`, `writing` and
+   (`daemon.rs:489-559`, `:560-624`). `pending` lists `queued`, `writing` and
    `unknown` records because all three may still change.
 6. `sendmessage` waits for the terminal status by default; `--no-wait` returns
    after admission. The response is `Sent { target, bytes, message_id, status }`
-   (`protocol.rs:357-371`). It means "bytes were accepted by the PTY", never
-   that the target application read, understood or acted on them.
-7. `MessageStatus` and `Pending` read the same records (`daemon.rs:389-407`).
+   (`protocol.rs:357-371`). A `written` status means "bytes were accepted by the
+   PTY", never that the target application read, understood or acted on them;
+   `queued`/`unknown` responses carry `bytes: 0` because nothing is confirmed.
+7. `MessageStatus` and `Pending` read the same records (`daemon.rs:406-426`).
    Ids and statuses are per daemon lifetime; a restart clears the history.
 
 The `from` field is a caller-supplied label, stored and forwarded verbatim; it

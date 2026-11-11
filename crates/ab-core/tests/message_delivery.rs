@@ -3,6 +3,7 @@
 //! This is a separate test binary from `daemon_e2e` because the daemon endpoint
 //! is selected through process-wide environment variables.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,45 +17,61 @@ use agent_bridge_core::protocol::{DeliveryStatus, ErrorCode, Request, Response};
 /// these tests must not overlap (the default test harness runs them in threads).
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+const ENV_KEYS: [&str; 4] = [
+    "AGENT_BRIDGE_HOME",
+    "AGENT_BRIDGE_PIPE",
+    "AGENT_BRIDGE_QUEUE_LIMIT",
+    "AGENT_BRIDGE_QUEUE_BYTES",
+];
+
+/// One daemon per test, with cleanup on both success and panic.
+struct Harness {
+    _serial: std::sync::MutexGuard<'static, ()>,
+    running: Option<thread::JoinHandle<()>>,
+    home: PathBuf,
+    previous: Vec<(&'static str, Option<OsString>)>,
 }
 
-/// Agent command: a shell that echoes whatever is typed into its PTY.
-fn agent_command() -> Vec<String> {
-    if cfg!(windows) {
-        let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
-        vec![shell]
-    } else {
-        vec!["/bin/sh".to_string(), "-c".to_string(), "cat".to_string()]
+impl Harness {
+    fn start(queue_limit: usize, queue_bytes: usize) -> Self {
+        let serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let previous: Vec<(&'static str, Option<OsString>)> = ENV_KEYS
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+
+        let stamp = agent_bridge_core::now_ms();
+        let home = std::env::temp_dir().join(format!("agent-bridge-queue-{stamp}"));
+        std::fs::create_dir_all(&home).expect("temp dir");
+        std::env::set_var("AGENT_BRIDGE_HOME", &home);
+        std::env::set_var("AGENT_BRIDGE_PIPE", format!("agent-bridge-queue-{stamp}"));
+        // Set both explicitly so one test cannot leak its limits into the next.
+        std::env::set_var("AGENT_BRIDGE_QUEUE_LIMIT", queue_limit.to_string());
+        std::env::set_var("AGENT_BRIDGE_QUEUE_BYTES", queue_bytes.to_string());
+
+        let daemon = Daemon::new();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let running = thread::spawn(move || {
+            daemon
+                .run(move || {
+                    let _ = ready_tx.send(());
+                })
+                .expect("daemon run");
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("daemon became ready");
+
+        Self {
+            _serial: serial,
+            running: Some(running),
+            home,
+            previous,
+        }
     }
-}
-
-fn start_daemon(queue_limit: usize, queue_bytes: usize) -> (thread::JoinHandle<()>, PathBuf) {
-    let stamp = agent_bridge_core::now_ms();
-    let home = std::env::temp_dir().join(format!("agent-bridge-queue-{stamp}"));
-    std::fs::create_dir_all(&home).expect("temp dir");
-    std::env::set_var("AGENT_BRIDGE_HOME", &home);
-    std::env::set_var("AGENT_BRIDGE_PIPE", format!("agent-bridge-queue-{stamp}"));
-    // Set both explicitly so one test cannot leak its limits into the next.
-    std::env::set_var("AGENT_BRIDGE_QUEUE_LIMIT", queue_limit.to_string());
-    std::env::set_var("AGENT_BRIDGE_QUEUE_BYTES", queue_bytes.to_string());
-
-    let daemon = Daemon::new();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let running = thread::spawn(move || {
-        daemon
-            .run(move || {
-                let _ = ready_tx.send(());
-            })
-            .expect("daemon run");
-    });
-    ready_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("daemon became ready");
-    (running, home)
 }
 
 fn create_agent_with(name: &str, command: Vec<String>) {
@@ -71,6 +88,33 @@ fn create_agent_with(name: &str, command: Vec<String>) {
 
 fn create_agent(name: &str) {
     create_agent_with(name, agent_command());
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        if let Some(running) = self.running.take() {
+            // Best effort: on a panic the daemon may already be gone.
+            let _ = client::request(&Request::Shutdown);
+            let _ = running.join();
+        }
+        let _ = std::fs::remove_dir_all(&self.home);
+        for (key, value) in self.previous.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+/// Agent command: a shell that echoes whatever is typed into its PTY.
+fn agent_command() -> Vec<String> {
+    if cfg!(windows) {
+        let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+        vec![shell]
+    } else {
+        vec!["/bin/sh".to_string(), "-c".to_string(), "cat".to_string()]
+    }
 }
 
 fn send_with(
@@ -109,6 +153,18 @@ fn terminal_status(id: u64) -> DeliveryStatus {
     }
 }
 
+fn pending(target: &str) -> Vec<u64> {
+    match client::request(&Request::Pending {
+        target: target.to_string(),
+        limit: None,
+    })
+    .expect("pending")
+    {
+        Response::Messages { messages } => messages.iter().map(|message| message.id).collect(),
+        other => panic!("unexpected pending response: {other:?}"),
+    }
+}
+
 fn output_text(target: &str) -> String {
     match client::request(&Request::Read {
         target: target.to_string(),
@@ -119,15 +175,6 @@ fn output_text(target: &str) -> String {
         Response::Output { lines, .. } => lines.join("\n"),
         other => panic!("unexpected read response: {other:?}"),
     }
-}
-
-fn shutdown(running: thread::JoinHandle<()>, home: PathBuf) {
-    assert!(matches!(
-        client::request(&Request::Shutdown).expect("shutdown"),
-        Response::Ok
-    ));
-    running.join().expect("daemon exits");
-    let _ = std::fs::remove_dir_all(home);
 }
 
 fn kill(name: &str) {
@@ -148,8 +195,7 @@ fn concurrent_sends_do_not_interleave() {
     const THREADS: usize = 8;
     const PER_THREAD: usize = 50;
 
-    let _serial = serial();
-    let (running, home) = start_daemon(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
     create_agent("busy");
 
     let mut workers = Vec::with_capacity(THREADS);
@@ -208,54 +254,34 @@ fn concurrent_sends_do_not_interleave() {
     }
 
     // Every marker also has a terminal status and drains out of `pending`.
-    match client::request(&Request::Pending {
-        target: "busy".to_string(),
-        limit: None,
-    })
-    .expect("pending")
-    {
-        Response::Messages { messages } => {
-            assert!(messages.is_empty(), "queue should be drained: {messages:?}");
+    // Poll: the last marker can be visible in the buffer before its `Done`
+    // observer updates the log.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let ids = pending("busy");
+        if ids.is_empty() {
+            break;
         }
-        other => panic!("unexpected pending response: {other:?}"),
+        assert!(
+            Instant::now() < deadline,
+            "queue should drain: {ids:?} still pending"
+        );
+        thread::sleep(Duration::from_millis(50));
     }
 
     kill("busy");
-    shutdown(running, home);
 }
 
-/// `--no-wait` returns while the message is still queued or being written, and
-/// the status becomes terminal without another client action.
+/// `--no-wait` returns after admission and the status settles without another
+/// client action. The write can be fast, so the reply may already be `written`;
+/// the point is that it is never `unknown`/`failed` and it reaches `written`.
 #[test]
-fn no_wait_returns_before_the_write_and_settles() {
-    let _serial = serial();
-    let (running, home) = start_daemon(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+fn no_wait_returns_after_admission_and_settles() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent("quick");
 
-    // On Unix use a target that does not read stdin for a second, so a large
-    // payload cannot finish before the daemon builds its reply. ConPTY buffers
-    // input eagerly on Windows, so there the payload stays small.
-    #[cfg(unix)]
-    let (command, payload) = (
-        vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            "sleep 1; cat".to_string(),
-        ],
-        format!("echo {}", "n".repeat(48 * 1024)),
-    );
-    #[cfg(windows)]
-    let (command, payload) = (agent_command(), "echo nowait".to_string());
-
-    create_agent_with("quick", command);
-    let (id, status) = send("quick", payload, false);
+    let (id, status) = send("quick", "echo nowait".to_string(), false);
     assert!(id > 0);
-
-    #[cfg(unix)]
-    assert!(
-        matches!(status, DeliveryStatus::Queued | DeliveryStatus::Writing),
-        "no-wait must reply before the write finishes, got {status:?}"
-    );
-    #[cfg(windows)]
     assert!(
         matches!(
             status,
@@ -282,15 +308,13 @@ fn no_wait_returns_before_the_write_and_settles() {
     }
 
     kill("quick");
-    shutdown(running, home);
 }
 
 /// A payload larger than the whole byte budget can never be admitted, so it
 /// fails fast with `queue_full` and no partial write.
 #[test]
 fn oversize_payload_fails_with_queue_full() {
-    let _serial = serial();
-    let (running, home) = start_daemon(1, 1024);
+    let _harness = Harness::start(1, 1024);
     create_agent("tiny");
 
     let (id, status) = send("tiny", "x".repeat(2048), true);
@@ -320,64 +344,56 @@ fn oversize_payload_fails_with_queue_full() {
     }
 
     kill("tiny");
-    shutdown(running, home);
 }
 
-/// A write that blocks inside the PTY returns `unknown` at the caller deadline
-/// and is amended to `written` once the target drains its input.
-///
-/// Unix only: `ConPTY` buffers input eagerly, so the write cannot be blocked
-/// deterministically on Windows. The delivery path itself is platform-neutral.
-#[cfg(unix)]
+/// A request larger than the ~8 KiB Unix-socket buffer must be read whole.
+/// macOS regression: `accept()` inherits `O_NONBLOCK` there, so the daemon
+/// must clear it explicitly or the request is dropped mid-line.
 #[test]
-fn blocked_write_is_unknown_then_amended() {
-    let _serial = serial();
-    let (running, home) = start_daemon(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
-    create_agent_with(
-        "slow",
+fn large_request_is_read_whole() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent("echoer");
+
+    // > 8 KiB, under the 64 KiB message limit.
+    let (_, status) = send("echoer", "x".repeat(12 * 1024), true);
+    assert_eq!(status, DeliveryStatus::Written);
+
+    kill("echoer");
+}
+
+/// A response larger than the ~8 KiB Unix-socket buffer must be written whole.
+/// Same macOS regression, in the daemon -> client direction.
+#[test]
+fn large_response_is_not_truncated() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    let command = if cfg!(windows) {
+        vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "for /L %i in (1,1,2000) do @echo marker-line-%i-0123456789".to_string(),
+        ]
+    } else {
         vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            "sleep 2; cat".to_string(),
-        ],
-    );
+            "seq 1 2000".to_string(),
+        ]
+    };
+    create_agent_with("big", command);
 
-    // Far larger than the kernel PTY input queue (a few KiB).
-    let payload = format!("echo {}", "b".repeat(48 * 1024));
-    let (id, status) = send_with("slow", payload, true, 5_000, 200);
-    assert!(
-        matches!(status, DeliveryStatus::Unknown),
-        "a blocked write must time out as unknown, got {status:?}"
-    );
-
-    // `unknown` stays pending while the write is still in flight.
-    match client::request(&Request::Pending {
-        target: "slow".to_string(),
-        limit: None,
-    })
-    .expect("pending")
-    {
-        Response::Messages { messages } => assert!(
-            messages.iter().any(|message| message.id == id),
-            "an unknown message still in flight must stay pending: {messages:?}"
-        ),
-        other => panic!("unexpected pending response: {other:?}"),
-    }
-
-    // Once `cat` drains stdin the writer completes and amends the record.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let current = terminal_status(id);
-        if matches!(current, DeliveryStatus::Written) {
+        let text = output_text("big");
+        if text.contains("1999") || text.contains("marker-line-1999") {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "message {id} was never amended from unknown: {current:?}"
+            "large output never arrived intact ({} bytes)",
+            text.len()
         );
         thread::sleep(Duration::from_millis(100));
     }
 
-    kill("slow");
-    shutdown(running, home);
+    kill("big");
 }

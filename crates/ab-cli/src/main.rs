@@ -125,7 +125,7 @@ enum Command {
         /// Message id printed by `sendmessage` or `log`.
         id: u64,
     },
-    /// List messages that are still queued or being written.
+    /// List messages that may still change: queued, writing or unknown.
     Pending {
         /// Agent name.
         target: String,
