@@ -96,7 +96,13 @@ A PR is ready for QA only when **all** of these are true:
   `anyhow` only inside PTY plumbing.
 * Never log message bodies at `info`; they may contain sensitive prompts.
 * Wire compatibility: `PROTOCOL_VERSION` in `crates/ab-core/src/protocol.rs`
-  must change whenever `Request`/`Response` changes incompatibly.
+  must change whenever `Request`/`Response` changes incompatibly, including
+  when a new field changes behaviour and an old daemon would silently ignore it
+  (for example `Send.require_ack`).
+* Delivery statuses are deliberately narrow: `written`/`awaiting_ack` mean the
+  PTY accepted the bytes. Only an explicit `Request::Ack` from the target makes
+  a message `acknowledged`; never infer one from output. An ack is
+  target-checked, idempotent, and capped at 1 KiB of note.
 * Attach streams replay buffered output and then continue live, so the same
   `seq` can arrive twice; clients must drop non-increasing `seq` frames.
 * Daemon lifecycle: a protocol-skew restart is allowed **only** when the daemon

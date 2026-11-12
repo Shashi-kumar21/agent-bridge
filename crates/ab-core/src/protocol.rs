@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the wire shape changes. New `cmd`/`event` tags are unknown
 /// to older daemons, so additive changes bump it too; the CLI compares it for
 /// equality and restarts a daemon only when no agent is live.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Default terminal width for spawned agents.
 pub const DEFAULT_COLS: u16 = 120;
@@ -144,9 +144,12 @@ pub enum PasteMode {
 ///
 /// `Queued` and `Writing` are transient. `Written` and `Failed` are terminal;
 /// `Unknown` means the write started but the caller stopped waiting, and the
-/// daemon may still amend it to `Written` or `Failed`. A message is never
-/// reported as delivered or acknowledged: writing bytes into a PTY only proves
-/// the bytes were accepted.
+/// daemon may still amend it to `Written` or `Failed`. `AwaitingAck` is the
+/// same as `Written` for a sender that asked for an application-level
+/// acknowledgement, and only an explicit [`Request::Ack`] moves it to
+/// `Acknowledged`. Writing bytes into a PTY proves the bytes were accepted;
+/// only `Acknowledged` says the receiving integration reported that it saw the
+/// message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum DeliveryStatus {
@@ -157,6 +160,13 @@ pub enum DeliveryStatus {
     /// The write and flush returned successfully.
     #[default]
     Written,
+    /// The write and flush returned successfully and the sender asked for an
+    /// application-level acknowledgement, which has not arrived yet.
+    AwaitingAck,
+    /// The receiving integration explicitly acknowledged the message
+    /// (`Request::Ack`). This is the only status that says more than "the PTY
+    /// accepted the bytes".
+    Acknowledged,
     /// The message was never written, or the write failed.
     Failed {
         /// Machine readable cause.
@@ -173,7 +183,19 @@ impl DeliveryStatus {
     /// `true` while the daemon may still change the status.
     #[must_use]
     pub fn is_pending(&self) -> bool {
-        matches!(self, Self::Queued | Self::Writing | Self::Unknown)
+        matches!(
+            self,
+            Self::Queued | Self::Writing | Self::Unknown | Self::AwaitingAck
+        )
+    }
+
+    /// `true` when the payload bytes reached the PTY.
+    ///
+    /// `Written`, `AwaitingAck` and `Acknowledged` all describe a completed
+    /// write; the latter two add receiver-visible delivery.
+    #[must_use]
+    pub fn is_written(&self) -> bool {
+        matches!(self, Self::Written | Self::AwaitingAck | Self::Acknowledged)
     }
 
     /// Short label used by the CLI and the message log.
@@ -183,10 +205,26 @@ impl DeliveryStatus {
             Self::Queued => "queued",
             Self::Writing => "writing",
             Self::Written => "written",
+            Self::AwaitingAck => "awaiting_ack",
+            Self::Acknowledged => "acknowledged",
             Self::Failed { .. } => "failed",
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// Acknowledgement supplied by the receiving integration.
+///
+/// It is opt-in: a sender asks for it with `require_ack`, and only an explicit
+/// [`Request::Ack`] creates one. It records that the integration saw the
+/// message, not that the application understood or completed the request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ack {
+    /// When the acknowledgement arrived (ms since epoch).
+    pub at: Millis,
+    /// Optional free-text note from the receiver.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// One inter-agent message and its delivery status.
@@ -212,6 +250,10 @@ pub struct Message {
     /// Current delivery status (v1 records default to `written`).
     #[serde(default)]
     pub status: DeliveryStatus,
+    /// Explicit application-level acknowledgement, when one was requested and
+    /// supplied (v1-v4 records have none).
+    #[serde(default)]
+    pub ack: Option<Ack>,
 }
 
 /// Client to daemon commands.
@@ -266,6 +308,25 @@ pub enum Request {
         /// How line breaks are delivered (default `auto`).
         #[serde(default)]
         paste: Option<PasteMode>,
+        /// Ask the receiving integration to acknowledge the message; the
+        /// status becomes `awaiting_ack` after the write instead of `written`.
+        #[serde(default)]
+        require_ack: Option<bool>,
+    },
+    /// Acknowledge a message the receiving integration has processed.
+    ///
+    /// Only the target may acknowledge. A write that started (`written`,
+    /// `awaiting_ack` or `unknown`) can be acknowledged; an `unknown` write is
+    /// accepted because the acknowledgement itself proves the bytes arrived.
+    /// Repeating the request is idempotent.
+    Ack {
+        /// Agent name that received the message.
+        target: String,
+        /// Identifier from `Send` or `Pending`.
+        id: MessageId,
+        /// Optional free-text note recorded with the acknowledgement.
+        #[serde(default)]
+        note: Option<String>,
     },
     /// Read the tail of an agent's output buffer.
     Read {
@@ -319,7 +380,8 @@ pub enum Request {
         /// Identifier returned by `Send` (or the message event).
         id: MessageId,
     },
-    /// Messages that may still change: queued, writing or unknown.
+    /// Messages that may still change: queued, writing, unknown or
+    /// `awaiting_ack`.
     Pending {
         /// Agent name.
         target: String,
@@ -526,8 +588,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_is_four() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn protocol_is_five() {
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     #[test]
@@ -639,6 +701,7 @@ mod tests {
                 write_timeout_ms,
                 wait,
                 paste,
+                require_ack,
             } => {
                 assert_eq!(target, "dev");
                 assert_eq!(message, "hi");
@@ -648,6 +711,7 @@ mod tests {
                 assert_eq!(write_timeout_ms, None);
                 assert_eq!(wait, None);
                 assert_eq!(paste, None);
+                assert_eq!(require_ack, None);
             }
             other => panic!("unexpected request: {other:?}"),
         }
@@ -664,11 +728,13 @@ mod tests {
             write_timeout_ms: Some(0),
             wait: Some(false),
             paste: Some(PasteMode::Bracketed),
+            require_ack: Some(true),
         };
         let json = serde_json::to_string(&request).expect("serialize");
         assert!(json.contains("\"queue_timeout_ms\":250"));
         assert!(json.contains("\"wait\":false"));
         assert!(json.contains("\"paste\":\"bracketed\""));
+        assert!(json.contains("\"require_ack\":true"));
         let parsed: Request = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(
             parsed,
@@ -677,9 +743,56 @@ mod tests {
                 write_timeout_ms: Some(0),
                 wait: Some(false),
                 paste: Some(PasteMode::Bracketed),
+                require_ack: Some(true),
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn ack_request_round_trips() {
+        let request = Request::Ack {
+            target: "dev".to_string(),
+            id: 42,
+            note: Some("ran the tests".to_string()),
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert!(json.contains("\"cmd\":\"ack\""));
+        assert!(json.contains("\"id\":42"));
+        match serde_json::from_str::<Request>(&json).expect("deserialize") {
+            Request::Ack { target, id, note } => {
+                assert_eq!(target, "dev");
+                assert_eq!(id, 42);
+                assert_eq!(note.as_deref(), Some("ran the tests"));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        let bare = r#"{"cmd":"ack","target":"dev","id":7}"#;
+        assert!(matches!(
+            serde_json::from_str::<Request>(bare).expect("bare ack"),
+            Request::Ack {
+                id: 7,
+                note: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_message_frame_has_no_ack() {
+        let legacy = r#"{"target":"dev","from":"qa","text":"hi","at":7}"#;
+        let parsed: Message = serde_json::from_str(legacy).expect("legacy message");
+        assert!(parsed.ack.is_none());
+    }
+
+    #[test]
+    fn awaiting_ack_is_pending_and_written() {
+        assert!(DeliveryStatus::AwaitingAck.is_pending());
+        assert!(DeliveryStatus::AwaitingAck.is_written());
+        assert!(!DeliveryStatus::Acknowledged.is_pending());
+        assert!(DeliveryStatus::Acknowledged.is_written());
+        assert_eq!(DeliveryStatus::AwaitingAck.label(), "awaiting_ack");
+        assert_eq!(DeliveryStatus::Acknowledged.label(), "acknowledged");
     }
 
     #[test]

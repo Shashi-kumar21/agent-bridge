@@ -17,12 +17,16 @@ use crate::agent::{Agent, SpawnConfig};
 use crate::delivery::{self, JobEvent};
 use crate::error::{BridgeError, Result};
 use crate::protocol::{
-    validate_name, AgentInfo, DeliveryStatus, ErrorCode, Event, Message, MessageId, Millis,
+    validate_name, Ack, AgentInfo, DeliveryStatus, ErrorCode, Event, Message, MessageId, Millis,
     Request, Response, DEFAULT_COLS, DEFAULT_ROWS, PROTOCOL_VERSION,
 };
 use crate::transport;
 
 const MAX_LOG: usize = 2000;
+
+/// Cap for the free-text note stored with an acknowledgement, so the bounded
+/// history stays bounded.
+const MAX_ACK_NOTE: usize = 1024;
 const HEARTBEAT: Duration = Duration::from_secs(10);
 
 /// Bounded, id-indexed message history.
@@ -243,9 +247,11 @@ impl Inner {
                 write_timeout_ms,
                 wait,
                 paste,
+                require_ack,
             } => {
                 let agent = self.get(&target)?;
                 let enter = enter.unwrap_or(true);
+                let require_ack = require_ack.unwrap_or(false);
                 let payload = delivery::compose_payload(
                     &message,
                     enter,
@@ -272,6 +278,7 @@ impl Inner {
                     updated_at: now,
                     bytes: 0,
                     status: DeliveryStatus::Queued,
+                    ack: None,
                 };
                 self.store_message(record.clone());
                 agent.record_message(record.clone());
@@ -288,7 +295,7 @@ impl Inner {
                 );
 
                 let (ack, ack_rx) = crossbeam_channel::unbounded();
-                let observer = self.message_observer(&agent, &target, id);
+                let observer = self.message_observer(&agent, &target, id, require_ack);
                 if let Err(error) = agent.enqueue_message(
                     payload.clone(),
                     observer,
@@ -307,7 +314,7 @@ impl Inner {
 
                 if !wait {
                     let status = self.current_status(id).unwrap_or(DeliveryStatus::Queued);
-                    let bytes = if status == DeliveryStatus::Written {
+                    let bytes = if status.is_written() {
                         payload.len()
                     } else {
                         0
@@ -340,13 +347,14 @@ impl Inner {
                         target,
                         bytes: outcome.bytes(),
                         message_id: id,
-                        status: outcome.status(),
+                        status: settle(outcome.status(), require_ack),
                     }),
                     Err(WaitError::Timeout) => {
-                        let status = self.status_on_timeout(&agent, &target, id);
+                        let status =
+                            settle(self.status_on_timeout(&agent, &target, id), require_ack);
                         // A `Done` that landed just after the deadline still
                         // carries its byte count; everything else is 0.
-                        let bytes = if matches!(status, DeliveryStatus::Written) {
+                        let bytes = if status.is_written() {
                             payload.len()
                         } else {
                             0
@@ -375,6 +383,7 @@ impl Inner {
                     }
                 }
             }
+            Request::Ack { target, id, note } => self.acknowledge(&target, id, note),
             Request::Read { target, lines } => {
                 let agent = self.get(&target)?;
                 let (lines, truncated) = agent.tail_lines(lines.unwrap_or(40));
@@ -494,6 +503,7 @@ impl Inner {
         agent: &Arc<Agent>,
         target: &str,
         id: MessageId,
+        require_ack: bool,
     ) -> delivery::JobObserver {
         let messages = Arc::clone(&self.messages);
         let agent = Arc::clone(agent);
@@ -512,10 +522,83 @@ impl Inner {
                 JobEvent::Started => apply_writing(&messages, id, &notify),
                 JobEvent::Done(outcome) => {
                     let bytes = outcome.bytes();
-                    apply_status(&messages, id, outcome.status(), bytes, &notify);
+                    let status = settle(outcome.status(), require_ack);
+                    apply_status(&messages, id, status, bytes, &notify);
                 }
             }
         })
+    }
+
+    /// Record an explicit acknowledgement from the receiving integration.
+    ///
+    /// Only the message's target may acknowledge it. A write that started
+    /// (`written`, `awaiting_ack` or `unknown`) can be acknowledged; `unknown`
+    /// is accepted because the acknowledgement itself proves the bytes
+    /// arrived. Repeating the request returns the stored record so a retry
+    /// cannot create a second acknowledgement or overwrite the note.
+    fn acknowledge(&self, target: &str, id: MessageId, note: Option<String>) -> Result<Response> {
+        let agent = self
+            .agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target)
+            .cloned();
+        let at = crate::now_ms();
+        let mut log = self
+            .messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = log.entries.get_mut(&id) else {
+            return Err(BridgeError::MessageNotFound(id));
+        };
+        if record.target != target {
+            // An id that belongs to another agent is indistinguishable from an
+            // unknown id: a caller cannot probe the global log through `ack`.
+            return Err(BridgeError::MessageNotFound(id));
+        }
+        match record.status {
+            DeliveryStatus::Acknowledged => {
+                return Ok(Response::Message {
+                    message: record.clone(),
+                })
+            }
+            DeliveryStatus::Queued | DeliveryStatus::Writing => {
+                return Err(BridgeError::Conflict(format!(
+                    "message {id} has not been written yet ({})",
+                    record.status.label()
+                )))
+            }
+            DeliveryStatus::Failed { code, .. } => {
+                return Err(BridgeError::Conflict(format!(
+                    "message {id} was never written (failed: {})",
+                    code.label()
+                )))
+            }
+            DeliveryStatus::Written | DeliveryStatus::AwaitingAck | DeliveryStatus::Unknown => {}
+        }
+        if let Some(note) = &note {
+            if note.len() > MAX_ACK_NOTE {
+                return Err(BridgeError::Protocol(format!(
+                    "ack note is {} bytes, limit is {MAX_ACK_NOTE}",
+                    note.len()
+                )));
+            }
+        }
+        record.status = DeliveryStatus::Acknowledged;
+        record.ack = Some(Ack { at, note });
+        record.updated_at = at;
+        let message = record.clone();
+        drop(log);
+        if let Some(agent) = agent {
+            agent.update_message(id, DeliveryStatus::Acknowledged, message.bytes, at);
+            agent.publish(Event::MessageStatus {
+                agent: target.to_string(),
+                id,
+                status: DeliveryStatus::Acknowledged,
+                at,
+            });
+        }
+        Ok(Response::Message { message })
     }
 
     /// Current stored status for `id`.
@@ -577,6 +660,18 @@ fn apply_writing(messages: &Mutex<MessageLog>, id: MessageId, notify: StatusNoti
     notify(DeliveryStatus::Writing, 0, at);
 }
 
+/// Final status for a completed write.
+///
+/// A sender that asked for an acknowledgement sees `awaiting_ack` instead of
+/// `written`; the bytes are on the wire either way.
+fn settle(status: DeliveryStatus, require_ack: bool) -> DeliveryStatus {
+    if require_ack && status == DeliveryStatus::Written {
+        DeliveryStatus::AwaitingAck
+    } else {
+        status
+    }
+}
+
 /// Publish the writer's terminal status (or amend an earlier `unknown`).
 fn apply_status(
     messages: &Mutex<MessageLog>,
@@ -590,6 +685,14 @@ fn apply_status(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(record) = log.entries.get_mut(&id) {
+        if matches!(record.status, DeliveryStatus::Acknowledged) {
+            // An explicit ack proves the bytes arrived, so a late `unknown`
+            // amendment must not downgrade it. Keep the byte count it reports.
+            if status.is_written() && bytes > 0 {
+                record.bytes = bytes;
+            }
+            return;
+        }
         record.status = status.clone();
         record.bytes = bytes;
         record.updated_at = at;
@@ -780,8 +883,8 @@ fn write_frame<W: Write, T: serde::Serialize>(writer: &mut W, value: &T) -> std:
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_status, apply_writing, status_after_timeout, DeliveryStatus, Message, MessageLog,
-        Millis, Mutex, MAX_LOG,
+        apply_status, apply_writing, settle, status_after_timeout, DeliveryStatus, Message,
+        MessageLog, Millis, Mutex, MAX_LOG,
     };
 
     fn record(id: u64, target: &str, status: DeliveryStatus) -> Message {
@@ -794,6 +897,7 @@ mod tests {
             updated_at: id,
             bytes: 0,
             status,
+            ack: None,
         }
     }
 
@@ -879,5 +983,56 @@ mod tests {
         assert_eq!(log.recent(MAX_LOG + 100).len(), MAX_LOG);
         assert!(log.get(1).is_none());
         assert!(log.get(MAX_LOG as u64 + 5).is_some());
+    }
+
+    #[test]
+    fn settle_maps_a_completed_write_to_awaiting_ack_when_requested() {
+        assert_eq!(
+            settle(DeliveryStatus::Written, true),
+            DeliveryStatus::AwaitingAck
+        );
+        assert_eq!(
+            settle(DeliveryStatus::Written, false),
+            DeliveryStatus::Written
+        );
+        let failed = DeliveryStatus::Failed {
+            code: crate::protocol::ErrorCode::Conflict,
+            detail: "gone".to_string(),
+        };
+        assert_eq!(
+            settle(failed.clone(), true),
+            failed,
+            "a failed write never becomes awaiting_ack"
+        );
+        assert_eq!(
+            settle(DeliveryStatus::Unknown, true),
+            DeliveryStatus::Unknown
+        );
+    }
+
+    /// An explicit ack is stronger than the write outcome: a late `done`
+    /// event must not downgrade it, but may fill in the byte count.
+    #[test]
+    fn an_acknowledgement_survives_a_late_write_outcome() {
+        let log = Mutex::new(MessageLog::new());
+        log.lock()
+            .expect("log")
+            .insert(record(1, "dev", DeliveryStatus::Acknowledged));
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        let notify = |_status: DeliveryStatus, _bytes: usize, _at: Millis| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+
+        apply_status(&log, 1, DeliveryStatus::Written, 9, &notify);
+        let guard = log.lock().expect("log");
+        let message = guard.get(1).expect("record");
+        assert_eq!(message.status, DeliveryStatus::Acknowledged);
+        assert_eq!(message.bytes, 9, "the confirmed byte count is kept");
+        drop(guard);
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no status event is emitted for a downgrade that did not happen"
+        );
     }
 }

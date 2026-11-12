@@ -75,6 +75,10 @@ enum Command {
         /// `plain` (send raw bytes; the documented fallback).
         #[arg(long, default_value = "auto", value_parser = parse_paste)]
         paste: PasteMode,
+        /// Ask the receiving integration to acknowledge the message; the
+        /// status becomes `awaiting_ack` instead of `written`.
+        #[arg(long)]
+        require_ack: bool,
     },
     /// Spawn a new agent inside a daemon-owned PTY.
     New {
@@ -132,7 +136,19 @@ enum Command {
         /// Message id printed by `sendmessage` or `log`.
         id: u64,
     },
-    /// List messages that may still change: queued, writing or unknown.
+    /// Acknowledge a message you received (explicit application-level ack).
+    #[command(visible_alias = "acknowledge")]
+    Ack {
+        /// Agent name that received the message.
+        target: String,
+        /// Message id from `sendmessage`, `pending` or `log`.
+        id: u64,
+        /// Optional note recorded with the acknowledgement.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// List messages that may still change: queued, writing, unknown or
+    /// `awaiting_ack`.
     Pending {
         /// Agent name.
         target: String,
@@ -205,6 +221,7 @@ fn run(cli: Cli) -> Result<()> {
             write_timeout,
             no_wait,
             paste,
+            require_ack,
         } => {
             ensure_daemon(true)?;
             let text = message.join(" ");
@@ -217,6 +234,7 @@ fn run(cli: Cli) -> Result<()> {
                 write_timeout_ms: Some(duration_millis(write_timeout)),
                 wait: Some(!no_wait),
                 paste: Some(paste),
+                require_ack: Some(require_ack),
             })?;
             let failure = match &response {
                 Response::Sent {
@@ -236,7 +254,7 @@ fn run(cli: Cli) -> Result<()> {
             } = &response
             {
                 if failure.is_none() {
-                    if matches!(status, DeliveryStatus::Written) {
+                    if status.is_written() {
                         println!(
                             "sent msg {message_id} to {target} ({}, {bytes} bytes)",
                             fmt::status_line(status)
@@ -337,6 +355,17 @@ fn run(cli: Cli) -> Result<()> {
         Command::Messagestatus { id } => {
             ensure_daemon(true)?;
             let response = client::request(&Request::MessageStatus { id })?;
+            match (&response, json) {
+                (Response::Message { message }, false) => {
+                    fmt::print_message(message);
+                    Ok(())
+                }
+                _ => emit(response, json),
+            }
+        }
+        Command::Ack { target, id, note } => {
+            ensure_daemon(true)?;
+            let response = client::request(&Request::Ack { target, id, note })?;
             match (&response, json) {
                 (Response::Message { message }, false) => {
                     fmt::print_message(message);
@@ -660,6 +689,7 @@ mod tests {
                 write_timeout,
                 no_wait,
                 paste,
+                require_ack,
             } => {
                 assert_eq!(target, "dev");
                 assert_eq!(message, ["hello", "world"]);
@@ -669,6 +699,7 @@ mod tests {
                 assert_eq!(write_timeout, Duration::from_secs(5));
                 assert!(!no_wait);
                 assert_eq!(paste, PasteMode::Auto);
+                assert!(!require_ack);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -719,6 +750,48 @@ mod tests {
             agent_bridge_core::delivery::MAX_TIMEOUT
         );
         assert_eq!(duration_millis(Duration::from_millis(250)), 250);
+    }
+
+    #[test]
+    fn sendmessage_parses_require_ack() {
+        let cli = Cli::try_parse_from([
+            "agent-bridge",
+            "sendmessage",
+            "dev",
+            "--require-ack",
+            "--no-wait",
+            "run the tests",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Sendmessage {
+                require_ack: true,
+                no_wait: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ack_command_parses_target_id_and_note() {
+        let cli =
+            Cli::try_parse_from(["agent-bridge", "ack", "dev", "7", "--note", "ran the tests"])
+                .expect("parse");
+        match cli.command {
+            Command::Ack { target, id, note } => {
+                assert_eq!(target, "dev");
+                assert_eq!(id, 7);
+                assert_eq!(note.as_deref(), Some("ran the tests"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let alias =
+            Cli::try_parse_from(["agent-bridge", "acknowledge", "qa", "3"]).expect("alias parse");
+        assert!(matches!(
+            alias.command,
+            Command::Ack { target, id: 3, note: None } if target == "qa"
+        ));
     }
 
     #[test]
