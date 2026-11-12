@@ -110,14 +110,14 @@ Atomic, queued writes still do not tell the sender whether the target is ready f
 input. A message can land while the target is generating output or waiting at a
 permission prompt. Readiness detection is heuristic and must be documented as such.
 
--   [ ] Detect idle/busy state from output quiescence (configurable quiet period) and optional per-agent prompt patterns.
--   [ ] Expose the state in agent status as `busy`, `idle`, or `unknown`, never as a guarantee.
+-   [x] Detect idle/busy state from output quiescence (configurable quiet period) and optional per-agent prompt patterns.
+-   [x] Expose the state in agent status as `busy`, `idle`, or `unknown`, never as a guarantee (`listagents`, `--json` `readiness`, `AgentInfo`).
 -   [ ] Add `sendmessage --wait-idle [--timeout]` that holds the message in the queue until the target appears idle or the timeout expires.
 -   [ ] Add `--wait-reply [--timeout]` that, after a message is written, waits for output to settle and returns the new output since the write (best effort, with explicit `timed_out` / `settled` result).
 -   [ ] Add output offsets and a cursor-based read: `read <name> --since <offset>` returns new output and the next offset, so callers do not re-read the same data.
 -   [ ] Add a bounded follow/stream mode (or long-poll) suitable for MCP clients, with clear behavior when the buffer wraps and older offsets are no longer available.
--   [ ] Make the quiet period, prompt patterns, and buffer sizes configurable, with safe defaults.
--   [ ] Add tests using a mock agent that alternates busy/idle output, prints prompts, and goes silent; cover timeouts and offset expiry.
+-   [x] Make the quiet period, prompt patterns, and buffer sizes configurable, with safe defaults (`AGENT_BRIDGE_QUIET_MS`, `AGENT_BRIDGE_PROMPT_PATTERN`, `AGENT_BRIDGE_BUFFER_BYTES`).
+-   [ ] Add tests using a mock agent that alternates busy/idle output, prints prompts, and goes silent; cover timeouts and offset expiry. (Readiness cases are covered; timeout and offset cases land with the items above.)
 
 **Acceptance criterion:** With a deterministic mock agent, `--wait-idle` never writes
 during a scripted busy period, and `--since` returns each output byte exactly once

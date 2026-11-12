@@ -98,6 +98,16 @@ and idempotent; it reports that the integration saw the message, not that the
 application understood or completed the request. `written`, `awaiting_ack` and
 `acknowledged` are the only statuses that mean the bytes reached the PTY.
 
+`listagents` shows a heuristic **READY** column: `busy`, `idle` or `unknown`
+(`listagents --json` reports `readiness`). Output newer than the quiet period is
+`busy`, older output is `idle`, a stopped agent or one that never printed is
+`unknown`, and an optional literal prompt suffix can mark `idle` early. This is
+a hint, never a guarantee: a silent long-running command is reported `idle`.
+Tune it with `AGENT_BRIDGE_QUIET_MS` (default `500`, clamped 50..60000) and
+`AGENT_BRIDGE_PROMPT_PATTERN`; both are read when the agent spawns. Retained
+output is 256 KiB per agent; `AGENT_BRIDGE_BUFFER_BYTES` overrides it (clamped
+1 KiB..16 MiB) and is also sampled at spawn.
+
 Multi-line text is bracket-pasted (`ESC[200~`..`ESC[201~`) when the target
 application announced support with `ESC[?2004h`; this is `--paste auto`, the
 default. Use `--paste plain` for applications that print the markers as literal
@@ -115,7 +125,7 @@ argument (`sendmessage dev --no-wait "run the tests"`).
 | Command | Purpose |
 | --- | --- |
 | `agent-bridge daemon start\|stop\|restart\|status\|run` | manage the background daemon |
-| `agent-bridge listagents` | table of agents (name, status, pid, messages, queued, last output) |
+| `agent-bridge listagents` | table of agents (name, status, readiness, pid, messages, queued, last output) |
 | `agent-bridge new <name> [-- <cmd...>]` | spawn an agent in a daemon-owned PTY |
 | `agent-bridge sendmessage <name> [--from L] [--paste auto\|bracketed\|plain] [--require-ack] [--queue-timeout 5s] [--write-timeout 5s] [--no-wait] <text>` | type text into another agent's terminal; prints the message id and status |
 | `agent-bridge ack <name> <id> [--note TEXT]` | record an explicit application-level acknowledgement for a message you received (alias `acknowledge`) |

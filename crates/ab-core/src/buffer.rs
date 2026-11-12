@@ -4,6 +4,29 @@ use std::collections::VecDeque;
 
 /// Default retained bytes per agent (256 KiB).
 pub const DEFAULT_CAPACITY: usize = 256 * 1024;
+/// Environment variable for the per-agent retained output size.
+pub const CAPACITY_ENV: &str = "AGENT_BRIDGE_BUFFER_BYTES";
+/// Shortest accepted retained-output size.
+pub const MIN_CAPACITY: usize = 1024;
+/// Longest accepted retained-output size (16 MiB).
+pub const MAX_CAPACITY: usize = 16 * 1024 * 1024;
+
+/// Clamp a requested buffer size into the documented range.
+#[must_use]
+pub fn clamp_capacity(capacity: usize) -> usize {
+    capacity.clamp(MIN_CAPACITY, MAX_CAPACITY)
+}
+
+/// Read `AGENT_BRIDGE_BUFFER_BYTES`, falling back to the default.
+///
+/// Invalid values fall back to the default; out-of-range values are clamped.
+#[must_use]
+pub fn capacity_from_env() -> usize {
+    std::env::var(CAPACITY_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map_or(DEFAULT_CAPACITY, clamp_capacity)
+}
 
 /// Ring buffer holding the most recent terminal output of one agent.
 #[derive(Debug)]
@@ -19,7 +42,7 @@ impl OutputBuffer {
     pub fn new(capacity: usize) -> Self {
         Self {
             data: VecDeque::with_capacity(capacity.min(64 * 1024)),
-            capacity: capacity.max(1024),
+            capacity: clamp_capacity(capacity),
             truncated: false,
         }
     }
@@ -74,6 +97,25 @@ impl OutputBuffer {
         } else {
             lines.split_off(lines.len() - n)
         }
+    }
+
+    /// Newest non-empty line with ANSI escapes removed.
+    ///
+    /// Scans at most `limit` trailing bytes so a configured prompt suffix does
+    /// not require stripping the whole retained buffer.
+    #[must_use]
+    pub fn last_line(&self, limit: usize) -> Option<String> {
+        let start = self.data.len().saturating_sub(limit);
+        let tail: Vec<u8> = self.data.iter().skip(start).copied().collect();
+        let text = strip_ansi(&String::from_utf8_lossy(&tail));
+        text.lines().rev().find_map(|line| {
+            let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+            if trimmed.trim().is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
     }
 }
 
@@ -147,6 +189,24 @@ mod tests {
     fn strips_csi_and_osc() {
         assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
         assert_eq!(strip_ansi("a\u{1b}]0;title\u{7}b"), "ab");
+    }
+
+    #[test]
+    fn finds_the_newest_visible_line() {
+        let mut buffer = OutputBuffer::new(1024);
+        buffer.push(b"prompt> \n\n\x1b[32mdone\x1b[0m\r\n\r\n");
+        assert_eq!(buffer.last_line(1024).as_deref(), Some("done"));
+        buffer.push(b"partial");
+        assert_eq!(buffer.last_line(1024).as_deref(), Some("partial"));
+        buffer.push(b"\n   \n");
+        assert_eq!(buffer.last_line(1024).as_deref(), Some("partial"));
+    }
+
+    #[test]
+    fn capacity_is_clamped() {
+        assert_eq!(super::clamp_capacity(1), super::MIN_CAPACITY);
+        assert_eq!(super::clamp_capacity(usize::MAX), super::MAX_CAPACITY);
+        assert_eq!(super::clamp_capacity(4096), 4096);
     }
 
     #[test]

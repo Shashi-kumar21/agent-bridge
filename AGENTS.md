@@ -103,6 +103,13 @@ A PR is ready for QA only when **all** of these are true:
   PTY accepted the bytes. Only an explicit `Request::Ack` from the target makes
   a message `acknowledged`; never infer one from output. An ack is
   target-checked, idempotent, and capped at 1 KiB of note.
+* Readiness is a heuristic and must always be documented as one. `idle` comes
+  from output quiescence (`AGENT_BRIDGE_QUIET_MS`, default 500 ms) or an optional
+  literal `AGENT_BRIDGE_PROMPT_PATTERN` suffix on the newest line; a stopped
+  agent or one with no output is `unknown`. Never gate a destructive action on
+  `idle` alone, and never describe it as a prompt detector. Both variables and
+  `AGENT_BRIDGE_BUFFER_BYTES` (1 KiB..16 MiB, default 256 KiB) are sampled in
+  `Agent::spawn`, so they affect only new agents.
 * Attach streams replay buffered output and then continue live, so the same
   `seq` can arrive twice; clients must drop non-increasing `seq` frames.
 * Daemon lifecycle: a protocol-skew restart is allowed **only** when the daemon
@@ -138,7 +145,9 @@ A PR is ready for QA only when **all** of these are true:
 crates/ab-core/src/protocol.rs  wire types (single source of truth)
 crates/ab-core/src/delivery.rs  message ids, size limit, payload composition, bounded write queue
 crates/ab-core/src/daemon.rs    accept loop, request handling, attach streams
-crates/ab-core/src/agent.rs     PTY spawn, output pump, resize, kill
+crates/ab-core/src/agent.rs     PTY spawn, output pump, resize, kill, readiness snapshot
+crates/ab-core/src/buffer.rs    bounded output ring, ANSI stripping, capacity from env
+crates/ab-core/src/readiness.rs quiet period + prompt-suffix heuristic
 crates/ab-core/src/reaper.rs    agent lifetime + `kill --force` tree teardown
 crates/ab-core/src/transport.rs local socket / named pipe
 crates/ab-core/src/client.rs    blocking client used by CLI and UI

@@ -17,21 +17,23 @@ use agent_bridge_core::daemon::Daemon;
 use agent_bridge_core::delivery::{DEFAULT_QUEUE_BYTES, DEFAULT_QUEUE_LIMIT};
 #[cfg(unix)]
 use agent_bridge_core::delivery::{PASTE_END, PASTE_START};
-#[cfg(unix)]
-use agent_bridge_core::protocol::AgentInfo;
 use agent_bridge_core::protocol::{
-    DeliveryStatus, ErrorCode, Message, PasteMode, Request, Response,
+    AgentInfo, AgentStatus, DeliveryStatus, ErrorCode, Message, PasteMode, Readiness, Request,
+    Response,
 };
 
 /// The daemon endpoint is chosen through process-wide environment variables, so
 /// these tests must not overlap (the default test harness runs them in threads).
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-const ENV_KEYS: [&str; 4] = [
+const ENV_KEYS: [&str; 7] = [
     "AGENT_BRIDGE_HOME",
     "AGENT_BRIDGE_PIPE",
     "AGENT_BRIDGE_QUEUE_LIMIT",
     "AGENT_BRIDGE_QUEUE_BYTES",
+    "AGENT_BRIDGE_QUIET_MS",
+    "AGENT_BRIDGE_PROMPT_PATTERN",
+    "AGENT_BRIDGE_BUFFER_BYTES",
 ];
 
 /// One daemon per test, with cleanup on both success and panic.
@@ -61,6 +63,13 @@ impl Harness {
         // Set both explicitly so one test cannot leak its limits into the next.
         std::env::set_var("AGENT_BRIDGE_QUEUE_LIMIT", queue_limit.to_string());
         std::env::set_var("AGENT_BRIDGE_QUEUE_BYTES", queue_bytes.to_string());
+        for key in [
+            "AGENT_BRIDGE_QUIET_MS",
+            "AGENT_BRIDGE_PROMPT_PATTERN",
+            "AGENT_BRIDGE_BUFFER_BYTES",
+        ] {
+            std::env::remove_var(key);
+        }
 
         let daemon = Daemon::new();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -207,7 +216,6 @@ fn output_text(target: &str) -> String {
     }
 }
 
-#[cfg(unix)]
 fn agent_info(name: &str) -> AgentInfo {
     match client::request(&Request::List).expect("list") {
         Response::Agents { agents } => agents
@@ -215,6 +223,64 @@ fn agent_info(name: &str) -> AgentInfo {
             .find(|agent| agent.name == name)
             .unwrap_or_else(|| panic!("agent {name} is missing")),
         other => panic!("unexpected list response: {other:?}"),
+    }
+}
+
+/// Poll `listagents` until the agent reports the expected readiness.
+fn wait_until_readiness(name: &str, expected: Readiness, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let info = agent_info(name);
+        if info.readiness == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{name} stayed {:?}, expected {expected:?} (status {:?}, last_output_at {:?}, output: {:?})",
+            info.readiness,
+            info.status,
+            info.last_output_at,
+            output_text(name)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Command that prints one line and then stays silent.
+fn prompt_command() -> Vec<String> {
+    if cfg!(windows) {
+        let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+        vec![
+            shell,
+            "/c".to_string(),
+            r"echo AGENT-READY & %SystemRoot%\System32\ping.exe -n 60 127.0.0.1 >nul".to_string(),
+        ]
+    } else {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf 'AGENT-READY
+'; sleep 30"
+                .to_string(),
+        ]
+    }
+}
+
+/// Command that never writes to its PTY.
+fn silent_command() -> Vec<String> {
+    if cfg!(windows) {
+        let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+        vec![
+            shell,
+            "/c".to_string(),
+            r"%SystemRoot%\System32\ping.exe -n 60 127.0.0.1 >nul".to_string(),
+        ]
+    } else {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 30".to_string(),
+        ]
     }
 }
 
@@ -783,4 +849,78 @@ fn ack_rejects_a_message_that_was_never_written() {
         other => panic!("expected a conflict error, got {other:?}"),
     }
     kill("tiny");
+}
+
+/// Readiness follows output quiescence: a recent echo is busy, and the same
+/// agent becomes idle once the configured quiet period passes.
+#[test]
+fn readiness_turns_busy_then_idle_after_the_quiet_period() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+
+    std::env::set_var("AGENT_BRIDGE_QUIET_MS", "10000");
+    create_agent("busy");
+    let (_, status) = send("busy", "echo readiness-busy".to_string(), true);
+    assert_eq!(status, DeliveryStatus::Written);
+    wait_until_readiness("busy", Readiness::Busy, Duration::from_secs(5));
+    kill("busy");
+
+    std::env::set_var("AGENT_BRIDGE_QUIET_MS", "100");
+    create_agent("idle");
+    let (_, status) = send("idle", "echo readiness-idle".to_string(), true);
+    assert_eq!(status, DeliveryStatus::Written);
+    wait_until_readiness("idle", Readiness::Idle, Duration::from_secs(5));
+    kill("idle");
+}
+
+/// Without output there is nothing to infer from, and a stopped agent is
+/// always `unknown`.
+#[test]
+fn readiness_is_unknown_without_output_and_after_exit() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+
+    std::env::set_var("AGENT_BRIDGE_QUIET_MS", "100");
+    create_agent_with("silent", silent_command());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let info = agent_info("silent");
+        if info.readiness == Readiness::Unknown {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a silent agent must stay unknown, got {:?}",
+            info.readiness
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    kill("silent");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let info = agent_info("silent");
+        if info.status == AgentStatus::Exited {
+            assert_eq!(info.readiness, Readiness::Unknown);
+            break;
+        }
+        assert!(Instant::now() < deadline, "the silent agent did not exit");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A configured prompt suffix marks idle even while the quiet period is still
+/// running; the same output without the suffix stays busy.
+#[test]
+fn readiness_uses_a_configured_prompt_suffix() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+
+    std::env::set_var("AGENT_BRIDGE_QUIET_MS", "10000");
+    create_agent_with("plain", prompt_command());
+    wait_until_readiness("plain", Readiness::Busy, Duration::from_secs(5));
+
+    std::env::set_var("AGENT_BRIDGE_PROMPT_PATTERN", "AGENT-READY");
+    create_agent_with("prompt", prompt_command());
+    wait_until_readiness("prompt", Readiness::Idle, Duration::from_secs(5));
+
+    kill("plain");
+    kill("prompt");
 }
