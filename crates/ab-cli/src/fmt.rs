@@ -111,6 +111,12 @@ pub fn print_message(message: &Message) {
     println!("bytes    : {}", message.bytes);
     println!("queued   : {}", human_age(message.at));
     println!("updated  : {}", human_age(message.updated_at));
+    if let Some(ack) = &message.ack {
+        println!("acked    : {}", human_age(ack.at));
+        if let Some(note) = &ack.note {
+            println!("ack note : {note}");
+        }
+    }
     println!("text     : {}", message.text);
 }
 

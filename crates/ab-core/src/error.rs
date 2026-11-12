@@ -60,6 +60,10 @@ pub enum BridgeError {
         detail: String,
     },
 
+    /// The request is valid but the object is in a state that forbids it.
+    #[error("{0}")]
+    Conflict(String),
+
     /// Generic daemon-side failure.
     #[error("{0}")]
     Daemon(String),
@@ -74,6 +78,7 @@ impl BridgeError {
             Self::AgentExists(_) | Self::AgentExited(_) | Self::DeliveryFailed { .. } => {
                 ErrorCode::Conflict
             }
+            Self::Conflict(_) => ErrorCode::Conflict,
             Self::InvalidName(_) | Self::Protocol(_) => ErrorCode::BadRequest,
             Self::MessageTooLarge { .. } => ErrorCode::TooLarge,
             Self::DaemonNotRunning(_) | Self::Daemon(_) => ErrorCode::NotRunning,

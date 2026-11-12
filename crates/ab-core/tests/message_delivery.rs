@@ -19,7 +19,9 @@ use agent_bridge_core::delivery::{DEFAULT_QUEUE_BYTES, DEFAULT_QUEUE_LIMIT};
 use agent_bridge_core::delivery::{PASTE_END, PASTE_START};
 #[cfg(unix)]
 use agent_bridge_core::protocol::AgentInfo;
-use agent_bridge_core::protocol::{DeliveryStatus, ErrorCode, PasteMode, Request, Response};
+use agent_bridge_core::protocol::{
+    DeliveryStatus, ErrorCode, Message, PasteMode, Request, Response,
+};
 
 /// The daemon endpoint is chosen through process-wide environment variables, so
 /// these tests must not overlap (the default test harness runs them in threads).
@@ -159,6 +161,7 @@ fn send_with_paste(
         write_timeout_ms: Some(write_timeout_ms),
         wait: Some(wait),
         paste: Some(paste),
+        require_ack: None,
     })
     .expect("send message");
     match response {
@@ -478,6 +481,54 @@ fn large_response_is_not_truncated() {
     kill("big");
 }
 
+/// Send with `require_ack: true`, which is what `--require-ack` sets.
+fn send_requiring_ack(target: &str, message: &str) -> (u64, DeliveryStatus) {
+    send_with_paste_and_ack(target, message.to_string(), PasteMode::Auto, true)
+}
+
+fn message_record(id: u64) -> Message {
+    match client::request(&Request::MessageStatus { id }).expect("message status") {
+        Response::Message { message } => message,
+        other => panic!("unexpected status response: {other:?}"),
+    }
+}
+
+fn ack(target: &str, id: u64, note: Option<&str>) -> Response {
+    client::request(&Request::Ack {
+        target: target.to_string(),
+        id,
+        note: note.map(ToString::to_string),
+    })
+    .expect("ack request")
+}
+
+/// One `Send` frame with explicit `paste` and `require_ack` values.
+fn send_with_paste_and_ack(
+    target: &str,
+    message: String,
+    paste: PasteMode,
+    require_ack: bool,
+) -> (u64, DeliveryStatus) {
+    let response = client::request(&Request::Send {
+        target: target.to_string(),
+        message,
+        enter: Some(true),
+        from: Some("qa".to_string()),
+        queue_timeout_ms: Some(5_000),
+        write_timeout_ms: Some(10_000),
+        wait: Some(true),
+        paste: Some(paste),
+        require_ack: Some(require_ack),
+    })
+    .expect("send message");
+    match response {
+        Response::Sent {
+            message_id, status, ..
+        } => (message_id, status),
+        other => panic!("expected a sent response, got {other:?}"),
+    }
+}
+
 /// Shell command that advertises bracketed paste and copies everything it
 /// receives into `$0`.
 #[cfg(unix)]
@@ -569,4 +620,167 @@ fn forced_bracketed_paste_wraps_a_silent_target() {
     let expected = [PASTE_START, b"one\ntwo", PASTE_END].concat();
     wait_for_capture(&file, &expected);
     kill("silent");
+}
+
+/// A message sent with `require_ack` stays `awaiting_ack` until the receiving
+/// integration explicitly acknowledges it, then becomes `acknowledged`.
+#[test]
+fn require_ack_waits_for_an_explicit_acknowledgement() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent("dev");
+
+    let (id, status) = send_requiring_ack("dev", "run the suite");
+    assert_eq!(status, DeliveryStatus::AwaitingAck);
+    assert!(
+        pending("dev").contains(&id),
+        "an unacknowledged message stays in flight"
+    );
+    let record = message_record(id);
+    assert_eq!(record.status, DeliveryStatus::AwaitingAck);
+    assert!(record.ack.is_none());
+    assert!(record.bytes > 0, "the bytes were written");
+
+    let at = record.at;
+    match ack("dev", id, Some("ran the suite")) {
+        Response::Message { message } => {
+            assert_eq!(message.status, DeliveryStatus::Acknowledged);
+            let acked = message.ack.expect("ack recorded");
+            assert_eq!(acked.note.as_deref(), Some("ran the suite"));
+            assert!(acked.at >= at);
+        }
+        other => panic!("expected the acknowledged record, got {other:?}"),
+    }
+
+    let record = message_record(id);
+    assert_eq!(record.status, DeliveryStatus::Acknowledged);
+    assert!(!pending("dev").contains(&id), "an ack settles the message");
+
+    // Retrying is idempotent and keeps the first note.
+    match ack("dev", id, Some("second note")) {
+        Response::Message { message } => {
+            assert_eq!(message.status, DeliveryStatus::Acknowledged);
+            assert_eq!(
+                message.ack.as_ref().and_then(|ack| ack.note.as_deref()),
+                Some("ran the suite")
+            );
+        }
+        other => panic!("expected the stored record, got {other:?}"),
+    }
+    kill("dev");
+}
+
+/// `written` is not `acknowledged`, but an integration may ack a message the
+/// sender did not mark as requiring it.
+#[test]
+fn a_plain_message_can_still_be_acknowledged() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent("dev");
+
+    let (id, status) = send("dev", "hello".to_string(), true);
+    assert_eq!(status, DeliveryStatus::Written);
+    assert!(message_record(id).ack.is_none());
+
+    match ack("dev", id, None) {
+        Response::Message { message } => {
+            assert_eq!(message.status, DeliveryStatus::Acknowledged);
+            assert!(message.ack.is_some());
+        }
+        other => panic!("expected the acknowledged record, got {other:?}"),
+    }
+    kill("dev");
+}
+
+/// Only the target may acknowledge, and an id must exist.
+#[test]
+fn ack_rejects_other_targets_and_unknown_ids() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent("dev");
+    create_agent("qa");
+
+    let (id, _) = send_requiring_ack("dev", "hello");
+
+    match ack("qa", id, None) {
+        Response::Error { code, message } => {
+            assert_eq!(code, ErrorCode::NotFound);
+            assert!(message.contains("not found"), "got {message}");
+        }
+        other => panic!("expected a not-found error, got {other:?}"),
+    }
+    match ack("dev", id + 10_000, None) {
+        Response::Error { code, .. } => assert_eq!(code, ErrorCode::NotFound),
+        other => panic!("expected a not-found error, got {other:?}"),
+    }
+    assert_eq!(
+        message_record(id).status,
+        DeliveryStatus::AwaitingAck,
+        "a rejected ack must not change the record"
+    );
+    kill("dev");
+    kill("qa");
+}
+
+/// The note is part of the bounded history, so an oversized one is rejected
+/// before it is stored.
+#[test]
+fn ack_rejects_an_oversized_note() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent("dev");
+    let (id, _) = send_requiring_ack("dev", "hello");
+
+    let huge = "x".repeat(1025);
+    match ack("dev", id, Some(&huge)) {
+        Response::Error { code, message } => {
+            assert_eq!(code, ErrorCode::BadRequest);
+            assert!(message.contains("ack note"), "got {message}");
+        }
+        other => panic!("expected a bad-request error, got {other:?}"),
+    }
+    assert!(message_record(id).ack.is_none());
+
+    // The boundary itself is accepted, and a retry with an oversized note now
+    // returns the stored record instead of re-validating it.
+    let largest = "y".repeat(1024);
+    match ack("dev", id, Some(&largest)) {
+        Response::Message { message } => {
+            assert_eq!(
+                message.ack.as_ref().and_then(|ack| ack.note.as_deref()),
+                Some(largest.as_str())
+            );
+        }
+        other => panic!("expected the acknowledged record, got {other:?}"),
+    }
+    match ack("dev", id, Some(&huge)) {
+        Response::Message { message } => assert_eq!(
+            message.ack.as_ref().and_then(|ack| ack.note.as_deref()),
+            Some(largest.as_str()),
+            "a retry must keep the first note"
+        ),
+        other => panic!("expected the stored record, got {other:?}"),
+    }
+    kill("dev");
+}
+
+/// A message that never reached the PTY cannot be acknowledged.
+#[test]
+fn ack_rejects_a_message_that_was_never_written() {
+    let _harness = Harness::start(1, 1024);
+    create_agent("tiny");
+
+    let (id, status) = send_requiring_ack("tiny", &"x".repeat(2048));
+    assert!(matches!(
+        status,
+        DeliveryStatus::Failed {
+            code: ErrorCode::QueueFull,
+            ..
+        }
+    ));
+
+    match ack("tiny", id, None) {
+        Response::Error { code, message } => {
+            assert_eq!(code, ErrorCode::Conflict);
+            assert!(message.contains("never written"), "got {message}");
+        }
+        other => panic!("expected a conflict error, got {other:?}"),
+    }
+    kill("tiny");
 }

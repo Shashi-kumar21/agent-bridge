@@ -85,8 +85,18 @@ write that is still blocked when `--write-timeout` expires returns `unknown`
 and is amended when the syscall returns; a message that has not started yet
 stays `queued` and is still delivered later. Note that `0` means fail fast for
 `--queue-timeout` but wait forever for `--write-timeout`. `sendmessage` exits 0
-for `queued`/`unknown` too; only `written` is a confirmed PTY write.
-`listagents` shows the queue depth.
+for `queued`/`unknown` too. `written` and `awaiting_ack` are confirmed PTY
+writes; `acknowledged` additionally means the receiving integration reported
+that it saw the message. `listagents` shows the queue depth.
+
+Add `--require-ack` when you need the receiving side to confirm it saw the
+message: the status then becomes `awaiting_ack` after the write, and an
+integration that received it runs `agent-bridge ack <name> <id> [--note "..."]`
+to record `acknowledged`. `pending <name>` lists the ids still awaiting an ack
+alongside the queued/writing/unknown ones. The ack is explicit, target-checked
+and idempotent; it reports that the integration saw the message, not that the
+application understood or completed the request. `written`, `awaiting_ack` and
+`acknowledged` are the only statuses that mean the bytes reached the PTY.
 
 Multi-line text is bracket-pasted (`ESC[200~`..`ESC[201~`) when the target
 application announced support with `ESC[?2004h`; this is `--paste auto`, the
@@ -107,9 +117,10 @@ argument (`sendmessage dev --no-wait "run the tests"`).
 | `agent-bridge daemon start\|stop\|restart\|status\|run` | manage the background daemon |
 | `agent-bridge listagents` | table of agents (name, status, pid, messages, queued, last output) |
 | `agent-bridge new <name> [-- <cmd...>]` | spawn an agent in a daemon-owned PTY |
-| `agent-bridge sendmessage <name> [--from L] [--paste auto\|bracketed\|plain] [--queue-timeout 5s] [--write-timeout 5s] [--no-wait] <text>` | type text into another agent's terminal; prints the message id and status |
+| `agent-bridge sendmessage <name> [--from L] [--paste auto\|bracketed\|plain] [--require-ack] [--queue-timeout 5s] [--write-timeout 5s] [--no-wait] <text>` | type text into another agent's terminal; prints the message id and status |
+| `agent-bridge ack <name> <id> [--note TEXT]` | record an explicit application-level acknowledgement for a message you received (alias `acknowledge`) |
 | `agent-bridge messagestatus <id>` | delivery status of one message (alias `msg-status`) |
-| `agent-bridge pending <name>` | messages for an agent that are still queued, writing or unknown |
+| `agent-bridge pending <name>` | messages for an agent that are still queued, writing, unknown or awaiting_ack |
 | `agent-bridge read <name> --lines N` | ANSI-stripped tail of its output |
 | `agent-bridge attach <name>` | live mirror + keyboard passthrough |
 | `agent-bridge kill <name>` | Ctrl-C first; `--force` kills the agent's process tree immediately (Windows: whole job; Unix: process group + best-effort tree snapshot from `ps` or `/proc`, plus a PTY fd sweep on Linux) |

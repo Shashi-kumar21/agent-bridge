@@ -16,20 +16,35 @@ $env:AGENT_BRIDGE_HOME = "C:\temp\ab-audit"   # PowerShell
 $env:AGENT_BRIDGE_PIPE = "agent-bridge-audit" # PowerShell, Windows isolation
 ```
 
-## 1. Message delivery is "written", never "delivered"
+## 1. Message delivery is "written" unless the receiver acked it
 
 `sendmessage` writes bytes into the target's PTY and returns
-`Sent { bytes, message_id, status }` (`daemon.rs:237-374`). The status records
+`Sent { bytes, message_id, status }` (`daemon.rs:241-385`). The status records
 what the daemon's write path did, not what the target did: the application may
 be mid-render, waiting at a prompt, or not reading at all. A bounded queue and a
-single writer per agent make the *write* orderly, but there is no retry and no
-application-level acknowledgement, so `written` does not mean the request was
-understood or executed.
+single writer per agent make the *write* orderly, but there is no retry, so
+`written` does not mean the request was understood or executed.
 
 ```bash
 agent-bridge new shell -- cmd.exe            # or /bin/sh
 agent-bridge sendmessage shell "echo hi"     # "sent msg 1 to shell (written, ...)"
 agent-bridge kill shell --force              # nothing observed the message
+```
+
+`--require-ack` adds one explicit step: after the write the status becomes
+`awaiting_ack`, and it only becomes `acknowledged` when the receiving
+integration sends `agent-bridge ack <target> <id>` (`Request::Ack`). An
+integration finds its ids with `pending <target>`; a message it never asks
+about stays `awaiting_ack` forever. An ack is opt-in and unauthenticated: it
+reports that the integration saw the message, not that the application
+understood or completed the request, and any process that can reach the daemon
+socket could claim one. Ids are per daemon lifetime, so an ack after a restart
+fails with `message not found`.
+
+```bash
+agent-bridge sendmessage dev --require-ack "run the suite"
+agent-bridge pending dev                     # awaiting_ack, id 7
+agent-bridge ack dev 7 --note "suite finished"
 ```
 
 Roadmap §2 (application-level acknowledgement only where a receiving
@@ -48,9 +63,10 @@ The remaining gap is the OS write itself: once `write_all` is inside the PTY
 there is no portable way to cancel it. `--write-timeout` (5 s by default, `0`
 waits forever) makes the caller return `unknown`; the writer keeps waiting and
 amends the record to `written`/`failed` when the syscall returns
-(`delivery.rs:483-499`, `daemon.rs:492-534`, `:535-627`). A target that never drains its PTY
-therefore keeps the in-flight byte reservation and the channel fills up behind
-it until the agent exits or the daemon is restarted; new messages to that agent
+(`delivery.rs:483-499`, `daemon.rs:501-530`, `:676-730`). A target that never
+drains its PTY therefore keeps the in-flight byte reservation and the channel
+fills up behind it until the agent exits or the daemon is restarted; new
+messages to that agent
 eventually fail with `queue_full`.
 
 Urgent jobs (Ctrl-C, `attach` keystrokes) use a separate channel and may pass a
@@ -83,7 +99,7 @@ printed the marker; the first multi-line message then falls back to plain. Wait
 for the prompt, or use `--paste bracketed`.
 
 The state is sampled when the request is handled
-(`daemon.rs:249-254`), not when the writer finally reaches the message. With a
+(`daemon.rs:253-261`), not when the writer finally reaches the message. With a
 slow queue the target may have disabled paste in between (readline does this
 while a command runs), and the wrapped text is then typed literally. Composing
 inside the writer would narrow that window but not close it, because the
@@ -126,8 +142,8 @@ Roadmap §6 (VT screen model and snapshot).
 
 ## 5. No byte offset cursor; `seq` counts chunks
 
-`Read` returns the current `seq` (`protocol.rs:427-437`); `Attach --from-seq`
-only decides whether to replay the *whole* retained buffer (`daemon.rs:710-711`).
+`Read` returns the current `seq` (`protocol.rs:436-445`); `Attach --from-seq`
+only decides whether to replay the *whole* retained buffer (`daemon.rs:813-814`).
 Because `seq` increments per PTY chunk, not per byte, callers cannot resume from
 an arbitrary offset, and a replay frame carries the newest `seq` for bytes that
 may include older chunks.
@@ -150,7 +166,7 @@ Roadmap §3 (cursor semantics that report what is actually available).
 
 ## 7. Exited agents are never removed; names cannot be reused
 
-The agent map is only inserted into (`daemon.rs:232`); there is no removal
+The agent map is only inserted into (`daemon.rs:236`); there is no removal
 path. `listagents` keeps showing exited entries with their buffers and message
 history, and `new` with that name fails with `agent '<name>' already exists`.
 
@@ -168,9 +184,9 @@ Tracked as issue
 ## 8. Daemon restart kills live agents and discards exited state
 
 Buffers, message history, PTY handles and job objects are in-memory only
-(`daemon.rs:87-93`). `daemon restart` stops the daemon, which sends Ctrl-C to
+(`daemon.rs:91-97`). `daemon restart` stops the daemon, which sends Ctrl-C to
 every agent, force-kills any that are still running after ~500 ms
-(`daemon.rs:171-180`, `agent.rs:530-548`), and then exits; the next daemon
+(`daemon.rs:175-184`, `agent.rs:530-548`), and then exits; the next daemon
 starts empty. There is no session adoption.
 
 ```bash
@@ -201,7 +217,7 @@ agent-bridge sendmessage sh "set -m; sleep 600 &"
 ## 10. Agents inherit the daemon's full environment
 
 The child gets everything the daemon has, plus `TERM` and
-`AGENT_BRIDGE_AGENT` (`agent.rs:112-113`). Nothing is filtered, so any secret in
+`AGENT_BRIDGE_AGENT` (`agent.rs:152`). Nothing is filtered, so any secret in
 the daemon's environment is present in every agent.
 
 ```bash
@@ -234,7 +250,7 @@ Roadmap §4 (document the endpoints, add per-instance isolation).
 Access control is the endpoint itself: socket `0600` in a `0700` directory, or a
 pipe DACL for owner/`SYSTEM`/Administrators (`transport.rs:79-98`,
 `transport.rs:41`). There is no caller authentication, no per-session policy and
-no audit trail; `from` is an unauthenticated label (`daemon.rs:237-374`).
+no audit trail; `from` is an unauthenticated label (`daemon.rs:241-385`).
 
 ```bash
 agent-bridge kill dev --force        # any local process can do this
@@ -254,7 +270,7 @@ Roadmap §3 (configurable sizes, explicit drop signalling).
 ## 14. Message history is per-agent and bounded at 500
 
 `record_message` keeps the newest 500 entries (`agent.rs:21`, `:438-448`), and
-the global id-indexed log keeps 2000 (`daemon.rs:25`, `:29-78`). Both are
+the global id-indexed log keeps 2000 (`daemon.rs:25`, `:33-82`). Both are
 in-memory and vanish with the daemon. Ids are unique only for one daemon
 lifetime, so `messagestatus` returns `not_found` after a restart even though the
 id was valid before; there is no persistence.
