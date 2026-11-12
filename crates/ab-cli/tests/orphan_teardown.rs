@@ -213,6 +213,9 @@ fn send(target: &str, message: &str) {
         message: message.to_string(),
         enter: Some(true),
         from: Some("qa".to_string()),
+        queue_timeout_ms: None,
+        write_timeout_ms: None,
+        wait: None,
     })
     .expect("send message");
     assert!(matches!(sent, Response::Sent { .. }), "got {sent:?}");
