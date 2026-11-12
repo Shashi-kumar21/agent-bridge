@@ -77,14 +77,14 @@ Implement a minimal, explicit delivery lifecycle:
 
 -   [x] Add a unique `message_id` to every message.
 -   [x] Add a per-session write queue so simultaneous senders cannot interleave bytes.
--   [x] Ensure each message is written atomically at the byte level (one writer, one `write_all` per message). Application-level paste is still open below.
--   [ ] Support multi-line messages safely. Investigate bracketed paste where supported, but provide a documented fallback because terminal applications differ.
+-   [x] Ensure each message is written atomically at the byte level (one writer, one `write_all` per message). Application-level acknowledgement is still open below.
+-   [x] Support multi-line messages safely: bracket-paste (`ESC[200~`..`ESC[201~`) when the target announces it (`ESC[?2004h`), with `--paste bracketed` and the documented `--paste plain` fallback.
 -   [x] Return a clear result such as `queued`, `written`, `failed`, or `unknown`; do not label `written` as `delivered` or `acknowledged`.
 -   [ ] Add optional application-level acknowledgement only where a receiving agent integration can explicitly send one.
 -   [x] Add configurable write timeouts and bounded queue sizes.
 -   [x] Define queue behavior when the target exits, is unavailable, or the queue is full.
 -   [x] Prevent unbounded memory growth and expose queue length/status (`AGENT_BRIDGE_QUEUE_*`, `listagents` queue depth, `messagestatus`/`pending` for status).
--   [ ] Add tests for multi-line input (the other cases - concurrent senders, large messages, Unicode, target exit, timeout, queue overflow - are covered).
+-   [x] Add tests for multi-line input (the other cases - concurrent senders, large messages, Unicode, target exit, timeout, queue overflow - were covered in Phase 2B).
 
 **Suggested conceptual API (adapt to existing conventions):**
 

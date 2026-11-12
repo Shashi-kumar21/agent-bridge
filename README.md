@@ -85,9 +85,20 @@ write that is still blocked when `--write-timeout` expires returns `unknown`
 and is amended when the syscall returns; a message that has not started yet
 stays `queued` and is still delivered later. Note that `0` means fail fast for
 `--queue-timeout` but wait forever for `--write-timeout`. `sendmessage` exits 0
-for `queued`/`unknown` too; only `written` is a confirmed PTY write. `listagents` shows the queue
-depth. Options must come **before** the message text, because the text is a
-trailing argument (`sendmessage dev --no-wait "run the tests"`).
+for `queued`/`unknown` too; only `written` is a confirmed PTY write.
+`listagents` shows the queue depth.
+
+Multi-line text is bracket-pasted (`ESC[200~`..`ESC[201~`) when the target
+application announced support with `ESC[?2004h`; this is `--paste auto`, the
+default. Use `--paste plain` for applications that print the markers as literal
+text, or `--paste bracketed` to force the markers for an application that
+supports paste without announcing it. Detection reads the daemon's PTY stream;
+in the default ConPTY configuration on Windows that stream is re-rendered by
+ConPTY, which consumes these markers, so `auto` behaves like `plain` there.
+`listagents --json` reports `bracketed_paste`.
+
+Options must come **before** the message text, because the text is a trailing
+argument (`sendmessage dev --no-wait "run the tests"`).
 
 ## Commands
 
@@ -96,7 +107,7 @@ trailing argument (`sendmessage dev --no-wait "run the tests"`).
 | `agent-bridge daemon start\|stop\|restart\|status\|run` | manage the background daemon |
 | `agent-bridge listagents` | table of agents (name, status, pid, messages, queued, last output) |
 | `agent-bridge new <name> [-- <cmd...>]` | spawn an agent in a daemon-owned PTY |
-| `agent-bridge sendmessage <name> [--from L] [--queue-timeout 5s] [--write-timeout 5s] [--no-wait] <text>` | type text into another agent's terminal; prints the message id and status |
+| `agent-bridge sendmessage <name> [--from L] [--paste auto\|bracketed\|plain] [--queue-timeout 5s] [--write-timeout 5s] [--no-wait] <text>` | type text into another agent's terminal; prints the message id and status |
 | `agent-bridge messagestatus <id>` | delivery status of one message (alias `msg-status`) |
 | `agent-bridge pending <name>` | messages for an agent that are still queued, writing or unknown |
 | `agent-bridge read <name> --lines N` | ANSI-stripped tail of its output |

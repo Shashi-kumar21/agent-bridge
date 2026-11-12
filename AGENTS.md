@@ -130,7 +130,7 @@ A PR is ready for QA only when **all** of these are true:
 
 ```
 crates/ab-core/src/protocol.rs  wire types (single source of truth)
-crates/ab-core/src/delivery.rs  message ids, size limit, bounded write queue
+crates/ab-core/src/delivery.rs  message ids, size limit, payload composition, bounded write queue
 crates/ab-core/src/daemon.rs    accept loop, request handling, attach streams
 crates/ab-core/src/agent.rs     PTY spawn, output pump, resize, kill
 crates/ab-core/src/reaper.rs    agent lifetime + `kill --force` tree teardown

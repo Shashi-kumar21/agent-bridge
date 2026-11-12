@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the wire shape changes. New `cmd`/`event` tags are unknown
 /// to older daemons, so additive changes bump it too; the CLI compares it for
 /// equality and restarts a daemon only when no agent is live.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Default terminal width for spawned agents.
 pub const DEFAULT_COLS: u16 = 120;
@@ -108,12 +108,36 @@ pub struct AgentInfo {
     /// flight.
     #[serde(default)]
     pub queued: usize,
+    /// True when the child application enabled bracketed paste
+    /// (`ESC[?2004h`) on its terminal output and has not disabled it since.
+    #[serde(default)]
+    pub bracketed_paste: bool,
     /// Number of live attach subscribers.
     pub subscribers: usize,
     /// PTY width.
     pub cols: u16,
     /// PTY height.
     pub rows: u16,
+}
+
+/// How line breaks in a message are delivered to the target terminal.
+///
+/// Terminals only treat `ESC[200~`..`ESC[201~` as a paste when the running
+/// application has enabled bracketed paste, which it announces with
+/// `ESC[?2004h`. The daemon follows that announcement in [`PasteMode::Auto`];
+/// [`PasteMode::Plain`] is the documented fallback for applications that do not
+/// support it, and [`PasteMode::Bracketed`] forces the markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PasteMode {
+    /// Bracket-paste multi-line text only when the target enabled it;
+    /// otherwise send plain bytes.
+    #[default]
+    Auto,
+    /// Always wrap the text in `ESC[200~`..`ESC[201~`, even single-line text.
+    Bracketed,
+    /// Never wrap; a line break is typed as-is and usually submits the line.
+    Plain,
 }
 
 /// Delivery lifecycle of one message.
@@ -239,6 +263,9 @@ pub enum Request {
         /// Wait for a terminal status before replying (default true).
         #[serde(default)]
         wait: Option<bool>,
+        /// How line breaks are delivered (default `auto`).
+        #[serde(default)]
+        paste: Option<PasteMode>,
     },
     /// Read the tail of an agent's output buffer.
     Read {
@@ -358,8 +385,8 @@ pub enum Response {
     Sent {
         /// Recipient.
         target: String,
-        /// Bytes accepted by the PTY, including the appended carriage return
-        /// (0 while queued or when the write failed).
+        /// Bytes accepted by the PTY, including any paste markers and the
+        /// appended carriage return (0 while queued or when the write failed).
         bytes: usize,
         /// Daemon-wide message identifier.
         #[serde(default)]
@@ -459,7 +486,7 @@ pub fn validate_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_name, DeliveryStatus, ErrorCode, Event, Message, Request, Response,
+        validate_name, DeliveryStatus, ErrorCode, Event, Message, PasteMode, Request, Response,
         PROTOCOL_VERSION,
     };
 
@@ -499,8 +526,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_is_three() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+    fn protocol_is_four() {
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[test]
@@ -611,6 +638,7 @@ mod tests {
                 queue_timeout_ms,
                 write_timeout_ms,
                 wait,
+                paste,
             } => {
                 assert_eq!(target, "dev");
                 assert_eq!(message, "hi");
@@ -619,6 +647,7 @@ mod tests {
                 assert_eq!(queue_timeout_ms, None);
                 assert_eq!(write_timeout_ms, None);
                 assert_eq!(wait, None);
+                assert_eq!(paste, None);
             }
             other => panic!("unexpected request: {other:?}"),
         }
@@ -634,10 +663,12 @@ mod tests {
             queue_timeout_ms: Some(250),
             write_timeout_ms: Some(0),
             wait: Some(false),
+            paste: Some(PasteMode::Bracketed),
         };
         let json = serde_json::to_string(&request).expect("serialize");
         assert!(json.contains("\"queue_timeout_ms\":250"));
         assert!(json.contains("\"wait\":false"));
+        assert!(json.contains("\"paste\":\"bracketed\""));
         let parsed: Request = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(
             parsed,
@@ -645,9 +676,20 @@ mod tests {
                 queue_timeout_ms: Some(250),
                 write_timeout_ms: Some(0),
                 wait: Some(false),
+                paste: Some(PasteMode::Bracketed),
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn paste_mode_defaults_to_auto() {
+        assert_eq!(PasteMode::default(), PasteMode::Auto);
+        let legacy = r#"{"cmd":"send","target":"dev","message":"hi"}"#;
+        match serde_json::from_str::<Request>(legacy).expect("legacy send") {
+            Request::Send { paste, .. } => assert_eq!(paste, None),
+            other => panic!("unexpected request: {other:?}"),
+        }
     }
 
     #[test]

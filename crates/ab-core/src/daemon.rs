@@ -242,13 +242,16 @@ impl Inner {
                 queue_timeout_ms,
                 write_timeout_ms,
                 wait,
+                paste,
             } => {
                 let agent = self.get(&target)?;
                 let enter = enter.unwrap_or(true);
-                let mut payload = message.clone().into_bytes();
-                if enter {
-                    payload.push(b'\r');
-                }
+                let payload = delivery::compose_payload(
+                    &message,
+                    enter,
+                    paste.unwrap_or_default(),
+                    agent.bracketed_paste(),
+                );
                 let limit = delivery::max_message_bytes();
                 if payload.len() > limit {
                     return Err(BridgeError::MessageTooLarge {

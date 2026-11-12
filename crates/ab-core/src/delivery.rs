@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError};
 
-use crate::protocol::{DeliveryStatus, ErrorCode, MessageId};
+use crate::protocol::{DeliveryStatus, ErrorCode, MessageId, PasteMode};
 
 /// Default maximum payload per `sendmessage` (64 KiB).
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 64 * 1024;
@@ -92,6 +92,46 @@ pub fn timeout_from_millis(value: Option<u64>, default: Duration) -> Duration {
     value.map_or(default, |millis| {
         Duration::from_millis(millis).min(MAX_TIMEOUT)
     })
+}
+
+/// Bracketed-paste start marker.
+pub const PASTE_START: &[u8] = b"\x1b[200~";
+
+/// Bracketed-paste end marker.
+pub const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Compose the exact bytes written to the PTY for one message.
+///
+/// `Auto` wraps text that contains a line break only when the target
+/// application announced bracketed paste (`target_supports_paste`); `Bracketed`
+/// always wraps, `Plain` never does. The optional `\r` is appended after the
+/// closing marker so Enter submits the pasted block instead of ending the paste.
+#[must_use]
+pub fn compose_payload(
+    text: &str,
+    enter: bool,
+    paste: PasteMode,
+    target_supports_paste: bool,
+) -> Vec<u8> {
+    let multiline = text.contains('\n') || text.contains('\r');
+    let bracketed = match paste {
+        PasteMode::Bracketed => true,
+        PasteMode::Plain => false,
+        PasteMode::Auto => multiline && target_supports_paste,
+    };
+    let mut payload =
+        Vec::with_capacity(text.len() + usize::from(enter) + if bracketed { 12 } else { 0 });
+    if bracketed {
+        payload.extend_from_slice(PASTE_START);
+    }
+    payload.extend_from_slice(text.as_bytes());
+    if bracketed {
+        payload.extend_from_slice(PASTE_END);
+    }
+    if enter {
+        payload.push(b'\r');
+    }
+    payload
 }
 
 /// The result of handing bytes to the PTY.
@@ -504,12 +544,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        admission_status, max_message_bytes, next_message_id, parse_clamped,
+        admission_status, compose_payload, max_message_bytes, next_message_id, parse_clamped,
         parse_max_message_bytes, timeout_from_millis, AdmissionError, Job, JobEvent, JobObserver,
         QueueConfig, WriteOutcome, WriteQueue, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_QUEUE_TIMEOUT,
-        MAX_MESSAGE_BYTES_CAP, MAX_TIMEOUT,
+        MAX_MESSAGE_BYTES_CAP, MAX_TIMEOUT, PASTE_END, PASTE_START,
     };
-    use crate::protocol::{DeliveryStatus, ErrorCode};
+    use crate::protocol::{DeliveryStatus, ErrorCode, PasteMode};
 
     #[test]
     fn ids_are_unique_and_monotonic() {
@@ -997,5 +1037,48 @@ mod tests {
         let mut expected = text.as_bytes().to_vec();
         expected.extend_from_slice(&large);
         assert_eq!(sink.written(), expected);
+    }
+
+    #[test]
+    fn compose_payload_keeps_single_line_messages_plain() {
+        assert_eq!(
+            compose_payload("echo hi", true, PasteMode::Auto, true),
+            b"echo hi\r"
+        );
+        assert_eq!(
+            compose_payload("echo hi", false, PasteMode::Bracketed, false),
+            [PASTE_START, b"echo hi".as_slice(), PASTE_END].concat()
+        );
+    }
+
+    #[test]
+    fn compose_payload_wraps_multi_line_only_when_supported() {
+        let text = "one\ntwo\nthree";
+        assert_eq!(
+            compose_payload(text, true, PasteMode::Auto, true),
+            [PASTE_START, text.as_bytes(), PASTE_END, b"\r".as_slice()].concat(),
+            "a supporting target sees one paste plus one Enter"
+        );
+        assert_eq!(
+            compose_payload(text, true, PasteMode::Auto, false),
+            b"one\ntwo\nthree\r",
+            "without an announcement the fallback is plain bytes"
+        );
+    }
+
+    #[test]
+    fn compose_payload_honours_explicit_modes() {
+        let text = "one\ntwo";
+        assert_eq!(
+            compose_payload(text, false, PasteMode::Bracketed, false),
+            [PASTE_START, text.as_bytes(), PASTE_END].concat(),
+            "bracketed is forced even when the target did not announce it"
+        );
+        assert_eq!(
+            compose_payload(text, false, PasteMode::Plain, true),
+            text.as_bytes(),
+            "plain never wraps"
+        );
+        assert_eq!(compose_payload("x", true, PasteMode::Plain, true), b"x\r");
     }
 }
