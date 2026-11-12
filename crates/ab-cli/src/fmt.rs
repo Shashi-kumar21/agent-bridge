@@ -80,6 +80,14 @@ pub fn print_agent(agent: &AgentInfo) {
     }
     println!("messages   : {}", agent.message_count);
     println!("queued     : {}", agent.queued);
+    println!(
+        "paste      : {}",
+        if agent.bracketed_paste {
+            "bracketed"
+        } else {
+            "plain"
+        }
+    );
     println!("subscribers: {}", agent.subscribers);
 }
 

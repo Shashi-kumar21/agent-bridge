@@ -31,6 +31,42 @@ const URGENT_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 /// disconnected instead of growing daemon memory without bound.
 pub const SUBSCRIBER_QUEUE: usize = 1024;
 
+/// Tracks bracketed-paste support announced by the child application.
+///
+/// The application, not the terminal emulator, enables the mode by writing
+/// `ESC[?2004h` to its output, and may toggle it per prompt (readline does), so
+/// the last marker in the stream wins. A marker can straddle two reads, so a
+/// few bytes are carried into the next chunk.
+#[derive(Default)]
+struct PasteDetector {
+    carry: Vec<u8>,
+}
+
+impl PasteDetector {
+    /// Feed one output chunk; `Some(enabled)` when the state changed.
+    fn observe(&mut self, data: &[u8]) -> Option<bool> {
+        const ON: &[u8] = b"\x1b[?2004h";
+        const OFF: &[u8] = b"\x1b[?2004l";
+        debug_assert_eq!(ON.len(), OFF.len());
+
+        let mut joined = std::mem::take(&mut self.carry);
+        joined.extend_from_slice(data);
+
+        let mut last: Option<(usize, bool)> = None;
+        for (index, window) in joined.windows(ON.len()).enumerate() {
+            if window == ON {
+                last = Some((index, true));
+            } else if window == OFF {
+                last = Some((index, false));
+            }
+        }
+
+        let keep_from = joined.len().saturating_sub(ON.len() - 1);
+        self.carry = joined[keep_from..].to_vec();
+        last.map(|(_, enabled)| enabled)
+    }
+}
+
 /// Process-wide monotonic suffix so two agents created in the same millisecond
 /// still get distinct ids.
 static AGENT_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -67,6 +103,9 @@ pub struct Agent {
     buffer: Mutex<OutputBuffer>,
     messages: Mutex<VecDeque<Message>>,
     queue: Arc<WriteQueue>,
+    /// Set when the child emits `ESC[?2004h` (bracketed paste enabled) and
+    /// cleared by `ESC[?2004l`.
+    bracketed_paste: AtomicBool,
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     subscribers: Mutex<Vec<Sender<Event>>>,
@@ -154,6 +193,7 @@ impl Agent {
             buffer: Mutex::new(OutputBuffer::new(crate::buffer::DEFAULT_CAPACITY)),
             messages: Mutex::new(VecDeque::new()),
             queue,
+            bracketed_paste: AtomicBool::new(false),
             master: Mutex::new(master),
             child: Mutex::new(child),
             subscribers: Mutex::new(Vec::new()),
@@ -177,11 +217,15 @@ impl Agent {
 
     fn pump_output(&self, mut reader: Box<dyn Read + Send>) {
         let mut chunk = [0_u8; 8192];
+        let mut paste = PasteDetector::default();
         loop {
             match reader.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let data = &chunk[..n];
+                    if let Some(enabled) = paste.observe(data) {
+                        self.bracketed_paste.store(enabled, Ordering::SeqCst);
+                    }
                     if let Ok(mut buffer) = self.buffer.lock() {
                         buffer.push(data);
                     }
@@ -263,6 +307,12 @@ impl Agent {
         self.running.load(Ordering::SeqCst)
     }
 
+    /// True when the child application has bracketed paste enabled.
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste.load(Ordering::SeqCst)
+    }
+
     /// Snapshot for the wire.
     #[must_use]
     pub fn info(&self) -> AgentInfo {
@@ -293,6 +343,7 @@ impl Agent {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             message_count,
             queued: self.queue.depth(),
+            bracketed_paste: self.bracketed_paste(),
             subscribers: self.subscriber_count.load(Ordering::SeqCst),
             cols: self.cols.load(Ordering::SeqCst),
             rows: self.rows.load(Ordering::SeqCst),
@@ -621,4 +672,38 @@ fn render_command(argv: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PasteDetector;
+
+    #[test]
+    fn paste_detector_tracks_both_markers() {
+        let mut detector = PasteDetector::default();
+        assert_eq!(detector.observe(b"\x1b[?2004h"), Some(true));
+        assert_eq!(detector.observe(b"prompt$ "), None);
+        assert_eq!(detector.observe(b"\x1b[?2004l"), Some(false));
+    }
+
+    #[test]
+    fn paste_detector_handles_a_marker_split_across_chunks() {
+        let mut detector = PasteDetector::default();
+        assert_eq!(detector.observe(b"\x1b[?20"), None);
+        assert_eq!(detector.observe(b"04h"), Some(true));
+        assert_eq!(detector.observe(b"text"), None);
+    }
+
+    #[test]
+    fn paste_detector_uses_the_last_marker_in_one_chunk() {
+        let mut detector = PasteDetector::default();
+        assert_eq!(
+            detector.observe(b"\x1b[?2004h enabled \x1b[?2004l disabled"),
+            Some(false)
+        );
+        assert_eq!(
+            detector.observe(b"\x1b[?2004l off \x1b[?2004h on"),
+            Some(true)
+        );
+    }
 }

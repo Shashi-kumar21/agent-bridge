@@ -216,6 +216,7 @@ fn send(target: &str, message: &str) {
         queue_timeout_ms: None,
         write_timeout_ms: None,
         wait: None,
+        paste: None,
     })
     .expect("send message");
     assert!(matches!(sent, Response::Sent { .. }), "got {sent:?}");

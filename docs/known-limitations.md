@@ -37,7 +37,7 @@ integration can send one).
 
 ## 2. A blocked PTY write cannot be cancelled
 
-Each agent has one writer thread and a bounded queue (`delivery.rs:294-378`), so
+Each agent has one writer thread and a bounded queue (`delivery.rs:334-419`), so
 a slow target no longer blocks *other* senders' writes and memory stays bounded
 (128 jobs / 2 MiB per agent by default). A caller still waits up to
 `--write-timeout` (forever with `0`) for its own message. Admission waits
@@ -48,26 +48,64 @@ The remaining gap is the OS write itself: once `write_all` is inside the PTY
 there is no portable way to cancel it. `--write-timeout` (5 s by default, `0`
 waits forever) makes the caller return `unknown`; the writer keeps waiting and
 amends the record to `written`/`failed` when the syscall returns
-(`delivery.rs:443-482`, `daemon.rs:489-559`). A target that never drains its PTY
+(`delivery.rs:483-499`, `daemon.rs:492-534`, `:535-627`). A target that never drains its PTY
 therefore keeps the in-flight byte reservation and the channel fills up behind
 it until the agent exits or the daemon is restarted; new messages to that agent
 eventually fail with `queue_full`.
 
 Urgent jobs (Ctrl-C, `attach` keystrokes) use a separate channel and may pass a
-queued message between writes; they never split a payload (`agent.rs:331-365`).
+queued message between writes; they never split a payload (`agent.rs:382-419`).
 
-## 3. Large messages are not atomic at the terminal level
+## 3. Multi-line delivery depends on the target application
 
 The writer serialises whole jobs, so two `sendmessage` calls cannot interleave
-*bytes*. What is not guaranteed is that the terminal application reads the
-message as one paste: a multi-line message is delivered as literal bytes plus
-`\r`, which shells execute line by line, and TUI agents may interpret
-intermediate lines as submissions. Bracketed paste is not used yet (Phase 2C).
+*bytes*. For multi-line text, `--paste auto` (default) wraps the message in
+`ESC[200~`..`ESC[201~` only when the target announced bracketed paste
+(`ESC[?2004h` on its output). A target that announced it receives the block as
+one paste plus one `\r`; `--paste plain` always sends raw bytes, which shells
+execute line by line and TUI agents may interpret as separate submissions.
 
 ```bash
-agent-bridge sendmessage shell "echo one
+agent-bridge sendmessage shell --paste plain "echo one
 echo two"
+agent-bridge sendmessage tui "line one
+line two"
 ```
+
+Limits of the detection: the marker must appear in the PTY output while the
+agent is alive (the scan is on the live stream, not a retained snapshot), an
+application that silently supports bracketed paste needs `--paste bracketed`,
+and a target that prints the markers as literal text needs `--paste plain`.
+`listagents --json` reports the current state as `bracketed_paste`, and the
+detail block printed by `new` shows `paste : bracketed|plain`. A scripted
+`new` followed immediately by `sendmessage` can reach the target before it has
+printed the marker; the first multi-line message then falls back to plain. Wait
+for the prompt, or use `--paste bracketed`.
+
+The state is sampled when the request is handled
+(`daemon.rs:249-254`), not when the writer finally reaches the message. With a
+slow queue the target may have disabled paste in between (readline does this
+while a command runs), and the wrapped text is then typed literally. Composing
+inside the writer would narrow that window but not close it, because the
+application can toggle the mode at any time.
+
+Message bodies are typed verbatim and are not sanitised: a body containing
+`ESC[201~` closes the paste early, and one containing `ESC[?2004h` can latch the
+detector through the PTY echo. This is not a new privilege - any sender can
+already write arbitrary control bytes to the target - but it is not a trust
+boundary either. `--no-enter` still writes the closing marker but omits the
+`\r`, so the block is closed and not submitted.
+
+In the default ConPTY configuration used by `portable-pty` (no passthrough) the
+daemon reads re-rendered ConPTY output, not a raw PTY: ConPTY consumes the
+private terminal-mode sequences, so `ESC[?2004h` never reaches the daemon and
+`auto` always falls back to plain. `--paste bracketed` is accepted but its
+markers are consumed by ConPTY before the child sees them, so it has no
+observable effect there. Bracketed paste is therefore Unix-only in practice;
+the byte composition itself is platform-neutral and unit-tested. A manual
+Windows smoke test confirmed the fallback (`paste : plain`, marker stripped from
+`read`), but there is no automated Windows test for it - the three byte-capture
+e2e tests are Unix-only.
 
 Roadmap §2 (multi-line handling, bracketed paste where supported, documented
 fallback).
@@ -88,8 +126,8 @@ Roadmap §6 (VT screen model and snapshot).
 
 ## 5. No byte offset cursor; `seq` counts chunks
 
-`Read` returns the current `seq` (`protocol.rs:345-355`); `Attach --from-seq`
-only decides whether to replay the *whole* retained buffer (`daemon.rs:707-708`).
+`Read` returns the current `seq` (`protocol.rs:427-437`); `Attach --from-seq`
+only decides whether to replay the *whole* retained buffer (`daemon.rs:710-711`).
 Because `seq` increments per PTY chunk, not per byte, callers cannot resume from
 an arbitrary offset, and a replay frame carries the newest `seq` for bytes that
 may include older chunks.
@@ -132,7 +170,7 @@ Tracked as issue
 Buffers, message history, PTY handles and job objects are in-memory only
 (`daemon.rs:87-93`). `daemon restart` stops the daemon, which sends Ctrl-C to
 every agent, force-kills any that are still running after ~500 ms
-(`daemon.rs:171-180`, `agent.rs:479-497`), and then exits; the next daemon
+(`daemon.rs:171-180`, `agent.rs:530-548`), and then exits; the next daemon
 starts empty. There is no session adoption.
 
 ```bash
@@ -208,15 +246,15 @@ Roadmap §4 (threat model, policy, identity, audit).
 
 Retention is a fixed 256 KiB ring (`buffer.rs:6`); there is no way to raise it.
 An attach client that cannot keep up with 1024 queued events is disconnected
-silently (`agent.rs:32`, `:423-433`, `:442-450`) - the CLI sees the stream
+silently (`agent.rs:32`, `:475-487`, `:489-505`) - the CLI sees the stream
 close, not an error.
 
 Roadmap §3 (configurable sizes, explicit drop signalling).
 
 ## 14. Message history is per-agent and bounded at 500
 
-`record_message` keeps the newest 500 entries (`agent.rs:21`, `:386-390`), and
-the global id-indexed log keeps 2000 (`daemon.rs:25`, `:29-77`). Both are
+`record_message` keeps the newest 500 entries (`agent.rs:21`, `:438-448`), and
+the global id-indexed log keeps 2000 (`daemon.rs:25`, `:29-78`). Both are
 in-memory and vanish with the daemon. Ids are unique only for one daemon
 lifetime, so `messagestatus` returns `not_found` after a restart even though the
 id was valid before; there is no persistence.

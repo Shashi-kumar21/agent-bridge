@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use agent_bridge_core::client;
 use agent_bridge_core::daemon::Daemon;
 use agent_bridge_core::paths;
-use agent_bridge_core::protocol::{DeliveryStatus, Request, Response, DEFAULT_COLS, DEFAULT_ROWS};
+use agent_bridge_core::protocol::{
+    DeliveryStatus, PasteMode, Request, Response, DEFAULT_COLS, DEFAULT_ROWS,
+};
 use agent_bridge_core::Result;
 use clap::{Parser, Subcommand};
 
@@ -68,6 +70,11 @@ enum Command {
         /// Return after the message is queued instead of waiting for the write.
         #[arg(long)]
         no_wait: bool,
+        /// How line breaks are delivered: `auto` (bracket-paste multi-line text
+        /// when the target supports it), `bracketed` (force the markers), or
+        /// `plain` (send raw bytes; the documented fallback).
+        #[arg(long, default_value = "auto", value_parser = parse_paste)]
+        paste: PasteMode,
     },
     /// Spawn a new agent inside a daemon-owned PTY.
     New {
@@ -197,6 +204,7 @@ fn run(cli: Cli) -> Result<()> {
             queue_timeout,
             write_timeout,
             no_wait,
+            paste,
         } => {
             ensure_daemon(true)?;
             let text = message.join(" ");
@@ -208,6 +216,7 @@ fn run(cli: Cli) -> Result<()> {
                 queue_timeout_ms: Some(duration_millis(queue_timeout)),
                 write_timeout_ms: Some(duration_millis(write_timeout)),
                 wait: Some(!no_wait),
+                paste: Some(paste),
             })?;
             let failure = match &response {
                 Response::Sent {
@@ -557,6 +566,17 @@ fn skew_restart_is_safe(live_agents: usize) -> bool {
 }
 
 /// Parse a CLI timeout: `500` / `500ms`, `5s`, `2m`; `0` means "no wait".
+fn parse_paste(raw: &str) -> std::result::Result<PasteMode, String> {
+    match raw.trim() {
+        "auto" => Ok(PasteMode::Auto),
+        "bracketed" => Ok(PasteMode::Bracketed),
+        "plain" => Ok(PasteMode::Plain),
+        other => Err(format!(
+            "invalid paste mode '{other}' (use auto, bracketed or plain)"
+        )),
+    }
+}
+
 fn parse_timeout(raw: &str) -> std::result::Result<Duration, String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -587,7 +607,8 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use std::time::Duration;
 
-    use super::{duration_millis, parse_timeout, skew_restart_is_safe, Cli, Command};
+    use super::{duration_millis, parse_paste, parse_timeout, skew_restart_is_safe, Cli, Command};
+    use agent_bridge_core::protocol::PasteMode;
     use clap::Parser;
 
     #[test]
@@ -638,6 +659,7 @@ mod tests {
                 queue_timeout,
                 write_timeout,
                 no_wait,
+                paste,
             } => {
                 assert_eq!(target, "dev");
                 assert_eq!(message, ["hello", "world"]);
@@ -646,6 +668,7 @@ mod tests {
                 assert_eq!(queue_timeout, Duration::from_secs(5));
                 assert_eq!(write_timeout, Duration::from_secs(5));
                 assert!(!no_wait);
+                assert_eq!(paste, PasteMode::Auto);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -670,11 +693,13 @@ mod tests {
                 queue_timeout,
                 write_timeout,
                 no_wait,
+                paste,
                 ..
             } => {
                 assert_eq!(queue_timeout, Duration::ZERO);
                 assert_eq!(write_timeout, Duration::from_millis(250));
                 assert!(no_wait);
+                assert_eq!(paste, PasteMode::Auto);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -694,5 +719,33 @@ mod tests {
             agent_bridge_core::delivery::MAX_TIMEOUT
         );
         assert_eq!(duration_millis(Duration::from_millis(250)), 250);
+    }
+
+    #[test]
+    fn paste_mode_parses_and_rejects_unknown_values() {
+        assert_eq!(parse_paste("auto").expect("auto"), PasteMode::Auto);
+        assert_eq!(
+            parse_paste("bracketed").expect("bracketed"),
+            PasteMode::Bracketed
+        );
+        assert_eq!(parse_paste(" plain ").expect("plain"), PasteMode::Plain);
+        assert!(parse_paste("paste").is_err());
+
+        let cli = Cli::try_parse_from([
+            "agent-bridge",
+            "sendmessage",
+            "dev",
+            "--paste",
+            "plain",
+            "hi",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Sendmessage {
+                paste: PasteMode::Plain,
+                ..
+            }
+        ));
     }
 }

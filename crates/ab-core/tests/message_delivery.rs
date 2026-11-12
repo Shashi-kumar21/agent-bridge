@@ -4,6 +4,10 @@
 //! is selected through process-wide environment variables.
 
 use std::ffi::OsString;
+#[cfg(unix)]
+use std::io::Read as _;
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,7 +15,11 @@ use std::time::{Duration, Instant};
 use agent_bridge_core::client;
 use agent_bridge_core::daemon::Daemon;
 use agent_bridge_core::delivery::{DEFAULT_QUEUE_BYTES, DEFAULT_QUEUE_LIMIT};
-use agent_bridge_core::protocol::{DeliveryStatus, ErrorCode, Request, Response};
+#[cfg(unix)]
+use agent_bridge_core::delivery::{PASTE_END, PASTE_START};
+#[cfg(unix)]
+use agent_bridge_core::protocol::AgentInfo;
+use agent_bridge_core::protocol::{DeliveryStatus, ErrorCode, PasteMode, Request, Response};
 
 /// The daemon endpoint is chosen through process-wide environment variables, so
 /// these tests must not overlap (the default test harness runs them in threads).
@@ -124,6 +132,24 @@ fn send_with(
     queue_timeout_ms: u64,
     write_timeout_ms: u64,
 ) -> (u64, DeliveryStatus) {
+    send_with_paste(
+        target,
+        message,
+        wait,
+        queue_timeout_ms,
+        write_timeout_ms,
+        PasteMode::Auto,
+    )
+}
+
+fn send_with_paste(
+    target: &str,
+    message: String,
+    wait: bool,
+    queue_timeout_ms: u64,
+    write_timeout_ms: u64,
+    paste: PasteMode,
+) -> (u64, DeliveryStatus) {
     let response = client::request(&Request::Send {
         target: target.to_string(),
         message,
@@ -132,6 +158,7 @@ fn send_with(
         queue_timeout_ms: Some(queue_timeout_ms),
         write_timeout_ms: Some(write_timeout_ms),
         wait: Some(wait),
+        paste: Some(paste),
     })
     .expect("send message");
     match response {
@@ -174,6 +201,59 @@ fn output_text(target: &str) -> String {
     {
         Response::Output { lines, .. } => lines.join("\n"),
         other => panic!("unexpected read response: {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+fn agent_info(name: &str) -> AgentInfo {
+    match client::request(&Request::List).expect("list") {
+        Response::Agents { agents } => agents
+            .into_iter()
+            .find(|agent| agent.name == name)
+            .unwrap_or_else(|| panic!("agent {name} is missing")),
+        other => panic!("unexpected list response: {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+fn wait_until_flag(name: &str, flag: fn(&AgentInfo) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if flag(&agent_info(name)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{name} never reported the expected terminal capability"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+fn read_bytes(path: &Path) -> Vec<u8> {
+    let mut file = std::fs::File::open(path).expect("capture file");
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).expect("read capture file");
+    bytes
+}
+
+#[cfg(unix)]
+fn wait_for_capture(path: &Path, expected: &[u8]) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if path.exists()
+            && read_bytes(path)
+                .windows(expected.len())
+                .any(|w| w == expected)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capture file never contained the expected bytes"
+        );
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -396,4 +476,97 @@ fn large_response_is_not_truncated() {
     }
 
     kill("big");
+}
+
+/// Shell command that advertises bracketed paste and copies everything it
+/// receives into `$0`.
+#[cfg(unix)]
+fn paste_capture_command(file: &Path) -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        r#"printf '\033[?2004h'; cat > "$0""#.to_string(),
+        file.display().to_string(),
+    ]
+}
+
+/// A shell command that does not advertise bracketed paste.
+#[cfg(unix)]
+fn plain_capture_command(file: &Path) -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "cat > \"$0\"".to_string(),
+        file.display().to_string(),
+    ]
+}
+
+/// `auto` bracket-pastes multi-line text once the target announces support, so
+/// the terminal application sees one paste instead of one submission per line.
+#[cfg(unix)]
+#[test]
+fn auto_paste_wraps_after_the_target_announces_it() {
+    let harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    let file = harness.home.join("paste.txt");
+    create_agent_with("paster", paste_capture_command(&file));
+    wait_until_flag("paster", |agent| agent.bracketed_paste);
+
+    let (_, status) = send_with("paster", "one\ntwo".to_string(), true, 5_000, 10_000);
+    assert_eq!(status, DeliveryStatus::Written);
+
+    let expected = [PASTE_START, b"one\ntwo", PASTE_END].concat();
+    wait_for_capture(&file, &expected);
+    kill("paster");
+}
+
+/// Without an announcement, `auto` falls back to plain bytes - no escape
+/// markers are typed into the target.
+#[cfg(unix)]
+#[test]
+fn auto_paste_falls_back_when_the_target_stays_plain() {
+    let harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    let file = harness.home.join("plain.txt");
+    create_agent_with("plain", plain_capture_command(&file));
+    assert!(!agent_info("plain").bracketed_paste);
+
+    let (_, status) = send_with("plain", "one\ntwo".to_string(), true, 5_000, 10_000);
+    assert_eq!(status, DeliveryStatus::Written);
+
+    wait_for_capture(&file, b"one\ntwo");
+    let bytes = read_bytes(&file);
+    assert!(
+        !bytes.windows(PASTE_START.len()).any(|w| w == PASTE_START),
+        "the fallback must not emit a paste marker: {bytes:?}"
+    );
+    assert!(
+        !bytes.windows(PASTE_END.len()).any(|w| w == PASTE_END),
+        "the fallback must not emit a paste marker: {bytes:?}"
+    );
+    kill("plain");
+}
+
+/// `--paste bracketed` forces the markers even when the target did not announce
+/// support, which is the escape hatch for applications that support it but stay
+/// silent.
+#[cfg(unix)]
+#[test]
+fn forced_bracketed_paste_wraps_a_silent_target() {
+    let harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    let file = harness.home.join("forced.txt");
+    create_agent_with("silent", plain_capture_command(&file));
+    assert!(!agent_info("silent").bracketed_paste);
+
+    let (_, status) = send_with_paste(
+        "silent",
+        "one\ntwo".to_string(),
+        true,
+        5_000,
+        10_000,
+        PasteMode::Bracketed,
+    );
+    assert_eq!(status, DeliveryStatus::Written);
+
+    let expected = [PASTE_START, b"one\ntwo", PASTE_END].concat();
+    wait_for_capture(&file, &expected);
+    kill("silent");
 }
