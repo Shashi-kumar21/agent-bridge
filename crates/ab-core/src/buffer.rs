@@ -17,15 +17,18 @@ pub fn clamp_capacity(capacity: usize) -> usize {
     capacity.clamp(MIN_CAPACITY, MAX_CAPACITY)
 }
 
+/// Parse a capacity override, falling back to the default.
+fn capacity_from_value(raw: Option<&str>) -> usize {
+    raw.and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map_or(DEFAULT_CAPACITY, clamp_capacity)
+}
+
 /// Read `AGENT_BRIDGE_BUFFER_BYTES`, falling back to the default.
 ///
 /// Invalid values fall back to the default; out-of-range values are clamped.
 #[must_use]
 pub fn capacity_from_env() -> usize {
-    std::env::var(CAPACITY_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .map_or(DEFAULT_CAPACITY, clamp_capacity)
+    capacity_from_value(std::env::var(CAPACITY_ENV).ok().as_deref())
 }
 
 /// Ring buffer holding the most recent terminal output of one agent.
@@ -110,7 +113,8 @@ impl OutputBuffer {
         let text = strip_ansi(&String::from_utf8_lossy(&tail));
         text.lines().rev().find_map(|line| {
             let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
-            if trimmed.trim().is_empty() {
+            let visible = trimmed.chars().any(|c| !c.is_control());
+            if trimmed.trim().is_empty() || !visible {
                 None
             } else {
                 Some(trimmed.to_string())
@@ -200,6 +204,30 @@ mod tests {
         assert_eq!(buffer.last_line(1024).as_deref(), Some("partial"));
         buffer.push(b"\n   \n");
         assert_eq!(buffer.last_line(1024).as_deref(), Some("partial"));
+    }
+
+    #[test]
+    fn control_bytes_alone_are_not_a_visible_line() {
+        let mut buffer = OutputBuffer::new(1024);
+        buffer.push(b"\x07\x00\x1b[2J");
+        assert_eq!(buffer.last_line(1024), None);
+        buffer.push(b"\n\x07done");
+        assert_eq!(buffer.last_line(1024).as_deref(), Some("\x07done"));
+    }
+
+    #[test]
+    fn capacity_values_fall_back_or_clamp() {
+        assert_eq!(super::capacity_from_value(None), super::DEFAULT_CAPACITY);
+        assert_eq!(
+            super::capacity_from_value(Some("junk")),
+            super::DEFAULT_CAPACITY
+        );
+        assert_eq!(super::capacity_from_value(Some(" 4096 ")), 4096);
+        assert_eq!(super::capacity_from_value(Some("0")), super::MIN_CAPACITY);
+        assert_eq!(
+            super::capacity_from_value(Some("999999999")),
+            super::MAX_CAPACITY
+        );
     }
 
     #[test]

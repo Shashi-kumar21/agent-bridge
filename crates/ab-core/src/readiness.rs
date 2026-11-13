@@ -23,6 +23,12 @@ pub const MAX_PROMPT_CHARS: usize = 128;
 /// How many trailing bytes are scanned for the prompt suffix.
 pub const PROMPT_SCAN_BYTES: usize = 4096;
 
+/// Parse a quiet-period override, falling back to the default.
+fn quiet_from_value(raw: Option<&str>) -> u64 {
+    raw.and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_QUIET_MS)
+}
+
 /// Per-agent readiness configuration, sampled when the agent is spawned.
 #[derive(Debug, Clone)]
 pub struct ReadinessConfig {
@@ -57,13 +63,11 @@ impl ReadinessConfig {
 
     /// Read `AGENT_BRIDGE_QUIET_MS` and `AGENT_BRIDGE_PROMPT_PATTERN`.
     ///
-    /// Invalid or out-of-range values fall back to the documented defaults.
+    /// Unparsable values fall back to the default; out-of-range values are
+    /// clamped to 50..60000 ms by [`Self::new`].
     #[must_use]
     pub fn from_env() -> Self {
-        let quiet_ms = std::env::var(QUIET_ENV)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_QUIET_MS);
+        let quiet_ms = quiet_from_value(std::env::var(QUIET_ENV).ok().as_deref());
         Self::new(quiet_ms, std::env::var(PROMPT_ENV).ok())
     }
 
@@ -169,6 +173,15 @@ mod tests {
             config.classify(true, Some(999), Some("still building"), 1_000),
             Readiness::Busy
         );
+    }
+
+    #[test]
+    fn unparsable_quiet_periods_fall_back_to_the_default() {
+        use super::{quiet_from_value, DEFAULT_QUIET_MS};
+        assert_eq!(quiet_from_value(None), DEFAULT_QUIET_MS);
+        assert_eq!(quiet_from_value(Some("junk")), DEFAULT_QUIET_MS);
+        assert_eq!(quiet_from_value(Some(" 2000 ")), 2_000);
+        assert_eq!(quiet_from_value(Some("-5")), DEFAULT_QUIET_MS);
     }
 
     #[test]

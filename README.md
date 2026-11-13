@@ -104,9 +104,11 @@ application understood or completed the request. `written`, `awaiting_ack` and
 `unknown`, and an optional literal prompt suffix can mark `idle` early. This is
 a hint, never a guarantee: a silent long-running command is reported `idle`.
 Tune it with `AGENT_BRIDGE_QUIET_MS` (default `500`, clamped 50..60000) and
-`AGENT_BRIDGE_PROMPT_PATTERN`; both are read when the agent spawns. Retained
-output is 256 KiB per agent; `AGENT_BRIDGE_BUFFER_BYTES` overrides it (clamped
-1 KiB..16 MiB) and is also sampled at spawn.
+`AGENT_BRIDGE_PROMPT_PATTERN`. Retained output is 256 KiB per agent;
+`AGENT_BRIDGE_BUFFER_BYTES` overrides it (clamped 1 KiB..16 MiB). All three are
+read by the daemon when it spawns an agent, so export them before
+`daemon start`/`restart`; an already-running daemon will not see a later
+change.
 
 Multi-line text is bracket-pasted (`ESC[200~`..`ESC[201~`) when the target
 application announced support with `ESC[?2004h`; this is `--paste auto`, the

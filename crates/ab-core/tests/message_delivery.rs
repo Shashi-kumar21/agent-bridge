@@ -859,8 +859,14 @@ fn readiness_turns_busy_then_idle_after_the_quiet_period() {
 
     std::env::set_var("AGENT_BRIDGE_QUIET_MS", "10000");
     create_agent("busy");
+    let before = agent_info("busy").last_output_at;
     let (_, status) = send("busy", "echo readiness-busy".to_string(), true);
     assert_eq!(status, DeliveryStatus::Written);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while agent_info("busy").last_output_at <= before {
+        assert!(Instant::now() < deadline, "the echo produced no output");
+        thread::sleep(Duration::from_millis(50));
+    }
     wait_until_readiness("busy", Readiness::Busy, Duration::from_secs(5));
     kill("busy");
 
