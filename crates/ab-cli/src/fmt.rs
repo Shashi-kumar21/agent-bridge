@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use agent_bridge_core::protocol::{AgentInfo, AgentStatus, DeliveryStatus, Message};
+use agent_bridge_core::protocol::{AgentInfo, AgentStatus, DeliveryStatus, Message, Readiness};
 
 /// Format a timestamp as a coarse age ("4s ago").
 #[must_use]
@@ -24,9 +24,10 @@ pub fn print_agents(agents: &[AgentInfo]) {
         println!("no agents. create one with: agent-bridge new <name>");
         return;
     }
-    let mut rows: Vec<[String; 7]> = vec![[
+    let mut rows: Vec<[String; 8]> = vec![[
         "NAME".to_string(),
         "STATUS".to_string(),
+        "READY".to_string(),
         "PID".to_string(),
         "MSGS".to_string(),
         "QUEUED".to_string(),
@@ -40,6 +41,7 @@ pub fn print_agents(agents: &[AgentInfo]) {
                 AgentStatus::Running => "running".to_string(),
                 AgentStatus::Exited => "exited".to_string(),
             },
+            readiness_label(agent.readiness).to_string(),
             agent
                 .pid
                 .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
@@ -65,6 +67,7 @@ pub fn print_agent(agent: &AgentInfo) {
             AgentStatus::Exited => "exited",
         }
     );
+    println!("readiness  : {}", readiness_label(agent.readiness));
     println!(
         "pid        : {}",
         agent
@@ -128,6 +131,16 @@ pub fn status_line(status: &DeliveryStatus) -> String {
             format!("failed ({}): {detail}", code.label())
         }
         other => other.label().to_string(),
+    }
+}
+
+/// Short label for the heuristic readiness state.
+#[must_use]
+pub fn readiness_label(readiness: Readiness) -> &'static str {
+    match readiness {
+        Readiness::Busy => "busy",
+        Readiness::Idle => "idle",
+        Readiness::Unknown => "unknown",
     }
 }
 

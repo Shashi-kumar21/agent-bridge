@@ -98,6 +98,20 @@ and idempotent; it reports that the integration saw the message, not that the
 application understood or completed the request. `written`, `awaiting_ack` and
 `acknowledged` are the only statuses that mean the bytes reached the PTY.
 
+`listagents` shows a heuristic **READY** column: `busy`, `idle` or `unknown`
+(`listagents --json` reports `readiness`). Output that arrived within the quiet
+period is `busy`; an agent that printed a visible line and then went quiet past
+it is `idle`; a stopped agent, or one that never printed a visible line, is
+`unknown`. An optional literal prompt suffix (max 128 characters) on the newest
+line can mark `idle` early. The state is a hint, never a guarantee: a command
+that printed once and then runs silently is reported `idle`.
+Tune it with `AGENT_BRIDGE_QUIET_MS` (default `500`, clamped 50..60000) and
+`AGENT_BRIDGE_PROMPT_PATTERN`. Retained output is 256 KiB per agent;
+`AGENT_BRIDGE_BUFFER_BYTES` overrides it (clamped 1 KiB..16 MiB). All three are
+read by the daemon when it spawns an agent, so export them before
+`daemon start`/`restart`; an already-running daemon will not see a later
+change.
+
 Multi-line text is bracket-pasted (`ESC[200~`..`ESC[201~`) when the target
 application announced support with `ESC[?2004h`; this is `--paste auto`, the
 default. Use `--paste plain` for applications that print the markers as literal
@@ -115,7 +129,7 @@ argument (`sendmessage dev --no-wait "run the tests"`).
 | Command | Purpose |
 | --- | --- |
 | `agent-bridge daemon start\|stop\|restart\|status\|run` | manage the background daemon |
-| `agent-bridge listagents` | table of agents (name, status, pid, messages, queued, last output) |
+| `agent-bridge listagents` | table of agents (name, status, readiness, pid, messages, queued, last output) |
 | `agent-bridge new <name> [-- <cmd...>]` | spawn an agent in a daemon-owned PTY |
 | `agent-bridge sendmessage <name> [--from L] [--paste auto\|bracketed\|plain] [--require-ack] [--queue-timeout 5s] [--write-timeout 5s] [--no-wait] <text>` | type text into another agent's terminal; prints the message id and status |
 | `agent-bridge ack <name> <id> [--note TEXT]` | record an explicit application-level acknowledgement for a message you received (alias `acknowledge`) |

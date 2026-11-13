@@ -15,7 +15,10 @@ use tracing::{debug, warn};
 use crate::buffer::OutputBuffer;
 use crate::delivery::{self, Job, WriteOutcome, WriteQueue};
 use crate::error::{BridgeError, Result};
-use crate::protocol::{AgentInfo, AgentStatus, DeliveryStatus, Event, Message, MessageId, Millis};
+use crate::protocol::{
+    AgentInfo, AgentStatus, DeliveryStatus, Event, Message, MessageId, Millis, Readiness,
+};
+use crate::readiness::{ReadinessConfig, PROMPT_SCAN_BYTES};
 use crate::reaper::{self, ProcessReaper};
 
 const MAX_MESSAGES: usize = 500;
@@ -101,6 +104,7 @@ pub struct Agent {
     exited_at: Mutex<Option<Millis>>,
     last_output_at: Mutex<Option<Millis>>,
     buffer: Mutex<OutputBuffer>,
+    readiness: ReadinessConfig,
     messages: Mutex<VecDeque<Message>>,
     queue: Arc<WriteQueue>,
     /// Set when the child emits `ESC[?2004h` (bracketed paste enabled) and
@@ -190,7 +194,8 @@ impl Agent {
             exit_code: Mutex::new(None),
             exited_at: Mutex::new(None),
             last_output_at: Mutex::new(None),
-            buffer: Mutex::new(OutputBuffer::new(crate::buffer::DEFAULT_CAPACITY)),
+            buffer: Mutex::new(OutputBuffer::new(crate::buffer::capacity_from_env())),
+            readiness: ReadinessConfig::from_env(),
             messages: Mutex::new(VecDeque::new()),
             queue,
             bracketed_paste: AtomicBool::new(false),
@@ -313,6 +318,32 @@ impl Agent {
         self.bracketed_paste.load(Ordering::SeqCst)
     }
 
+    /// Heuristic readiness derived from output quiescence and an optional
+    /// prompt suffix.
+    ///
+    /// Never a guarantee: a silent command that runs longer than the quiet
+    /// period is reported `idle`, and a prompt that does not reprint cannot be
+    /// detected without a configured suffix. Terminal control sequences alone
+    /// are not output; such an agent stays `unknown`.
+    #[must_use]
+    pub fn readiness(&self) -> Readiness {
+        let last_line = self
+            .buffer
+            .lock()
+            .ok()
+            .and_then(|buffer| buffer.last_line(PROMPT_SCAN_BYTES));
+        let last_output_at = *self
+            .last_output_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.readiness.classify(
+            self.is_running(),
+            last_output_at,
+            last_line.as_deref(),
+            crate::now_ms(),
+        )
+    }
+
     /// Snapshot for the wire.
     #[must_use]
     pub fn info(&self) -> AgentInfo {
@@ -325,6 +356,7 @@ impl Agent {
             } else {
                 AgentStatus::Exited
             },
+            readiness: self.readiness(),
             pid: self.pid,
             command: self.command.clone(),
             cwd: self.cwd.clone(),

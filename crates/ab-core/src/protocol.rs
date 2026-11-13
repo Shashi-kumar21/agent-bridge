@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the wire shape changes. New `cmd`/`event` tags are unknown
 /// to older daemons, so additive changes bump it too; the CLI compares it for
 /// equality and restarts a daemon only when no agent is live.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Default terminal width for spawned agents.
 pub const DEFAULT_COLS: u16 = 120;
@@ -79,6 +79,24 @@ pub enum AgentStatus {
     Exited,
 }
 
+/// Heuristic input readiness inferred from recent output.
+///
+/// This is not a guarantee. A command that runs silently for longer than the
+/// quiet period looks `idle`, and a persistent prompt that never reprints looks
+/// permanently `busy` without a configured prompt suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Readiness {
+    /// Recent output is still arriving.
+    Busy,
+    /// Output has been quiet for the configured period, or the configured
+    /// prompt suffix matched the newest line.
+    Idle,
+    /// Not running, or no visible output line has been observed yet.
+    #[default]
+    Unknown,
+}
+
 /// Snapshot of one agent managed by the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
@@ -88,6 +106,9 @@ pub struct AgentInfo {
     pub name: String,
     /// Current lifecycle state.
     pub status: AgentStatus,
+    /// Heuristic input readiness (v1-v5 daemons report `unknown`).
+    #[serde(default)]
+    pub readiness: Readiness,
     /// OS process id while running.
     pub pid: Option<u32>,
     /// Full command line that was spawned.
@@ -548,8 +569,8 @@ pub fn validate_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_name, DeliveryStatus, ErrorCode, Event, Message, PasteMode, Request, Response,
-        PROTOCOL_VERSION,
+        validate_name, AgentInfo, DeliveryStatus, ErrorCode, Event, Message, PasteMode, Readiness,
+        Request, Response, PROTOCOL_VERSION,
     };
 
     #[test]
@@ -588,8 +609,20 @@ mod tests {
     }
 
     #[test]
-    fn protocol_is_five() {
-        assert_eq!(PROTOCOL_VERSION, 5);
+    fn protocol_is_six() {
+        assert_eq!(PROTOCOL_VERSION, 6);
+    }
+
+    /// An agent frame from a daemon that predates `readiness` is `unknown`.
+    #[test]
+    fn legacy_agent_frame_defaults_to_unknown_readiness() {
+        let legacy = r#"{
+            "id":"1","name":"dev","status":"running","pid":7,"command":"sh",
+            "cwd":"/tmp","created_at":1,"last_output_at":null,"exited_at":null,
+            "exit_code":null,"message_count":0,"subscribers":0,"cols":80,"rows":24
+        }"#;
+        let parsed: AgentInfo = serde_json::from_str(legacy).expect("legacy agent");
+        assert_eq!(parsed.readiness, Readiness::Unknown);
     }
 
     #[test]
