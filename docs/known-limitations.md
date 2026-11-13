@@ -64,7 +64,7 @@ The remaining gap is the OS write itself: once `write_all` is inside the PTY
 there is no portable way to cancel it. `--write-timeout` (5 s by default, `0`
 waits forever) makes the caller return `unknown`; the writer keeps waiting and
 amends the record to `written`/`failed` when the syscall returns
-(`delivery.rs:486-500`, `daemon.rs:562-595`, `:838-863`). A target that never
+(`delivery.rs:486-500`, `daemon.rs:561-594`, `:838-863`). A target that never
 drains its PTY therefore keeps the in-flight byte reservation and the channel
 fills up behind it until the agent exits or the daemon is restarted; new
 messages to that agent
@@ -132,8 +132,8 @@ fallback).
 `read` strips ANSI sequences from the retained byte ring and returns the last N
 lines (`buffer.rs:149-163`). Cursor movement, erase-line/screen,
 alternate screen and wrapping are discarded, so a full-screen TUI renders as a
-puzzle of redraw fragments. Cursor reads (`--since`) return the same raw bytes
-without stripping; see §5.
+puzzle of redraw fragments. Cursor reads (`--since`) return raw bytes and the
+CLI writes them verbatim, so escape sequences reach the terminal; see §5.
 
 ```bash
 agent-bridge new tui --cwd . -- opencode     # any full-screen TUI
@@ -145,11 +145,12 @@ Roadmap §6 (VT screen model and snapshot).
 ## 5. Cursor reads are bounded chunks, not a live stream
 
 `read --since OFFSET` returns raw output bytes from an absolute per-agent byte
-offset as a `Chunk` (`protocol.rs:519-536`): `offset`, `next_offset`, `dropped`
+offset as a `Chunk` (`protocol.rs:519-538`): `offset`, `next_offset`, `dropped`
 and the current `seq`, with the bytes base64 encoded
-(`daemon.rs:430-461`, `buffer.rs:122-145`). Each response carries at most
-64 KiB (`MAX_READ_CHUNK`, `daemon.rs:41`), so a caller that wants everything new
-must loop until `next_offset` stops moving.
+(`daemon.rs:430-460`, `buffer.rs:122-145`). Each response carries at most
+64 KiB of raw bytes (`MAX_READ_CHUNK`, `daemon.rs:41`; base64 inflates the JSON
+frame), so a caller that wants everything new must loop until `next_offset`
+stops moving.
 
 A `since` older than the retained window is clamped to the oldest retained byte
 and flagged with `dropped: true`; a `since` past the newest byte is rejected
@@ -165,7 +166,7 @@ include older chunks.
 
 ```bash
 agent-bridge --json read shell --since 0     # offset, next_offset, dropped, data
-agent-bridge read shell --since 4096         # stripped text; next offset on stderr
+agent-bridge read shell --since 4096         # raw bytes; next offset on stderr
 ```
 
 Roadmap §3 (follow/stream mode).
@@ -202,7 +203,7 @@ Tracked as issue
 Buffers, message history, PTY handles and job objects are in-memory only
 (`daemon.rs:102-108`). `daemon restart` stops the daemon, which sends Ctrl-C to
 every agent, force-kills any that are still running after ~500 ms
-(`daemon.rs:186-195`, `agent.rs:593-620`), and then exits; the next daemon
+(`daemon.rs:186-195`, `agent.rs:598-625`), and then exits; the next daemon
 starts empty. There is no session adoption.
 
 ```bash
@@ -336,7 +337,7 @@ Roadmap §3 (heuristic readiness with documented caveats).
 ## 18. `--wait-idle` and `--wait-reply` are best-effort heuristics
 
 `--wait-idle` polls the same readiness signal as `listagents`
-(`daemon.rs:734-752`, `readiness.rs:94-121`), so every caveat in §17 applies: a
+(`daemon.rs:733-751`, `readiness.rs:94-121`), so every caveat in §17 applies: a
 target that printed once and then runs silently looks idle, and one that keeps
 redrawing never becomes idle. `unknown` is treated as ready so a fresh shell is
 not blocked, which also means an agent whose startup produced only control
@@ -346,7 +347,7 @@ and writes nothing; the message is not queued and no id is recorded.
 `--wait-reply` subscribes before the message is queued and collects
 `Event::Output` until the agent's configured quiet period passes, the PTY reader
 closes after an exit, the channel closes, or the deadline expires
-(`daemon.rs:757-823`). When the target exits, the queued output frames are
+(`daemon.rs:756-822`). When the target exits, the queued output frames are
 drained before the reply is marked `settled`, so a marker printed just before
 the exit is still returned. If the child exits while a descendant keeps the PTY
 open, the reader never closes; the reply then ends at the first quiet gap (or at

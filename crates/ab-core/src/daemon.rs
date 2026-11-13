@@ -434,8 +434,7 @@ impl Inner {
             } => {
                 let agent = self.get(&target)?;
                 if let Some(since) = since {
-                    let total = agent.output_offset();
-                    let chunk = agent.read_since(since, MAX_READ_CHUNK).ok_or_else(|| {
+                    let chunk = agent.read_since(since, MAX_READ_CHUNK).map_err(|total| {
                         BridgeError::CursorAhead {
                             target: target.clone(),
                             since,
@@ -451,13 +450,13 @@ impl Inner {
                         seq: agent.seq(),
                     });
                 }
-                let (lines, truncated) = agent.tail_lines(lines.unwrap_or(40));
+                let (lines, truncated, next_offset) = agent.tail_snapshot(lines.unwrap_or(40));
                 Ok(Response::Output {
                     agent: target,
                     lines,
                     truncated,
                     seq: agent.seq(),
-                    next_offset: agent.output_offset(),
+                    next_offset,
                 })
             }
             Request::Kill { name, force } => {

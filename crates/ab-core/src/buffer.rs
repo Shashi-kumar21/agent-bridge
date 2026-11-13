@@ -335,6 +335,28 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_buffer_has_an_empty_cursor() {
+        let buffer = OutputBuffer::new(1024);
+        let chunk = buffer.read_from(0, 16).expect("empty chunk");
+        assert_eq!(chunk.start_offset, 0);
+        assert_eq!(chunk.next_offset, 0);
+        assert_eq!(chunk.data.len(), 0);
+        assert!(!chunk.dropped);
+        assert!(buffer.read_from(1, 16).is_none());
+    }
+
+    #[test]
+    fn a_zero_byte_limit_returns_an_empty_chunk() {
+        let mut buffer = OutputBuffer::new(1024);
+        buffer.push(b"abc");
+        let chunk = buffer.read_from(1, 0).expect("empty chunk");
+        assert_eq!(chunk.start_offset, 1);
+        assert_eq!(chunk.next_offset, 1);
+        assert_eq!(chunk.data.len(), 0);
+        assert!(!chunk.dropped);
+    }
+
+    #[test]
     fn capacity_is_clamped() {
         assert_eq!(super::clamp_capacity(1), super::MIN_CAPACITY);
         assert_eq!(super::clamp_capacity(usize::MAX), super::MAX_CAPACITY);

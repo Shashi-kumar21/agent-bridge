@@ -138,12 +138,15 @@ ConPTY, which consumes these markers, so `auto` behaves like `plain` there.
 `listagents --json` reports `bracketed_paste`.
 
 `read --since OFFSET` returns raw output bytes from an absolute per-agent byte
-offset instead of a line tail. Each response carries at most 64 KiB plus
-`offset`, `next_offset` and `dropped`; loop from the previous `next_offset` to
-consume new output exactly once. A `since` older than the retained window is
-clamped to the oldest byte and flagged `dropped`; a `since` past the newest byte
-fails with `bad_request`. Offsets reset when the daemon restarts or the agent is
-re-created. Cursor reads do not wait, so a follower polls `--since`.
+offset instead of a line tail. Each response carries at most 64 KiB of raw bytes
+(base64 makes the JSON frame larger) plus `offset`, `next_offset` and `dropped`;
+loop from the previous `next_offset` to consume new output exactly once. A
+`since` older than the retained window is clamped to the oldest byte and flagged
+`dropped`; a `since` past the newest byte fails with `bad_request`. Offsets reset
+when the daemon restarts or the agent is re-created. Cursor reads do not wait, so
+a follower polls `--since`. The human command writes the bytes verbatim (no ANSI
+stripping), so escape sequences reach the terminal; use `--json` for the exact
+payload.
 
 Options must come **before** the message text, because the text is a trailing
 argument (`sendmessage dev --no-wait "run the tests"`).

@@ -473,35 +473,40 @@ impl Agent {
 
     /// Raw output from an absolute byte cursor.
     ///
-    /// `None` when `since` is ahead of the stream (see
-    /// [`crate::buffer::OutputBuffer::read_from`]).
-    #[must_use]
-    pub fn read_since(&self, since: Offset, max_bytes: usize) -> Option<CursorChunk> {
+    /// `Err(total)` when `since` is ahead of the stream; `total` is the newest
+    /// byte count from the same snapshot, so the error reports an authoritative
+    /// bound (see [`crate::buffer::OutputBuffer::read_from`]).
+    pub fn read_since(
+        &self,
+        since: Offset,
+        max_bytes: usize,
+    ) -> std::result::Result<CursorChunk, Offset> {
         let buffer = self
             .buffer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        buffer.read_from(since, max_bytes)
+        buffer
+            .read_from(since, max_bytes)
+            .ok_or_else(|| buffer.end_offset())
     }
 
-    /// Absolute offset just past the newest retained byte.
+    /// Trailing output lines with ANSI removed, plus the absolute offset just
+    /// past the newest retained byte.
+    ///
+    /// Lines, the `truncated` flag and the offset come from one buffer lock, so
+    /// a caller that reads a tail and resumes from the offset cannot skip bytes
+    /// that were appended between two separate snapshots.
     #[must_use]
-    pub fn output_offset(&self) -> Offset {
+    pub fn tail_snapshot(&self, lines: usize) -> (Vec<String>, bool, Offset) {
         let buffer = self
             .buffer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        buffer.end_offset()
-    }
-
-    /// Trailing output lines with ANSI removed.
-    #[must_use]
-    pub fn tail_lines(&self, lines: usize) -> (Vec<String>, bool) {
-        let buffer = self
-            .buffer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (buffer.tail_lines(lines), buffer.truncated())
+        (
+            buffer.tail_lines(lines),
+            buffer.truncated(),
+            buffer.end_offset(),
+        )
     }
 
     /// Record a delivered message (bounded history).

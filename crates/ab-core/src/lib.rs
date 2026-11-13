@@ -28,8 +28,8 @@ pub mod transport;
 
 pub use error::{BridgeError, Result};
 pub use protocol::{
-    AgentInfo, AgentStatus, DeliveryStatus, ErrorCode, Event, Message, MessageId, Readiness,
-    Request, Response, PROTOCOL_VERSION,
+    AgentInfo, AgentStatus, DeliveryStatus, ErrorCode, Event, Message, MessageId, Offset,
+    Readiness, Request, Response, Seq, PROTOCOL_VERSION,
 };
 
 /// Current wall clock in milliseconds since the Unix epoch.

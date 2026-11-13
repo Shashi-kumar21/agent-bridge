@@ -13,7 +13,7 @@ use agent_bridge_core::paths;
 use agent_bridge_core::protocol::{
     DeliveryStatus, Offset, PasteMode, Request, Response, DEFAULT_COLS, DEFAULT_ROWS,
 };
-use agent_bridge_core::Result;
+use agent_bridge_core::{BridgeError, Result};
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 
@@ -472,7 +472,7 @@ fn emit(response: Response, json: bool) -> Result<()> {
         } => {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(data)
-                .unwrap_or_default();
+                .map_err(|err| BridgeError::Protocol(format!("invalid chunk payload: {err}")))?;
             fmt::print_chunk(&agent, &bytes, offset, next_offset, dropped);
         }
         Response::Sent {

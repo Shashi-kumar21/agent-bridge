@@ -1307,7 +1307,13 @@ fn cursor_reads_return_each_byte_once() {
 
         if bytes.is_empty() {
             let quiet = *quiet_since.get_or_insert_with(Instant::now);
-            if quiet.elapsed() >= Duration::from_millis(600) {
+            // The producer exits, so once it is gone a short quiet period means
+            // the reader has published its tail. The 5 s fallback keeps a slow
+            // CI runner from ending the loop while output is still arriving.
+            let exited = agent_info("stream").status == AgentStatus::Exited;
+            if (exited && quiet.elapsed() >= Duration::from_millis(200))
+                || quiet.elapsed() >= Duration::from_secs(5)
+            {
                 break;
             }
         } else {
@@ -1356,14 +1362,13 @@ fn cursor_older_than_the_buffer_reports_a_gap() {
     wait_for_exit("wrapped");
     wait_for_offset("wrapped", 1024);
 
+    let total = line_read_next_offset("wrapped");
+    assert!(total >= 1024);
     let (bytes, offset, next_offset, dropped) = chunk_parts(read_chunk("wrapped", 0));
     assert!(dropped, "offset 0 should have rotated out");
-    assert!(
-        offset > 0,
-        "the chunk should start at the oldest retained byte"
-    );
-    assert!(next_offset >= 1024);
-    assert_eq!(offset + bytes.len() as u64, next_offset);
+    assert_eq!(offset, total - 1024, "the chunk starts at the oldest byte");
+    assert_eq!(next_offset, total);
+    assert_eq!(bytes.len(), 1024, "the whole retained window is returned");
 
     let (more, offset, after, dropped) = chunk_parts(read_chunk("wrapped", next_offset));
     assert!(!dropped, "continuing from the newest offset has no gap");

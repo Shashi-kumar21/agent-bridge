@@ -531,7 +531,9 @@ pub enum Response {
         /// True when the requested offset was older than the retained window,
         /// so a gap was skipped.
         dropped: bool,
-        /// Newest sequence number at response time.
+        /// Newest sequence number at response time. It counts PTY chunks and
+        /// does not describe the returned byte span, so do not use it to
+        /// correlate bytes.
         seq: Seq,
     },
     /// Message accepted, with its delivery status.

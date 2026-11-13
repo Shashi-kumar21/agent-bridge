@@ -67,10 +67,10 @@ Module map (`crates/ab-core/src`):
 * Per-agent mutable state lives behind mutexes inside `Agent`
   (`agent.rs:93-122`): PTY master (resize), child handle, output buffer, message
   history, subscriber list, reaper, and the write-queue handle.
-* Shutdown: `Request::Shutdown` sets an `AtomicBool` (`Inner::shutdown`, `daemon.rs:506-509`); the
+* Shutdown: `Request::Shutdown` sets an `AtomicBool` (`Inner::shutdown`, `daemon.rs:505-508`); the
   accept loop observes it, calls `Inner::stop_agents` (`daemon.rs:149`, `:179`,
   `:186-195`), which sends Ctrl-C to every agent, force-kills the ones still
-  running after ~500 ms (`agent.rs:593-620`), and then lets the process exit.
+  running after ~500 ms (`agent.rs:598-625`), and then lets the process exit.
 
 ## 3. Request lifecycle (non-streaming)
 
@@ -79,12 +79,12 @@ Module map (`crates/ab-core/src`):
    back (`client.rs:16-35`); the connection is then dropped.
 3. Daemon-side `serve_connection` reads one line, parses it, and either
    dispatches to `Inner::handle` or routes it to `stream_attach`
-   (`serve_connection`, `daemon.rs:917-945`).
+   (`serve_connection`, `daemon.rs:916-944`).
 4. `Inner::handle` maps errors to `Response::Error` with an `ErrorCode`
    (`daemon.rs:197-205`); `try_handle` implements the match
-   (`daemon.rs:207-514`).
+   (`daemon.rs:207-513`).
 5. The response is serialized as one line with the whole frame built before the
-   write, so frames cannot interleave mid-line (`write_frame`, `daemon.rs:1036-1043`).
+   write, so frames cannot interleave mid-line (`write_frame`, `daemon.rs:1035-1042`).
 
 Every request except `Attach` is one request and one response. There is no
 pipelining: a second request on the same connection is never read.
@@ -99,21 +99,22 @@ pipelining: a second request on the same connection is never read.
    published to subscribers as a base64 `Event::Output` (`agent.rs:244-248`).
 4. Subscribers are bounded channels of 1024 events (`agent.rs:35`, `:541-555`). A
    subscriber that cannot keep up is dropped and logged
-   (`agent.rs:557-574`).
+   (`agent.rs:562-579`).
 5. A plain `Read` returns ANSI-stripped tail lines plus the current `seq` and
-   `next_offset` (`daemon.rs:454-461`, `agent.rs:497-505`, `buffer.rs:149-163`);
+   `next_offset` (`daemon.rs:453-460`, `agent.rs:508-510`, `buffer.rs:149-163`);
    it is a line view of raw bytes, not a terminal screen. `Read { since }`
    returns a base64 `Chunk` of raw bytes from an absolute byte offset, at most
-   64 KiB per response (`MAX_READ_CHUNK`, `daemon.rs:41`), with `offset`,
-   `next_offset`, `dropped` and `seq` (`daemon.rs:430-453`, `buffer.rs:122-145`).
+   64 KiB of raw bytes per response (`MAX_READ_CHUNK`, `daemon.rs:41`; base64
+   inflates the JSON frame), with `offset`,
+   `next_offset`, `dropped` and `seq` (`daemon.rs:430-452`, `buffer.rs:122-145`).
    `dropped` means the requested offset had rotated out and the chunk starts at
    the oldest retained byte; `since` past the newest byte is a `BadRequest`
    (`CursorAhead`, `error.rs:76-87`). Offsets are per agent and daemon lifetime
    (`Offset`, `protocol.rs:24-29`); there is no blocking follow.
 6. `Attach` subscribes first, sends `Hello`, optionally replays the whole
    retained buffer as one frame tagged with the *current* `seq`
-   (`daemon.rs:975-988`), then streams live events until exit or disconnect
-   (`daemon.rs:1004-1032`). Because the replay and the live stream can repeat a
+   (`daemon.rs:974-987`), then streams live events until exit or disconnect
+   (`daemon.rs:1003-1031`). Because the replay and the live stream can repeat a
    sequence number, clients drop non-increasing `seq` (`client.rs:79-83`).
 7. Readiness is derived per request from this stream (`Agent::readiness`,
    `agent.rs:338-354`): output newer than `AGENT_BRIDGE_QUIET_MS` (default
@@ -159,14 +160,14 @@ restart from zero in a new daemon.
    A message that is still `queued` at the deadline stays `queued` and keeps
    waiting; `unknown` is only used after the write started. The writer amends an
    `unknown` record to `written`/`failed` when the syscall returns
-   (`daemon.rs:562-595`, `:838-863`). When the sender asked for an
+   (`daemon.rs:561-594`, `:838-863`). When the sender asked for an
    acknowledgement, the completed write lands in `awaiting_ack` instead of
-   `written` (`settle`, `daemon.rs:825-835`). `pending` lists `queued`,
+   `written` (`settle`, `daemon.rs:824-834`). `pending` lists `queued`,
    `writing`, `unknown` and `awaiting_ack` records because all four may still
    change.
 6. `sendmessage` waits for the terminal status by default; `--no-wait` returns
    after admission. The response is
-   `Sent { target, bytes, message_id, status, reply }` (`protocol.rs:538-554`);
+   `Sent { target, bytes, message_id, status, reply }` (`protocol.rs:540-556`);
    `reply` is `Some` only when `--wait-reply` was requested and the write
    completed, so a failed or abandoned write leaves it `null`. A `written` or
    `awaiting_ack` status means "bytes were accepted by the PTY", never that the
@@ -179,21 +180,21 @@ restart from zero in a new daemon.
    `awaiting_ack` or `unknown`) can be acknowledged, and repeating the request
    is idempotent. An `unknown` write is accepted because the acknowledgement
    itself proves the bytes arrived. `acknowledge`
-   (`daemon.rs:605-668`) stores `Ack { at, note }`, moves the status to
+   (`daemon.rs:604-667`) stores `Ack { at, note }`, moves the status to
    `acknowledged` and publishes `Event::MessageStatus`. Notes are capped at
    1 KiB because the log is bounded. An acknowledgement is stronger than the
    write outcome, so a late `done` event cannot downgrade it
-   (`apply_status`, `daemon.rs:837-863`); only `acknowledged` means the receiver
+   (`apply_status`, `daemon.rs:836-862`); only `acknowledged` means the receiver
    reported that it saw the message.
 8. `--wait-idle` calls `wait_until_ready` before allocating the id
    (`daemon.rs:294-296`, `:734-752`): it polls `Agent::readiness` every 25 ms,
    proceeds on `idle` and `unknown`, and fails with
    `BridgeError::WaitIdleTimeout` (`error.rs:69-74`, code `timeout`) without
    recording or writing anything when the deadline expires. `--wait-reply`
-   subscribes to the agent's event channel before enqueueing (`agent.rs:541-555`)
+   subscribes to the agent's event channel before enqueueing (`agent.rs:546-560`)
    and, after the write completes, runs `collect_reply` until output has been
    quiet for the agent's configured period, the PTY reader closes after an exit,
-   the channel closes, or the deadline expires (`daemon.rs:757-823`). On exit it
+   the channel closes, or the deadline expires (`daemon.rs:756-822`). On exit it
    drains the queued `Event::Output` frames before settling, so the target's
    last line is not lost. The collector retains at most 64 KiB and returns the
    last 200 lines with `settled`/`timed_out`/`truncated` (`Reply`,
@@ -201,9 +202,9 @@ restart from zero in a new daemon.
    lines. Each wait uses `--timeout` (default 30 s,
    `delivery.rs:56`, clamped by `MAX_TIMEOUT`); `--wait-reply` is rejected with
    `--no-wait`. The reply is attached to the same `Sent` response
-   (`protocol.rs:538-554`), which requires protocol v7 or newer (the cursor
+   (`protocol.rs:540-556`), which requires protocol v7 or newer (the cursor
    fields raise it to v8).
-9. `MessageStatus` and `Pending` read the same records (`daemon.rs:484-505`).
+9. `MessageStatus` and `Pending` read the same records (`daemon.rs:483-504`).
    Ids, statuses and acknowledgements are per daemon lifetime; a restart clears
    the history.
 

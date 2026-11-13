@@ -1,8 +1,8 @@
 //! Terminal formatting helpers (human readable output).
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 
-use agent_bridge_core::buffer::strip_ansi;
 use agent_bridge_core::protocol::{
     AgentInfo, AgentStatus, DeliveryStatus, Message, Offset, Readiness, Reply,
 };
@@ -107,16 +107,20 @@ pub fn print_output(agent: &str, lines: &[String], truncated: bool) {
     }
 }
 
-/// Print one raw cursor chunk and the offset to resume from.
+/// Write one raw cursor chunk and the offset to resume from.
 ///
-/// The bytes are ANSI-stripped for the human view and written without adding a
-/// newline, so successive reads concatenate cleanly. The resumable offset (and
-/// any skipped gap) go to stderr, keeping stdout pipe-friendly.
+/// The bytes are written verbatim (no ANSI stripping, no newline), so chunk
+/// boundaries cannot corrupt escape sequences or multi-byte characters and
+/// successive reads concatenate exactly. Escape sequences therefore reach the
+/// terminal; use `--json` when the exact bytes matter. The resumable offset
+/// (and any skipped gap) go to stderr, keeping stdout pipe-friendly.
 pub fn print_chunk(agent: &str, data: &[u8], offset: Offset, next_offset: Offset, dropped: bool) {
     if dropped {
         eprintln!("--- {agent} (gap: oldest retained byte is offset {offset}) ---");
     }
-    print!("{}", strip_ansi(&String::from_utf8_lossy(data)));
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(data);
+    let _ = stdout.flush();
     eprintln!("next offset: {next_offset}");
 }
 
