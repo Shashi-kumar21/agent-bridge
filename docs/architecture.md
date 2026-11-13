@@ -136,7 +136,7 @@ restart from zero in a new daemon.
    the record as `queued` in the bounded id-indexed log (2000 entries,
    `daemon.rs:33-81`) and publishes `Event::Message`.
 3. The payload becomes one `delivery::Job` and is admitted to the agent's
-   bounded queue (`delivery.rs:334-419`). The defaults are 128 jobs and 2 MiB
+   bounded queue (`delivery.rs:334-418`). The defaults are 128 jobs and 2 MiB
    per agent, configurable with `AGENT_BRIDGE_QUEUE_LIMIT` and
    `AGENT_BRIDGE_QUEUE_BYTES`. Admission waits up to `--queue-timeout` (5 s
    default, `0` fails fast); a full queue ends `failed { code: queue_full }`

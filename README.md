@@ -99,10 +99,12 @@ application understood or completed the request. `written`, `awaiting_ack` and
 `acknowledged` are the only statuses that mean the bytes reached the PTY.
 
 `listagents` shows a heuristic **READY** column: `busy`, `idle` or `unknown`
-(`listagents --json` reports `readiness`). Output newer than the quiet period is
-`busy`, older output is `idle`, a stopped agent or one that never printed is
-`unknown`, and an optional literal prompt suffix can mark `idle` early. This is
-a hint, never a guarantee: a silent long-running command is reported `idle`.
+(`listagents --json` reports `readiness`). Output that arrived within the quiet
+period is `busy`; an agent that printed a visible line and then went quiet past
+it is `idle`; a stopped agent, or one that never printed a visible line, is
+`unknown`. An optional literal prompt suffix (max 128 characters) on the newest
+line can mark `idle` early. The state is a hint, never a guarantee: a command
+that printed once and then runs silently is reported `idle`.
 Tune it with `AGENT_BRIDGE_QUIET_MS` (default `500`, clamped 50..60000) and
 `AGENT_BRIDGE_PROMPT_PATTERN`. Retained output is 256 KiB per agent;
 `AGENT_BRIDGE_BUFFER_BYTES` overrides it (clamped 1 KiB..16 MiB). All three are

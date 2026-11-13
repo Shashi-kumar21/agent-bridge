@@ -52,7 +52,7 @@ integration can send one).
 
 ## 2. A blocked PTY write cannot be cancelled
 
-Each agent has one writer thread and a bounded queue (`delivery.rs:334-419`), so
+Each agent has one writer thread and a bounded queue (`delivery.rs:334-418`), so
 a slow target no longer blocks *other* senders' writes and memory stays bounded
 (128 jobs / 2 MiB per agent by default). A caller still waits up to
 `--write-timeout` (forever with `0`) for its own message. Admission waits
@@ -129,7 +129,7 @@ fallback).
 ## 4. `read` is a line view of raw bytes, not a terminal screen
 
 `read` strips ANSI sequences from the retained byte ring and returns the last N
-lines (`buffer.rs:89-103`, `:110-123`, `:131-171`). Cursor movement, erase-line/screen,
+lines (`buffer.rs:89-103`, `:131-171`). Cursor movement, erase-line/screen,
 alternate screen and wrapping are discarded, so a full-screen TUI renders as a
 puzzle of redraw fragments.
 
@@ -273,7 +273,7 @@ Roadmap §3 (explicit drop signalling, offset expiry).
 ## 14. Message history is per-agent and bounded at 500
 
 `record_message` keeps the newest 500 entries (`agent.rs:24`, `:470-479`), and
-the global id-indexed log keeps 2000 (`daemon.rs:25`, `:33-82`). Both are
+the global id-indexed log keeps 2000 (`daemon.rs:25`, `:33-81`). Both are
 in-memory and vanish with the daemon. Ids are unique only for one daemon
 lifetime, so `messagestatus` returns `not_found` after a restart even though the
 id was valid before; there is no persistence.

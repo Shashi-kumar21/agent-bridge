@@ -105,8 +105,9 @@ A PR is ready for QA only when **all** of these are true:
   target-checked, idempotent, and capped at 1 KiB of note.
 * Readiness is a heuristic and must always be documented as one. `idle` comes
   from output quiescence (`AGENT_BRIDGE_QUIET_MS`, default 500 ms) or an optional
-  literal `AGENT_BRIDGE_PROMPT_PATTERN` suffix on the newest line; a stopped
-  agent or one with no output is `unknown`. Never gate a destructive action on
+  literal `AGENT_BRIDGE_PROMPT_PATTERN` suffix (truncated to 128 characters) on
+  the newest visible line; a stopped agent or one with no visible line is
+  `unknown`. Never gate a destructive action on
   `idle` alone, and never describe it as a prompt detector. Both variables and
   `AGENT_BRIDGE_BUFFER_BYTES` (1 KiB..16 MiB, default 256 KiB) are sampled in
   `Agent::spawn`, so they affect only new agents.
