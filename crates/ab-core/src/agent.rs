@@ -12,11 +12,11 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use tracing::{debug, warn};
 
-use crate::buffer::OutputBuffer;
+use crate::buffer::{CursorChunk, OutputBuffer};
 use crate::delivery::{self, Job, WriteOutcome, WriteQueue};
 use crate::error::{BridgeError, Result};
 use crate::protocol::{
-    AgentInfo, AgentStatus, DeliveryStatus, Event, Message, MessageId, Millis, Readiness,
+    AgentInfo, AgentStatus, DeliveryStatus, Event, Message, MessageId, Millis, Offset, Readiness,
 };
 use crate::readiness::{ReadinessConfig, PROMPT_SCAN_BYTES};
 use crate::reaper::{self, ProcessReaper};
@@ -469,6 +469,29 @@ impl Agent {
     #[must_use]
     pub fn readiness_quiet(&self) -> Duration {
         self.readiness.quiet()
+    }
+
+    /// Raw output from an absolute byte cursor.
+    ///
+    /// `None` when `since` is ahead of the stream (see
+    /// [`crate::buffer::OutputBuffer::read_from`]).
+    #[must_use]
+    pub fn read_since(&self, since: Offset, max_bytes: usize) -> Option<CursorChunk> {
+        let buffer = self
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        buffer.read_from(since, max_bytes)
+    }
+
+    /// Absolute offset just past the newest retained byte.
+    #[must_use]
+    pub fn output_offset(&self) -> Offset {
+        let buffer = self
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        buffer.end_offset()
     }
 
     /// Trailing output lines with ANSI removed.

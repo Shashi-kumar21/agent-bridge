@@ -37,6 +37,8 @@ const REPLY_POLL: Duration = Duration::from_millis(25);
 const MAX_REPLY_BYTES: usize = 64 * 1024;
 /// Trailing lines returned for one collected reply.
 const MAX_REPLY_LINES: usize = 200;
+/// Largest raw byte span returned by one cursor read (64 KiB).
+const MAX_READ_CHUNK: usize = 64 * 1024;
 
 /// Bounded, id-indexed message history.
 struct MessageLog {
@@ -425,14 +427,37 @@ impl Inner {
                 }
             }
             Request::Ack { target, id, note } => self.acknowledge(&target, id, note),
-            Request::Read { target, lines } => {
+            Request::Read {
+                target,
+                lines,
+                since,
+            } => {
                 let agent = self.get(&target)?;
+                if let Some(since) = since {
+                    let total = agent.output_offset();
+                    let chunk = agent.read_since(since, MAX_READ_CHUNK).ok_or_else(|| {
+                        BridgeError::CursorAhead {
+                            target: target.clone(),
+                            since,
+                            total,
+                        }
+                    })?;
+                    return Ok(Response::Chunk {
+                        agent: target,
+                        data: base64::engine::general_purpose::STANDARD.encode(&chunk.data),
+                        offset: chunk.start_offset,
+                        next_offset: chunk.next_offset,
+                        dropped: chunk.dropped,
+                        seq: agent.seq(),
+                    });
+                }
                 let (lines, truncated) = agent.tail_lines(lines.unwrap_or(40));
                 Ok(Response::Output {
                     agent: target,
                     lines,
                     truncated,
                     seq: agent.seq(),
+                    next_offset: agent.output_offset(),
                 })
             }
             Request::Kill { name, force } => {

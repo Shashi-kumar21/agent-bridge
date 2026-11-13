@@ -2,8 +2,9 @@
 
 use std::fmt::Write as _;
 
+use agent_bridge_core::buffer::strip_ansi;
 use agent_bridge_core::protocol::{
-    AgentInfo, AgentStatus, DeliveryStatus, Message, Readiness, Reply,
+    AgentInfo, AgentStatus, DeliveryStatus, Message, Offset, Readiness, Reply,
 };
 
 /// Format a timestamp as a coarse age ("4s ago").
@@ -104,6 +105,19 @@ pub fn print_output(agent: &str, lines: &[String], truncated: bool) {
     for line in lines {
         println!("{line}");
     }
+}
+
+/// Print one raw cursor chunk and the offset to resume from.
+///
+/// The bytes are ANSI-stripped for the human view and written without adding a
+/// newline, so successive reads concatenate cleanly. The resumable offset (and
+/// any skipped gap) go to stderr, keeping stdout pipe-friendly.
+pub fn print_chunk(agent: &str, data: &[u8], offset: Offset, next_offset: Offset, dropped: bool) {
+    if dropped {
+        eprintln!("--- {agent} (gap: oldest retained byte is offset {offset}) ---");
+    }
+    print!("{}", strip_ansi(&String::from_utf8_lossy(data)));
+    eprintln!("next offset: {next_offset}");
 }
 
 /// Print one message record and its delivery status.

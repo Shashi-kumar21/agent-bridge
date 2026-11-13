@@ -188,6 +188,7 @@ fn wait_for_echo(target: &str, needle: &str) {
         if let Ok(Response::Output { lines, .. }) = client::request(&Request::Read {
             target: target.to_string(),
             lines: Some(50),
+            since: None,
         }) {
             if lines.iter().any(|line| line.contains(needle)) {
                 return;

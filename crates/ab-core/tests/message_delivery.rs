@@ -211,6 +211,7 @@ fn output_text(target: &str) -> String {
     match client::request(&Request::Read {
         target: target.to_string(),
         lines: Some(10_000),
+        since: None,
     })
     .expect("read")
     {
@@ -1194,4 +1195,206 @@ fn wait_reply_requires_a_completed_write() {
     }
     assert_eq!(agent_info("no-wait").message_count, 0);
     kill("no-wait");
+}
+
+/// Request one cursor chunk from an absolute byte offset.
+fn read_chunk(target: &str, since: u64) -> Response {
+    client::request(&Request::Read {
+        target: target.to_string(),
+        lines: None,
+        since: Some(since),
+    })
+    .expect("cursor read")
+}
+
+/// Decode a `Chunk` response into `(bytes, offset, next_offset, dropped)`.
+fn chunk_parts(response: Response) -> (Vec<u8>, u64, u64, bool) {
+    use base64::Engine as _;
+    match response {
+        Response::Chunk {
+            data,
+            offset,
+            next_offset,
+            dropped,
+            ..
+        } => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .expect("base64 chunk");
+            (bytes, offset, next_offset, dropped)
+        }
+        other => panic!("expected a chunk response, got {other:?}"),
+    }
+}
+
+/// A line read reports the absolute offset just past the newest byte.
+fn line_read_next_offset(target: &str) -> u64 {
+    match client::request(&Request::Read {
+        target: target.to_string(),
+        lines: Some(20),
+        since: None,
+    })
+    .expect("read")
+    {
+        Response::Output { next_offset, .. } => next_offset,
+        other => panic!("expected an output response, got {other:?}"),
+    }
+}
+
+/// Wait until the agent has produced at least `min_bytes`.
+fn wait_for_offset(target: &str, min_bytes: u64) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while line_read_next_offset(target) < min_bytes {
+        assert!(
+            Instant::now() < deadline,
+            "agent never produced {min_bytes} bytes"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn output_lines_command(count: usize) -> Vec<String> {
+    if cfg!(windows) {
+        let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+        vec![
+            shell,
+            "/c".to_string(),
+            format!(
+                "for /L %i in (1,1,{count}) do @echo cursor-line-%i-abcdefghijklmnopqrstuvwxyz"
+            ),
+        ]
+    } else {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("seq 1 {count} | sed 's/^/cursor-line-/'"),
+        ]
+    }
+}
+
+fn large_output_command() -> Vec<String> {
+    output_lines_command(4000)
+}
+
+/// Wait until the agent process exits and its reader has published the tail.
+fn wait_for_exit(target: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while agent_info(target).status != AgentStatus::Exited {
+        assert!(Instant::now() < deadline, "agent never exited");
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(300));
+}
+
+/// Resuming from `next_offset` must return every byte exactly once, even when
+/// the stream is larger than one 64 KiB chunk and is still growing.
+#[test]
+fn cursor_reads_return_each_byte_once() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent_with("stream", large_output_command());
+
+    let mut cursor = 0_u64;
+    let mut collected: Vec<u8> = Vec::new();
+    let mut quiet_since: Option<Instant> = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (bytes, offset, next_offset, dropped) = chunk_parts(read_chunk("stream", cursor));
+        assert!(!dropped, "the whole stream fits in the default buffer");
+        assert_eq!(offset, cursor, "a chunk started at the wrong offset");
+        assert!(bytes.len() <= 64 * 1024, "chunk exceeded the 64 KiB cap");
+        cursor = next_offset;
+        collected.extend_from_slice(&bytes);
+
+        if bytes.is_empty() {
+            let quiet = *quiet_since.get_or_insert_with(Instant::now);
+            if quiet.elapsed() >= Duration::from_millis(600) {
+                break;
+            }
+        } else {
+            quiet_since = None;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stream never settled ({} bytes)",
+            collected.len()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    assert!(
+        collected.len() as u64 > 64 * 1024,
+        "the test needs more than one chunk, got {} bytes",
+        collected.len()
+    );
+    assert_eq!(
+        collected.len() as u64,
+        cursor,
+        "offsets and bytes disagree, so a span was skipped or repeated"
+    );
+    let text = String::from_utf8_lossy(&collected);
+    assert!(text.contains("cursor-line-1-"), "first line missing");
+    assert!(text.contains("cursor-line-4000-"), "last line missing");
+    assert_eq!(
+        text.matches("cursor-line-2-").count(),
+        1,
+        "a byte span was returned twice"
+    );
+
+    kill("stream");
+}
+
+/// A cursor older than the retained window is clamped to the oldest byte and
+/// flagged, and the next read from `next_offset` has no gap.
+#[test]
+fn cursor_older_than_the_buffer_reports_a_gap() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    // Sampled when the agent spawns, so set it before `create_agent_with`.
+    std::env::set_var("AGENT_BRIDGE_BUFFER_BYTES", "1024");
+    create_agent_with("wrapped", output_lines_command(200));
+    // A finite producer: once it exits the retained window stops moving, so a
+    // cursor taken from the first read cannot rotate out before the second.
+    wait_for_exit("wrapped");
+    wait_for_offset("wrapped", 1024);
+
+    let (bytes, offset, next_offset, dropped) = chunk_parts(read_chunk("wrapped", 0));
+    assert!(dropped, "offset 0 should have rotated out");
+    assert!(
+        offset > 0,
+        "the chunk should start at the oldest retained byte"
+    );
+    assert!(next_offset >= 1024);
+    assert_eq!(offset + bytes.len() as u64, next_offset);
+
+    let (more, offset, after, dropped) = chunk_parts(read_chunk("wrapped", next_offset));
+    assert!(!dropped, "continuing from the newest offset has no gap");
+    assert_eq!(offset, next_offset);
+    assert_eq!(after, offset + more.len() as u64);
+
+    kill("wrapped");
+}
+
+/// A cursor past the newest byte is rejected, while `since == total` is a
+/// valid empty chunk.
+#[test]
+fn cursor_ahead_of_the_stream_is_rejected() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent_with("quiet-cursor", silent_command());
+    thread::sleep(Duration::from_millis(300));
+
+    let total = line_read_next_offset("quiet-cursor");
+    match read_chunk("quiet-cursor", total + 1) {
+        Response::Error { code, message } => {
+            assert_eq!(code, ErrorCode::BadRequest);
+            assert!(message.contains("ahead"), "unexpected message: {message}");
+        }
+        other => panic!("expected an error response, got {other:?}"),
+    }
+
+    let (bytes, offset, next_offset, dropped) = chunk_parts(read_chunk("quiet-cursor", total));
+    assert_eq!(bytes.len(), 0);
+    assert_eq!(offset, total);
+    assert_eq!(next_offset, total);
+    assert!(!dropped);
+
+    kill("quiet-cursor");
 }

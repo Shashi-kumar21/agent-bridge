@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the wire shape changes. New `cmd`/`event` tags are unknown
 /// to older daemons, so additive changes bump it too; the CLI compares it for
 /// equality and restarts a daemon only when no agent is live.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Default terminal width for spawned agents.
 pub const DEFAULT_COLS: u16 = 120;
@@ -20,6 +20,13 @@ pub const DEFAULT_ROWS: u16 = 32;
 
 /// Monotonic per-agent output sequence number.
 pub type Seq = u64;
+
+/// Absolute byte offset into one agent's output stream.
+///
+/// Starts at zero when the agent is spawned and grows with every byte the PTY
+/// produces, including bytes that have already rotated out of the buffer.
+/// Offsets are per agent and per daemon lifetime.
+pub type Offset = u64;
 
 /// Milliseconds since the Unix epoch.
 pub type Millis = u64;
@@ -393,6 +400,10 @@ pub enum Request {
         /// Number of trailing lines.
         #[serde(default)]
         lines: Option<usize>,
+        /// Resume from an absolute byte offset. When set, the daemon returns
+        /// raw bytes as a [`Response::Chunk`] and ignores `lines`.
+        #[serde(default)]
+        since: Option<Offset>,
     },
     /// Terminate an agent.
     Kill {
@@ -499,6 +510,28 @@ pub enum Response {
         /// True when the buffer rotated out older content.
         truncated: bool,
         /// Last sequence number included.
+        seq: Seq,
+        /// Absolute offset just past the newest retained byte; pass it as
+        /// [`Request::Read::since`] to follow from here.
+        #[serde(default)]
+        next_offset: Offset,
+    },
+    /// Raw output from an absolute byte cursor (`Request::Read::since`).
+    Chunk {
+        /// Agent name.
+        agent: String,
+        /// Base64 encoded raw bytes from `offset` up to `next_offset`.
+        data: String,
+        /// Absolute offset of the first returned byte. Greater than the
+        /// requested offset when that data had already rotated out.
+        offset: Offset,
+        /// Absolute offset just past the last returned byte; pass it as
+        /// `since` to continue.
+        next_offset: Offset,
+        /// True when the requested offset was older than the retained window,
+        /// so a gap was skipped.
+        dropped: bool,
+        /// Newest sequence number at response time.
         seq: Seq,
     },
     /// Message accepted, with its delivery status.
@@ -650,8 +683,48 @@ mod tests {
     }
 
     #[test]
-    fn protocol_is_seven() {
-        assert_eq!(PROTOCOL_VERSION, 7);
+    fn protocol_is_eight() {
+        assert_eq!(PROTOCOL_VERSION, 8);
+    }
+
+    #[test]
+    fn chunk_frame_round_trips() {
+        let chunk = Response::Chunk {
+            agent: "dev".to_string(),
+            data: "aGk=".to_string(),
+            offset: 4,
+            next_offset: 6,
+            dropped: false,
+            seq: 9,
+        };
+        let json = serde_json::to_string(&chunk).expect("serialize");
+        assert!(json.contains("\"kind\":\"chunk\""));
+        let parsed: Response = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            parsed,
+            Response::Chunk {
+                offset: 4,
+                next_offset: 6,
+                dropped: false,
+                seq: 9,
+                ..
+            }
+        ));
+    }
+
+    /// A `read` from a daemon that predates `since` parses as line mode.
+    #[test]
+    fn legacy_read_frame_has_no_since() {
+        let legacy = r#"{"cmd":"read","target":"dev","lines":40}"#;
+        let parsed: Request = serde_json::from_str(legacy).expect("legacy read");
+        assert!(matches!(
+            parsed,
+            Request::Read {
+                since: None,
+                lines: Some(40),
+                ..
+            }
+        ));
     }
 
     /// A `sent` frame from a daemon that predates `reply` parses as `None`.

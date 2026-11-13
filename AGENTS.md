@@ -122,6 +122,12 @@ A PR is ready for QA only when **all** of these are true:
   `Agent::spawn`, so they affect only new agents.
 * Attach streams replay buffered output and then continue live, so the same
   `seq` can arrive twice; clients must drop non-increasing `seq` frames.
+* `read --since` is the byte cursor: offsets are absolute, per agent and per
+  daemon lifetime; a response is capped at 64 KiB and carries `offset`,
+  `next_offset` and `dropped`. A cursor older than the retained window is
+  clamped with `dropped: true`; a cursor past the newest byte is `bad_request`.
+  Never claim offsets survive a daemon restart or an agent re-creation, and never
+  describe `--since` as a blocking follow (it is a poll).
 * Daemon lifecycle: a protocol-skew restart is allowed **only** when the daemon
   owns no agent sessions. Never add a path that silently kills live agents
   (a version bump is not a licence to destroy someone's terminal).

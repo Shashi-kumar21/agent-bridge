@@ -1,6 +1,8 @@
-//! Bounded output buffer with ANSI-aware line extraction.
+//! Bounded output buffer with ANSI-aware line extraction and byte cursors.
 
 use std::collections::VecDeque;
+
+use crate::protocol::Offset;
 
 /// Default retained bytes per agent (256 KiB).
 pub const DEFAULT_CAPACITY: usize = 256 * 1024;
@@ -31,12 +33,28 @@ pub fn capacity_from_env() -> usize {
     capacity_from_value(std::env::var(CAPACITY_ENV).ok().as_deref())
 }
 
+/// One bounded slice of the retained output, addressed by absolute byte offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorChunk {
+    /// Absolute offset of the first returned byte.
+    pub start_offset: Offset,
+    /// Raw bytes in `start_offset..next_offset`.
+    pub data: Vec<u8>,
+    /// Absolute offset just past the last returned byte.
+    pub next_offset: Offset,
+    /// True when the requested offset had already rotated out, so the chunk
+    /// starts at the oldest retained byte instead.
+    pub dropped: bool,
+}
+
 /// Ring buffer holding the most recent terminal output of one agent.
 #[derive(Debug)]
 pub struct OutputBuffer {
     data: VecDeque<u8>,
     capacity: usize,
     truncated: bool,
+    /// Total bytes ever pushed, including bytes that have rotated out.
+    total: u64,
 }
 
 impl OutputBuffer {
@@ -47,11 +65,13 @@ impl OutputBuffer {
             data: VecDeque::with_capacity(capacity.min(64 * 1024)),
             capacity: clamp_capacity(capacity),
             truncated: false,
+            total: 0,
         }
     }
 
     /// Append a chunk, dropping the oldest bytes on overflow.
     pub fn push(&mut self, chunk: &[u8]) {
+        self.total = self.total.saturating_add(chunk.len() as u64);
         self.data.extend(chunk.iter().copied());
         while self.data.len() > self.capacity {
             let overflow = self.data.len() - self.capacity;
@@ -82,6 +102,46 @@ impl OutputBuffer {
     #[must_use]
     pub fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// Absolute offset of the oldest retained byte.
+    ///
+    /// Grows with every byte pushed; the difference between this and
+    /// [`Self::end_offset`] is [`Self::len`].
+    #[must_use]
+    pub fn start_offset(&self) -> Offset {
+        self.total.saturating_sub(self.len() as Offset)
+    }
+
+    /// Absolute offset just past the newest retained byte.
+    #[must_use]
+    pub fn end_offset(&self) -> Offset {
+        self.total
+    }
+
+    /// Read at most `max_bytes` from `since` onwards.
+    ///
+    /// Returns `None` when `since` is ahead of the newest byte: such a cursor
+    /// does not belong to this stream (offsets reset when the daemon or agent
+    /// restarts). A cursor older than the retained window is clamped to the
+    /// oldest retained byte and reported with [`CursorChunk::dropped`], so the
+    /// caller can tell that a gap was skipped. An empty buffer with
+    /// `since == 0` returns an empty chunk.
+    #[must_use]
+    pub fn read_from(&self, since: Offset, max_bytes: usize) -> Option<CursorChunk> {
+        if since > self.total {
+            return None;
+        }
+        let start = since.max(self.start_offset());
+        let skip = usize::try_from(start - self.start_offset()).ok()?;
+        let take = self.data.len().saturating_sub(skip).min(max_bytes);
+        let data: Vec<u8> = self.data.iter().skip(skip).take(take).copied().collect();
+        Some(CursorChunk {
+            start_offset: start,
+            next_offset: start + data.len() as Offset,
+            dropped: since < self.start_offset(),
+            data,
+        })
     }
 
     /// Last `n` lines with ANSI escapes removed.
@@ -228,6 +288,50 @@ mod tests {
             super::capacity_from_value(Some("999999999")),
             super::MAX_CAPACITY
         );
+    }
+
+    #[test]
+    fn offsets_advance_across_a_wrap() {
+        let mut buffer = OutputBuffer::new(1024);
+        buffer.push(&vec![b'a'; 1500]);
+        assert_eq!(buffer.end_offset(), 1500);
+        assert_eq!(buffer.start_offset(), 476);
+        assert_eq!(buffer.len(), 1024);
+
+        let chunk = buffer.read_from(0, 64 * 1024).expect("cursor");
+        assert!(chunk.dropped, "offset 0 rotated out");
+        assert_eq!(chunk.start_offset, 476);
+        assert_eq!(chunk.next_offset, 1500);
+        assert_eq!(chunk.data.len(), 1024);
+    }
+
+    #[test]
+    fn repeated_reads_cover_each_byte_once() {
+        let mut buffer = OutputBuffer::new(1024);
+        buffer.push(b"abcdef");
+
+        let first = buffer.read_from(0, 3).expect("first chunk");
+        assert_eq!(first.data, b"abc");
+        assert!(!first.dropped);
+        let second = buffer
+            .read_from(first.next_offset, 3)
+            .expect("second chunk");
+        assert_eq!(second.data, b"def");
+        assert_eq!(second.next_offset, 6);
+        let empty = buffer
+            .read_from(second.next_offset, 3)
+            .expect("empty chunk");
+        assert_eq!(empty.data.len(), 0);
+        assert_eq!(empty.next_offset, 6);
+        assert!(!empty.dropped);
+    }
+
+    #[test]
+    fn a_cursor_ahead_of_the_stream_is_rejected() {
+        let mut buffer = OutputBuffer::new(1024);
+        buffer.push(b"abc");
+        assert!(buffer.read_from(4, 16).is_none());
+        assert_eq!(buffer.read_from(3, 16).map(|c| c.data), Some(Vec::new()));
     }
 
     #[test]
