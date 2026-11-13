@@ -143,7 +143,7 @@ Roadmap §6 (VT screen model and snapshot).
 
 ## 5. No byte offset cursor; `seq` counts chunks
 
-`Read` returns the current `seq` (`protocol.rs:491-501`); `Attach --from-seq`
+`Read` returns the current `seq` (`protocol.rs:493-503`); `Attach --from-seq`
 only decides whether to replay the *whole* retained buffer (`daemon.rs:950`).
 Because `seq` increments per PTY chunk, not per byte, callers cannot resume from
 an arbitrary offset, and a replay frame carries the newest `seq` for bytes that
@@ -332,15 +332,16 @@ closes after an exit, the channel closes, or the deadline expires
 (`daemon.rs:732-798`). When the target exits, the queued output frames are
 drained before the reply is marked `settled`, so a marker printed just before
 the exit is still returned. If the child exits while a descendant keeps the PTY
-open, the reader never closes, so the reply waits for the deadline and reports
-`timed_out` with the lines seen so far. It keeps at most 64 KiB and returns the last 200
+open, the reader never closes; the reply then ends at the first quiet gap (or at
+the deadline if no output was seen or it never goes quiet), so it can be
+`settled` or `timed_out`. It keeps at most 64 KiB and returns the last 200
 lines; `truncated` only reports dropped bytes, so a reply can hold fewer than
 200 lines between the byte cap and the line cap. It stops at the first quiet
 gap, so a target that pauses mid-task returns a partial reply, and output
 already retained before the write is not included. On a Unix PTY the terminal
-driver may echo the typed bytes even when the target prints nothing, so an
-"empty" reply is not guaranteed; a target that writes nothing at all still
-yields `timed_out`. A reply is not a protocol handshake: no output line is
+driver normally echoes the typed bytes, so a silent target usually returns a
+`settled` reply containing only that echo; only a target that stays silent
+until the deadline (or never goes quiet) reaches `timed_out` with no lines. A reply is not a protocol handshake: no output line is
 correlated with the request, and the target may ignore the message entirely.
 `--timeout 0` performs a single check instead of waiting. `--wait-reply`
 requires a completed write, so `--no-wait` is rejected and a failed write

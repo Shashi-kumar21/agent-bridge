@@ -743,29 +743,29 @@ fn collect_reply(
     let mut settled = false;
     let mut timed_out = false;
     loop {
+        // Observe the close flag before draining: the pump publishes its last
+        // chunk first and stores the flag second, so a `true` load here means
+        // the drain below cannot miss that chunk. Draining first would leave a
+        // window where `try_recv` is empty but the flag is already set.
+        let closed = agent.output_closed();
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Output { data, .. } = event {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+                    buffer.push(&bytes);
+                }
+                saw_output = true;
+                last_output = Instant::now();
+            }
+        }
         let now = Instant::now();
-        if saw_output && now.duration_since(last_output) >= quiet {
+        if closed {
+            // The reader is gone, so nothing else can be published.
             settled = true;
             break;
         }
-        if !agent.is_running() {
-            // Drain what the pump published before it noticed the exit; the
-            // final marker is often emitted only a few milliseconds earlier.
-            while let Ok(event) = rx.try_recv() {
-                if let Event::Output { data, .. } = event {
-                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
-                        buffer.push(&bytes);
-                    }
-                    saw_output = true;
-                    last_output = Instant::now();
-                }
-            }
-            if agent.output_closed() {
-                // The pump stores the flag after its last publish, so the
-                // channel is fully drained at this point.
-                settled = true;
-                break;
-            }
+        if saw_output && now.duration_since(last_output) >= quiet {
+            settled = true;
+            break;
         }
         if now >= deadline {
             timed_out = true;

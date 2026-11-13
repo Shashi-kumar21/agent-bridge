@@ -106,9 +106,10 @@ target is still `busy`, nothing is written and the command fails with the
 prints the ANSI-stripped new lines plus whether the reply `settled` or
 `timed_out`. The daemon keeps at most 64 KiB and 200 lines; `truncated` reports
 dropped bytes. It is best effort: a target that never prints yields an empty
-`timed_out` reply (a Unix PTY may still echo the typed bytes), a failed write
-leaves `reply` null, and a `written` status still only means the PTY accepted
-the bytes. `--wait-reply` conflicts with `--no-wait`; `--timeout 0` checks once
+`timed_out` reply (as does a target that stays silent until the deadline); a
+silent target on a Unix PTY usually returns just the terminal echo, a failed
+write leaves `reply` null, and
+a `written` status still only means the PTY accepted the bytes. `--wait-reply` conflicts with `--no-wait`; `--timeout 0` checks once
 instead of waiting.
 
 `listagents` shows a heuristic **READY** column: `busy`, `idle` or `unknown`

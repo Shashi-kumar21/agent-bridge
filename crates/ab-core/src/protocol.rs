@@ -252,8 +252,10 @@ pub struct Ack {
 ///
 /// Best effort: the daemon subscribes just before the message is queued and
 /// returns the ANSI-stripped tail of the bytes emitted around the write, once
-/// output has been quiet for the agent's configured period. It is not a request/response protocol and a target that
-/// never prints anything yields `timed_out` with no lines.
+/// output has been quiet for the agent's configured period. It is not a
+/// request/response protocol. On a Unix PTY the terminal may echo the typed
+/// bytes, so a silent target can still return a `settled` echo; a target that
+/// stays silent until the deadline yields `timed_out` with no lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reply {
     /// ANSI-stripped trailing lines of the output observed after the write.

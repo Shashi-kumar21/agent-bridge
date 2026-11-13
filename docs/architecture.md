@@ -40,7 +40,7 @@ Module map (`crates/ab-core/src`):
 
 | File | Role |
 | --- | --- |
-| `protocol.rs` | Wire types, `PROTOCOL_VERSION`, name validation (`validate_name`, `:600`) |
+| `protocol.rs` | Wire types, `PROTOCOL_VERSION`, name validation (`validate_name`, `:602`) |
 | `delivery.rs` | Message ids, size limit, payload composition, bounded write queue, writer thread, timeouts |
 | `transport.rs` | Listener/connect, Unix socket permissions, Windows pipe DACL (`:41`) |
 | `daemon.rs` | Accept loop, request handlers, attach streaming |
@@ -68,7 +68,7 @@ Module map (`crates/ab-core/src`):
   (`agent.rs:93-122`): PTY master (resize), child handle, output buffer, message
   history, subscriber list, reaper, and the write-queue handle.
 * Shutdown: `Request::Shutdown` sets an `AtomicBool` (`Inner::shutdown`, `daemon.rs:481-484`); the
-  accept loop observes it, calls `Inner::stop_agents` (`daemon.rs:147-148`,
+  accept loop observes it, calls `Inner::stop_agents` (`daemon.rs:147`, `:177`,
   `:184-193`), which sends Ctrl-C to every agent, force-kills the ones still
   running after ~500 ms (`agent.rs:570-597`), and then lets the process exit.
 
@@ -159,7 +159,7 @@ restart from zero in a new daemon.
    change.
 6. `sendmessage` waits for the terminal status by default; `--no-wait` returns
    after admission. The response is
-   `Sent { target, bytes, message_id, status, reply }` (`protocol.rs:503-519`);
+   `Sent { target, bytes, message_id, status, reply }` (`protocol.rs:505-521`);
    `reply` is `Some` only when `--wait-reply` was requested and the write
    completed, so a failed or abandoned write leaves it `null`. A `written` or
    `awaiting_ack` status means "bytes were accepted by the PTY", never that the
@@ -167,7 +167,7 @@ restart from zero in a new daemon.
    responses carry `bytes: 0` because nothing is confirmed.
 7. `--require-ack` opts into an application-level acknowledgement. The
    receiving integration (a wrapper, or the agent itself with a tool call) sends
-   `Request::Ack { target, id, note }` (`protocol.rs:372-386`); only the
+   `Request::Ack { target, id, note }` (`protocol.rs:374-388`); only the
    recorded target may acknowledge, a write that started (`written`,
    `awaiting_ack` or `unknown`) can be acknowledged, and repeating the request
    is idempotent. An `unknown` write is accepted because the acknowledgement
@@ -190,11 +190,11 @@ restart from zero in a new daemon.
    drains the queued `Event::Output` frames before settling, so the target's
    last line is not lost. The collector retains at most 64 KiB and returns the
    last 200 lines with `settled`/`timed_out`/`truncated` (`Reply`,
-   `protocol.rs:251-271`); `truncated` only reports dropped bytes, not dropped
+   `protocol.rs:251-273`); `truncated` only reports dropped bytes, not dropped
    lines. Each wait uses `--timeout` (default 30 s,
    `delivery.rs:56`, clamped by `MAX_TIMEOUT`); `--wait-reply` is rejected with
    `--no-wait`. The reply is attached to the same `Sent` response
-   (`protocol.rs:503-519`), which is why protocol v7 is required.
+   (`protocol.rs:505-521`), which is why protocol v7 is required.
 9. `MessageStatus` and `Pending` read the same records (`daemon.rs:459-480`).
    Ids, statuses and acknowledgements are per daemon lifetime; a restart clears
    the history.

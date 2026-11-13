@@ -1114,7 +1114,10 @@ fn echo_then_exit_command() -> Vec<String> {
 #[test]
 fn wait_reply_drains_output_from_a_target_that_exits() {
     let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
-    // The old bug was racy (roughly one in five runs), so repeat it.
+    // Force the exit path: with a long quiet period the reply cannot settle on
+    // quiescence, so only draining the reader's last frames can return the
+    // marker. Repeat to cover the publish/close interleaving.
+    std::env::set_var("AGENT_BRIDGE_QUIET_MS", "10000");
     for round in 0..8 {
         let name = format!("one-shot-{round}");
         create_agent_with(&name, echo_then_exit_command());
