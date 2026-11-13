@@ -104,10 +104,11 @@ not typed into a busy terminal. If `--timeout` (default 30s) expires while the
 target is still `busy`, nothing is written and the command fails with the
 `timeout` code. `--wait-reply` waits for output after the write to go quiet and
 prints the ANSI-stripped new lines plus whether the reply `settled` or
-`timed_out`; the daemon keeps at most 64 KiB and 200 lines and flags
-`truncated`. It is best effort: a target that never prints yields an empty
-`timed_out` reply, and a `written` status still only means the PTY accepted the
-bytes. `--wait-reply` conflicts with `--no-wait`; `--timeout 0` checks once
+`timed_out`. The daemon keeps at most 64 KiB and 200 lines; `truncated` reports
+dropped bytes. It is best effort: a target that never prints yields an empty
+`timed_out` reply (a Unix PTY may still echo the typed bytes), a failed write
+leaves `reply` null, and a `written` status still only means the PTY accepted
+the bytes. `--wait-reply` conflicts with `--no-wait`; `--timeout 0` checks once
 instead of waiting.
 
 `listagents` shows a heuristic **READY** column: `busy`, `idle` or `unknown`

@@ -373,9 +373,13 @@ impl Inner {
                 match waited {
                     Ok(outcome) => {
                         let status = settle(outcome.status(), require_ack);
-                        let reply = reply_rx.map(|rx| {
-                            collect_reply(&agent, &rx, agent.readiness_quiet(), wait_timeout)
-                        });
+                        let reply = if matches!(&outcome, delivery::WriteOutcome::Written { .. }) {
+                            reply_rx.map(|rx| {
+                                collect_reply(&agent, rx, agent.readiness_quiet(), wait_timeout)
+                            })
+                        } else {
+                            None
+                        };
                         Ok(Response::Sent {
                             target,
                             bytes: outcome.bytes(),
@@ -727,7 +731,7 @@ fn wait_until_ready(agent: &Agent, timeout: Duration) -> Result<()> {
 /// expires. Best effort: bounded bytes and lines, ANSI stripped.
 fn collect_reply(
     agent: &Agent,
-    rx: &crossbeam_channel::Receiver<Event>,
+    rx: crossbeam_channel::Receiver<Event>,
     quiet: Duration,
     timeout: Duration,
 ) -> Reply {
@@ -745,9 +749,23 @@ fn collect_reply(
             break;
         }
         if !agent.is_running() {
-            // Exiting settles whatever was published before the wait loop.
-            settled = true;
-            break;
+            // Drain what the pump published before it noticed the exit; the
+            // final marker is often emitted only a few milliseconds earlier.
+            while let Ok(event) = rx.try_recv() {
+                if let Event::Output { data, .. } = event {
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+                        buffer.push(&bytes);
+                    }
+                    saw_output = true;
+                    last_output = Instant::now();
+                }
+            }
+            if agent.output_closed() {
+                // The pump stores the flag after its last publish, so the
+                // channel is fully drained at this point.
+                settled = true;
+                break;
+            }
         }
         if now >= deadline {
             timed_out = true;
@@ -769,6 +787,7 @@ fn collect_reply(
             }
         }
     }
+    drop(rx);
     let lines = buffer.tail_lines(MAX_REPLY_LINES);
     Reply {
         lines,

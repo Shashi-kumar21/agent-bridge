@@ -19,8 +19,8 @@ $env:AGENT_BRIDGE_PIPE = "agent-bridge-audit" # PowerShell, Windows isolation
 ## 1. Message delivery is "written" unless the receiver acked it
 
 `sendmessage` writes bytes into the target's PTY and returns
-`Sent { bytes, message_id, status, reply }` (`daemon.rs:250-421`); `reply` is
-empty unless `--wait-reply` is used. The status records
+`Sent { bytes, message_id, status, reply }` (`daemon.rs:250-426`); `reply` is
+`null` unless `--wait-reply` is used and the write completed. The status records
 what the daemon's write path did, not what the target did: the application may
 be mid-render, waiting at a prompt, or not reading at all. A bounded queue and a
 single writer per agent make the *write* orderly, but there is no retry, so
@@ -64,14 +64,14 @@ The remaining gap is the OS write itself: once `write_all` is inside the PTY
 there is no portable way to cancel it. `--write-timeout` (5 s by default, `0`
 waits forever) makes the caller return `unknown`; the writer keeps waiting and
 amends the record to `written`/`failed` when the syscall returns
-(`delivery.rs:486-500`, `daemon.rs:533-566`, `:794-849`). A target that never
+(`delivery.rs:486-500`, `daemon.rs:537-570`, `:812-838`). A target that never
 drains its PTY therefore keeps the in-flight byte reservation and the channel
 fills up behind it until the agent exits or the daemon is restarted; new
 messages to that agent
 eventually fail with `queue_full`.
 
 Urgent jobs (Ctrl-C, `attach` keystrokes) use a separate channel and may pass a
-queued message between writes; they never split a payload (`agent.rs:414-424`).
+queued message between writes; they never split a payload (`agent.rs:423-433`).
 
 ## 3. Multi-line delivery depends on the target application
 
@@ -144,7 +144,7 @@ Roadmap §6 (VT screen model and snapshot).
 ## 5. No byte offset cursor; `seq` counts chunks
 
 `Read` returns the current `seq` (`protocol.rs:491-501`); `Attach --from-seq`
-only decides whether to replay the *whole* retained buffer (`daemon.rs:932`).
+only decides whether to replay the *whole* retained buffer (`daemon.rs:950`).
 Because `seq` increments per PTY chunk, not per byte, callers cannot resume from
 an arbitrary offset, and a replay frame carries the newest `seq` for bytes that
 may include older chunks.
@@ -187,7 +187,7 @@ Tracked as issue
 Buffers, message history, PTY handles and job objects are in-memory only
 (`daemon.rs:100-106`). `daemon restart` stops the daemon, which sends Ctrl-C to
 every agent, force-kills any that are still running after ~500 ms
-(`daemon.rs:184-193`, `agent.rs:561-588`), and then exits; the next daemon
+(`daemon.rs:184-193`, `agent.rs:570-597`), and then exits; the next daemon
 starts empty. There is no session adoption.
 
 ```bash
@@ -218,7 +218,7 @@ agent-bridge sendmessage sh "set -m; sleep 600 &"
 ## 10. Agents inherit the daemon's full environment
 
 The child gets everything the daemon has, plus `TERM` and
-`AGENT_BRIDGE_AGENT` (`agent.rs:156`). Nothing is filtered, so any secret in
+`AGENT_BRIDGE_AGENT` (`agent.rs:157`). Nothing is filtered, so any secret in
 the daemon's environment is present in every agent.
 
 ```bash
@@ -251,7 +251,7 @@ Roadmap §4 (document the endpoints, add per-instance isolation).
 Access control is the endpoint itself: socket `0600` in a `0700` directory, or a
 pipe DACL for owner/`SYSTEM`/Administrators (`transport.rs:79-98`,
 `transport.rs:41`). There is no caller authentication, no per-session policy and
-no audit trail; `from` is an unauthenticated label (`daemon.rs:250-421`).
+no audit trail; `from` is an unauthenticated label (`daemon.rs:250-426`).
 
 ```bash
 agent-bridge kill dev --force        # any local process can do this
@@ -266,14 +266,14 @@ raises or lowers it per agent, clamped to 1 KiB..16 MiB (`buffer.rs:8-32`), and 
 sampled at spawn, so existing agents keep their size. Even at the maximum, older
 bytes are dropped and only the `truncated` flag says so - no byte offset survives.
 An attach client that cannot keep up with 1024 queued events is disconnected
-silently (`agent.rs:35`, `:507-517`, `:521-536`); the CLI sees the stream close,
+silently (`agent.rs:35`, `:518-532`, `:534-551`); the CLI sees the stream close,
 not an error.
 
 Roadmap §3 (explicit drop signalling, offset expiry).
 
 ## 14. Message history is per-agent and bounded at 500
 
-`record_message` keeps the newest 500 entries (`agent.rs:24`, `:475-484`), and
+`record_message` keeps the newest 500 entries (`agent.rs:24`, `:484-493`), and
 the global id-indexed log keeps 2000 (`daemon.rs:26`, `:41-90`). Both are
 in-memory and vanish with the daemon. Ids are unique only for one daemon
 lifetime, so `messagestatus` returns `not_found` after a restart even though the
@@ -302,7 +302,7 @@ Roadmap §6 (resize handling in the screen model).
 ## 17. Readiness is a heuristic, not a prompt detector
 
 `listagents` reports `busy`, `idle` or `unknown` from output quiescence
-(`readiness.rs:94-121`, `agent.rs:329-345`). A command that prints one visible
+(`readiness.rs:94-121`, `agent.rs:338-354`). A command that prints one visible
 line and then runs silently for longer than `AGENT_BRIDGE_QUIET_MS` (default
 500 ms) is reported `idle` even while it is still running; a command that never
 prints a visible line (terminal control sequences alone do not count) stays
@@ -319,7 +319,7 @@ Roadmap §3 (heuristic readiness with documented caveats).
 ## 18. `--wait-idle` and `--wait-reply` are best-effort heuristics
 
 `--wait-idle` polls the same readiness signal as `listagents`
-(`daemon.rs:705-723`, `readiness.rs:94-121`), so every caveat in §17 applies: a
+(`daemon.rs:709-727`, `readiness.rs:94-121`), so every caveat in §17 applies: a
 target that printed once and then runs silently looks idle, and one that keeps
 redrawing never becomes idle. `unknown` is treated as ready so a fresh shell is
 not blocked, which also means an agent whose startup produced only control
@@ -327,14 +327,23 @@ sequences is written to immediately. On timeout the daemon fails with `timeout`
 and writes nothing; the message is not queued and no id is recorded.
 
 `--wait-reply` subscribes before the message is queued and collects
-`Event::Output` until the agent's configured quiet period passes, the agent
-exits, the channel closes, or the deadline expires (`daemon.rs:728-780`). It
-keeps at most 64 KiB and returns the last 200 lines, setting `truncated` when
-older bytes were dropped. It stops at the first quiet gap, so a target that
-pauses mid-task returns a partial reply, and output already retained before the
-write is not included. A reply is not a protocol handshake: no output line is
+`Event::Output` until the agent's configured quiet period passes, the PTY reader
+closes after an exit, the channel closes, or the deadline expires
+(`daemon.rs:732-798`). When the target exits, the queued output frames are
+drained before the reply is marked `settled`, so a marker printed just before
+the exit is still returned. If the child exits while a descendant keeps the PTY
+open, the reader never closes, so the reply waits for the deadline and reports
+`timed_out` with the lines seen so far. It keeps at most 64 KiB and returns the last 200
+lines; `truncated` only reports dropped bytes, so a reply can hold fewer than
+200 lines between the byte cap and the line cap. It stops at the first quiet
+gap, so a target that pauses mid-task returns a partial reply, and output
+already retained before the write is not included. On a Unix PTY the terminal
+driver may echo the typed bytes even when the target prints nothing, so an
+"empty" reply is not guaranteed; a target that writes nothing at all still
+yields `timed_out`. A reply is not a protocol handshake: no output line is
 correlated with the request, and the target may ignore the message entirely.
 `--timeout 0` performs a single check instead of waiting. `--wait-reply`
-requires a completed write, so `--no-wait` is rejected.
+requires a completed write, so `--no-wait` is rejected and a failed write
+returns no reply at all rather than an empty one.
 
 Roadmap §3 (`--wait-idle` / `--wait-reply`).

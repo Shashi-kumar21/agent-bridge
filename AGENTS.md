@@ -103,8 +103,9 @@ A PR is ready for QA only when **all** of these are true:
   `wait_idle` polls readiness and proceeds on `idle` or `unknown`; a timeout
   must fail with `timeout` and write nothing. `wait_reply` subscribes just
   before the enqueue and returns output observed around the write, bounded to
-  64 KiB / 200 lines, with explicit `settled`/`timed_out`/`truncated`; never
-  claim it proves the application processed the message. Each wait uses
+  64 KiB / 200 lines, with explicit `settled`/`timed_out`/`truncated`; it drains
+  queued output before settling on an exit and is only attached to a successful
+  write. Never claim it proves the application processed the message. Each wait uses
   `--timeout` (default 30 s, `0` checks once) and needs a protocol bump when
   added to the wire.
 * Delivery statuses are deliberately narrow: `written`/`awaiting_ack` mean the

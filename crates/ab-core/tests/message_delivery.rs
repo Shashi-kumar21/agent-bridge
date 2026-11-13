@@ -1088,3 +1088,106 @@ fn wait_reply_times_out_on_a_silent_target() {
     }
     kill("mute");
 }
+
+/// Reads one line from the PTY, prints a marker and exits immediately.
+fn echo_then_exit_command() -> Vec<String> {
+    if cfg!(windows) {
+        let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+        vec![
+            shell,
+            "/v:on".to_string(),
+            "/c".to_string(),
+            "set /p x= & echo GOT-!x!".to_string(),
+        ]
+    } else {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "read x; echo GOT-$x".to_string(),
+        ]
+    }
+}
+
+/// The PTY pump can publish the target's last line at the same moment the child
+/// exits. `--wait-reply` must drain that output before settling, otherwise the
+/// caller sees `settled` with only the terminal echo.
+#[test]
+fn wait_reply_drains_output_from_a_target_that_exits() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    // The old bug was racy (roughly one in five runs), so repeat it.
+    for round in 0..8 {
+        let name = format!("one-shot-{round}");
+        create_agent_with(&name, echo_then_exit_command());
+        let marker = format!("final-{round}");
+        let response = send_waiting(&name, marker.clone(), false, true, 15_000);
+        match response {
+            Response::Sent { status, reply, .. } => {
+                assert_eq!(status, DeliveryStatus::Written);
+                let reply = reply.expect("wait-reply must attach a reply");
+                assert!(
+                    reply.settled,
+                    "round {round}: expected settled, got {reply:?}"
+                );
+                assert!(!reply.timed_out, "round {round}: unexpected timeout");
+                let text = reply.lines.join("\n");
+                assert!(
+                    text.contains(&format!("GOT-{marker}")),
+                    "round {round}: the final marker was dropped: {reply:?}"
+                );
+            }
+            other => panic!("round {round}: expected a sent response, got {other:?}"),
+        }
+    }
+}
+
+/// `unknown` readiness counts as ready, so a fresh silent target is written to
+/// immediately instead of blocking until the deadline.
+#[test]
+fn wait_idle_proceeds_on_an_unknown_target() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent_with("quiet", silent_command());
+    assert_eq!(agent_info("quiet").readiness, Readiness::Unknown);
+
+    let started = Instant::now();
+    let response = send_waiting("quiet", "hello".to_string(), true, false, 10_000);
+    let elapsed = started.elapsed();
+    match response {
+        Response::Sent { status, .. } => assert_eq!(status, DeliveryStatus::Written),
+        other => panic!("expected a sent response, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "an unknown target must not wait for the deadline, took {elapsed:?}"
+    );
+    kill("quiet");
+}
+
+/// `wait_reply` needs a completed write; `wait: false` is a conflict and
+/// nothing is recorded.
+#[test]
+fn wait_reply_requires_a_completed_write() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent("no-wait");
+
+    let response = client::request(&Request::Send {
+        target: "no-wait".to_string(),
+        message: "echo nope".to_string(),
+        enter: Some(true),
+        from: None,
+        queue_timeout_ms: None,
+        write_timeout_ms: None,
+        wait: Some(false),
+        paste: None,
+        require_ack: None,
+        wait_idle: None,
+        wait_reply: Some(true),
+        timeout_ms: None,
+    })
+    .expect("send");
+    match response {
+        Response::Error { code, .. } => assert_eq!(code, ErrorCode::Conflict),
+        other => panic!("expected a conflict response, got {other:?}"),
+    }
+    assert_eq!(agent_info("no-wait").message_count, 0);
+    kill("no-wait");
+}

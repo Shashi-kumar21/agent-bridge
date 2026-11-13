@@ -100,6 +100,7 @@ pub struct Agent {
     cols: AtomicU16,
     rows: AtomicU16,
     running: Arc<AtomicBool>,
+    output_closed: AtomicBool,
     exit_code: Mutex<Option<i32>>,
     exited_at: Mutex<Option<Millis>>,
     last_output_at: Mutex<Option<Millis>>,
@@ -191,6 +192,7 @@ impl Agent {
             cols: AtomicU16::new(config.cols),
             rows: AtomicU16::new(config.rows),
             running,
+            output_closed: AtomicBool::new(false),
             exit_code: Mutex::new(None),
             exited_at: Mutex::new(None),
             last_output_at: Mutex::new(None),
@@ -247,7 +249,14 @@ impl Agent {
                 }
             }
         }
+        self.output_closed.store(true, Ordering::SeqCst);
         debug!(agent = %self.name, "pty reader closed");
+    }
+
+    /// True once the PTY reader has stopped and published its last chunk.
+    #[must_use]
+    pub fn output_closed(&self) -> bool {
+        self.output_closed.load(Ordering::SeqCst)
     }
 
     fn wait_child(&self) {
