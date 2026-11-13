@@ -81,10 +81,11 @@ impl ReadinessConfig {
 
     /// Classify one observation.
     ///
-    /// A stopped agent and an agent that has never produced output are
-    /// `unknown`. A configured prompt suffix on the newest line is an early
-    /// `idle` signal; otherwise output newer than the quiet period is `busy`
-    /// and older output is `idle`.
+    /// A stopped agent and an agent without a visible output line are
+    /// `unknown` - terminal control sequences alone are not output. A
+    /// configured prompt suffix on the newest line is an early `idle` signal;
+    /// otherwise output newer than the quiet period is `busy` and older output
+    /// is `idle`.
     #[must_use]
     pub fn classify(
         &self,
@@ -96,7 +97,10 @@ impl ReadinessConfig {
         if !running {
             return Readiness::Unknown;
         }
-        if let (Some(prompt), Some(line)) = (self.prompt.as_deref(), last_line) {
+        let Some(line) = last_line else {
+            return Readiness::Unknown;
+        };
+        if let Some(prompt) = self.prompt.as_deref() {
             if line.trim_end().ends_with(prompt) {
                 return Readiness::Idle;
             }
@@ -123,27 +127,35 @@ mod tests {
     }
 
     #[test]
-    fn unknown_without_a_process_or_output() {
+    fn unknown_without_a_process_or_visible_output() {
         let config = config(500);
         assert_eq!(
-            config.classify(false, Some(1), None, 1_000),
+            config.classify(false, Some(1), Some("done"), 1_000),
             Readiness::Unknown
         );
         assert_eq!(config.classify(true, None, None, 1_000), Readiness::Unknown);
+        assert_eq!(
+            config.classify(true, Some(999), None, 1_000),
+            Readiness::Unknown,
+            "control bytes alone do not make an agent busy"
+        );
     }
 
     #[test]
     fn recent_output_is_busy_and_quiet_output_is_idle() {
         let config = config(500);
         assert_eq!(
-            config.classify(true, Some(900), None, 1_000),
+            config.classify(true, Some(900), Some("building"), 1_000),
             Readiness::Busy
         );
         assert_eq!(
-            config.classify(true, Some(500), None, 1_000),
+            config.classify(true, Some(500), Some("building"), 1_000),
             Readiness::Idle
         );
-        assert_eq!(config.classify(true, Some(1), None, 1_000), Readiness::Idle);
+        assert_eq!(
+            config.classify(true, Some(1), Some("building"), 1_000),
+            Readiness::Idle
+        );
     }
 
     #[test]

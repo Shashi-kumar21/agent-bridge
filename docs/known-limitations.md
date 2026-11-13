@@ -301,7 +301,7 @@ Roadmap §6 (resize handling in the screen model).
 ## 17. Readiness is a heuristic, not a prompt detector
 
 `listagents` reports `busy`, `idle` or `unknown` from output quiescence
-(`readiness.rs:89-113`, `agent.rs:328-347`). A command that prints nothing
+(`readiness.rs:90-117`, `agent.rs:329-345`). A command that prints nothing
 for longer than `AGENT_BRIDGE_QUIET_MS` (default 500 ms) is reported `idle`
 even while it is still running, and an application that redraws a spinner is
 `busy` forever. The optional literal `AGENT_BRIDGE_PROMPT_PATTERN` suffix only

@@ -92,7 +92,7 @@ pub enum Readiness {
     /// Output has been quiet for the configured period, or the configured
     /// prompt suffix matched the newest line.
     Idle,
-    /// Not running, or no output has been observed yet.
+    /// Not running, or no visible output line has been observed yet.
     #[default]
     Unknown,
 }

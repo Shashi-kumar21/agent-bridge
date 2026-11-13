@@ -108,11 +108,12 @@ pipelining: a second request on the same connection is never read.
    (`daemon.rs:841-872`). Because the replay and the live stream can repeat a
    sequence number, clients drop non-increasing `seq` (`client.rs:79-83`).
 7. Readiness is derived per request from this stream (`Agent::readiness`,
-   `agent.rs:328-347`): output newer than `AGENT_BRIDGE_QUIET_MS` (default
+   `agent.rs:329-345`): output newer than `AGENT_BRIDGE_QUIET_MS` (default
    500 ms) is `busy`, older output is `idle`, and an optional
    `AGENT_BRIDGE_PROMPT_PATTERN` literal suffix on the newest line marks `idle`
-   early (`readiness.rs:89-113`). A stopped agent, or one that has never
-   produced output, is `unknown`. This is a heuristic, never a guarantee.
+   early (`readiness.rs:90-117`). A stopped agent, or one without a visible
+   output line (control sequences alone do not count), is `unknown`. This is
+   a heuristic, never a guarantee.
    Retained output is 256 KiB by default; `AGENT_BRIDGE_BUFFER_BYTES` clamps a
    per-agent override to 1 KiB..16 MiB (`buffer.rs:6-29`).
 

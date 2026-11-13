@@ -323,17 +323,15 @@ impl Agent {
     ///
     /// Never a guarantee: a silent command that runs longer than the quiet
     /// period is reported `idle`, and a prompt that does not reprint cannot be
-    /// detected without a configured suffix.
+    /// detected without a configured suffix. Terminal control sequences alone
+    /// are not output; such an agent stays `unknown`.
     #[must_use]
     pub fn readiness(&self) -> Readiness {
-        let last_line = if self.readiness.prompt().is_some() {
-            self.buffer
-                .lock()
-                .ok()
-                .and_then(|buffer| buffer.last_line(PROMPT_SCAN_BYTES))
-        } else {
-            None
-        };
+        let last_line = self
+            .buffer
+            .lock()
+            .ok()
+            .and_then(|buffer| buffer.last_line(PROMPT_SCAN_BYTES));
         let last_output_at = *self
             .last_output_at
             .lock()
