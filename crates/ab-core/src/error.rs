@@ -64,6 +64,15 @@ pub enum BridgeError {
     #[error("{0}")]
     Conflict(String),
 
+    /// A `--wait-idle` deadline expired while the target was still busy.
+    #[error("agent '{target}' stayed busy for {millis} ms")]
+    WaitIdleTimeout {
+        /// Target agent name.
+        target: String,
+        /// Deadline that expired.
+        millis: u64,
+    },
+
     /// Generic daemon-side failure.
     #[error("{0}")]
     Daemon(String),
@@ -81,6 +90,7 @@ impl BridgeError {
             Self::Conflict(_) => ErrorCode::Conflict,
             Self::InvalidName(_) | Self::Protocol(_) => ErrorCode::BadRequest,
             Self::MessageTooLarge { .. } => ErrorCode::TooLarge,
+            Self::WaitIdleTimeout { .. } => ErrorCode::Timeout,
             Self::DaemonNotRunning(_) | Self::Daemon(_) => ErrorCode::NotRunning,
             Self::Io(_) => ErrorCode::Internal,
         }

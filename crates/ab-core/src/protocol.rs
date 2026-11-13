@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the wire shape changes. New `cmd`/`event` tags are unknown
 /// to older daemons, so additive changes bump it too; the CLI compares it for
 /// equality and restarts a daemon only when no agent is live.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Default terminal width for spawned agents.
 pub const DEFAULT_COLS: u16 = 120;
@@ -248,6 +248,30 @@ pub struct Ack {
     pub note: Option<String>,
 }
 
+/// Output collected after a write while `wait_reply` was requested.
+///
+/// Best effort: the daemon subscribes just before the message is queued and
+/// returns the ANSI-stripped tail of the bytes emitted around the write, once
+/// output has been quiet for the agent's configured period. It is not a
+/// request/response protocol. On a Unix PTY the terminal may echo the typed
+/// bytes, so a silent target can still return a `settled` echo; a target that
+/// stays silent until the deadline yields `timed_out` with no lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reply {
+    /// ANSI-stripped trailing lines of the output observed after the write.
+    #[serde(default)]
+    pub lines: Vec<String>,
+    /// True when output went quiet before the deadline (or the agent exited).
+    #[serde(default)]
+    pub settled: bool,
+    /// True when the deadline expired before output settled.
+    #[serde(default)]
+    pub timed_out: bool,
+    /// True when older collected bytes were dropped to keep the reply bounded.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 /// One inter-agent message and its delivery status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -333,6 +357,19 @@ pub enum Request {
         /// status becomes `awaiting_ack` after the write instead of `written`.
         #[serde(default)]
         require_ack: Option<bool>,
+        /// Wait for the target to stop being `busy` before queueing the
+        /// message. `unknown` (no visible output yet) counts as ready. On
+        /// timeout nothing is written and the request fails with `timeout`.
+        #[serde(default)]
+        wait_idle: Option<bool>,
+        /// After a successful write, collect output until it settles and
+        /// return it in the `Sent.reply` field.
+        #[serde(default)]
+        wait_reply: Option<bool>,
+        /// Deadline for `wait_idle` and `wait_reply`, in milliseconds.
+        /// Defaults to 30 s and is clamped by the daemon's maximum timeout.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
     },
     /// Acknowledge a message the receiving integration has processed.
     ///
@@ -477,6 +514,10 @@ pub enum Response {
         /// Status at the time the response was sent.
         #[serde(default)]
         status: DeliveryStatus,
+        /// Output collected after the write when `wait_reply` was requested
+        /// (v1-v6 daemons never send one).
+        #[serde(default)]
+        reply: Option<Reply>,
     },
     /// One message record.
     Message {
@@ -570,7 +611,7 @@ pub fn validate_name(name: &str) -> bool {
 mod tests {
     use super::{
         validate_name, AgentInfo, DeliveryStatus, ErrorCode, Event, Message, PasteMode, Readiness,
-        Request, Response, PROTOCOL_VERSION,
+        Reply, Request, Response, PROTOCOL_VERSION,
     };
 
     #[test]
@@ -609,8 +650,19 @@ mod tests {
     }
 
     #[test]
-    fn protocol_is_six() {
-        assert_eq!(PROTOCOL_VERSION, 6);
+    fn protocol_is_seven() {
+        assert_eq!(PROTOCOL_VERSION, 7);
+    }
+
+    /// A `sent` frame from a daemon that predates `reply` parses as `None`.
+    #[test]
+    fn legacy_sent_frame_has_no_reply() {
+        let legacy = r#"{"kind":"sent","target":"dev","bytes":5,"message_id":1,"status":{"state":"written"}}"#;
+        let parsed: Response = serde_json::from_str(legacy).expect("legacy sent");
+        match parsed {
+            Response::Sent { reply, .. } => assert_eq!(reply, None),
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 
     /// An agent frame from a daemon that predates `readiness` is `unknown`.
@@ -676,6 +728,12 @@ mod tests {
             bytes: 3,
             message_id: 42,
             status: DeliveryStatus::Written,
+            reply: Some(Reply {
+                lines: vec!["done".to_string()],
+                settled: true,
+                timed_out: false,
+                truncated: false,
+            }),
         };
         let json = serde_json::to_string(&sent).expect("serialize");
         let parsed: Response = serde_json::from_str(&json).expect("deserialize");
@@ -684,11 +742,17 @@ mod tests {
                 message_id,
                 status,
                 bytes,
+                reply,
                 ..
             } => {
                 assert_eq!(message_id, 42);
                 assert_eq!(bytes, 3);
                 assert_eq!(status, DeliveryStatus::Written);
+                let reply = reply.expect("reply present");
+                assert_eq!(reply.lines, ["done"]);
+                assert!(reply.settled);
+                assert!(!reply.timed_out);
+                assert!(!reply.truncated);
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -735,6 +799,9 @@ mod tests {
                 wait,
                 paste,
                 require_ack,
+                wait_idle,
+                wait_reply,
+                timeout_ms,
             } => {
                 assert_eq!(target, "dev");
                 assert_eq!(message, "hi");
@@ -745,6 +812,9 @@ mod tests {
                 assert_eq!(wait, None);
                 assert_eq!(paste, None);
                 assert_eq!(require_ack, None);
+                assert_eq!(wait_idle, None);
+                assert_eq!(wait_reply, None);
+                assert_eq!(timeout_ms, None);
             }
             other => panic!("unexpected request: {other:?}"),
         }
@@ -762,12 +832,18 @@ mod tests {
             wait: Some(false),
             paste: Some(PasteMode::Bracketed),
             require_ack: Some(true),
+            wait_idle: Some(true),
+            wait_reply: Some(true),
+            timeout_ms: Some(2_000),
         };
         let json = serde_json::to_string(&request).expect("serialize");
         assert!(json.contains("\"queue_timeout_ms\":250"));
         assert!(json.contains("\"wait\":false"));
         assert!(json.contains("\"paste\":\"bracketed\""));
         assert!(json.contains("\"require_ack\":true"));
+        assert!(json.contains("\"wait_idle\":true"));
+        assert!(json.contains("\"wait_reply\":true"));
+        assert!(json.contains("\"timeout_ms\":2000"));
         let parsed: Request = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(
             parsed,
@@ -777,6 +853,9 @@ mod tests {
                 wait: Some(false),
                 paste: Some(PasteMode::Bracketed),
                 require_ack: Some(true),
+                wait_idle: Some(true),
+                wait_reply: Some(true),
+                timeout_ms: Some(2_000),
                 ..
             }
         ));

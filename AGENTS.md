@@ -99,6 +99,15 @@ A PR is ready for QA only when **all** of these are true:
   must change whenever `Request`/`Response` changes incompatibly, including
   when a new field changes behaviour and an old daemon would silently ignore it
   (for example `Send.require_ack`).
+* `wait_idle` and `wait_reply` are best-effort heuristics, not a handshake.
+  `wait_idle` polls readiness and proceeds on `idle` or `unknown`; a timeout
+  must fail with `timeout` and write nothing. `wait_reply` subscribes just
+  before the enqueue and returns output observed around the write, bounded to
+  64 KiB / 200 lines, with explicit `settled`/`timed_out`/`truncated`; it drains
+  queued output before settling on an exit and is only attached to a successful
+  write. Never claim it proves the application processed the message. Each wait uses
+  `--timeout` (default 30 s, `0` checks once) and needs a protocol bump when
+  added to the wire.
 * Delivery statuses are deliberately narrow: `written`/`awaiting_ack` mean the
   PTY accepted the bytes. Only an explicit `Request::Ack` from the target makes
   a message `acknowledged`; never infer one from output. An ack is

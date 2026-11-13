@@ -88,6 +88,9 @@ fn send_message(target: &str, message: &str) -> u64 {
         wait: None,
         paste: None,
         require_ack: None,
+        wait_idle: None,
+        wait_reply: None,
+        timeout_ms: None,
     })
     .expect("send message");
     match sent {
@@ -154,6 +157,9 @@ fn assert_oversize_rejected() {
         wait: None,
         paste: None,
         require_ack: None,
+        wait_idle: None,
+        wait_reply: None,
+        timeout_ms: None,
     })
     .expect("oversize send");
     std::env::remove_var("AGENT_BRIDGE_MAX_MESSAGE");

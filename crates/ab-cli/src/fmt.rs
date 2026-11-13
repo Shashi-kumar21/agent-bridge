@@ -2,7 +2,9 @@
 
 use std::fmt::Write as _;
 
-use agent_bridge_core::protocol::{AgentInfo, AgentStatus, DeliveryStatus, Message, Readiness};
+use agent_bridge_core::protocol::{
+    AgentInfo, AgentStatus, DeliveryStatus, Message, Readiness, Reply,
+};
 
 /// Format a timestamp as a coarse age ("4s ago").
 #[must_use]
@@ -131,6 +133,22 @@ pub fn status_line(status: &DeliveryStatus) -> String {
             format!("failed ({}): {detail}", code.label())
         }
         other => other.label().to_string(),
+    }
+}
+
+/// Print the output collected by `sendmessage --wait-reply`.
+pub fn print_reply(reply: &Reply) {
+    let state = if reply.timed_out {
+        "timed out"
+    } else if reply.settled {
+        "settled"
+    } else {
+        "unsettled"
+    };
+    let truncated = if reply.truncated { ", truncated" } else { "" };
+    println!("reply ({state}, {} lines{truncated}):", reply.lines.len());
+    for line in &reply.lines {
+        println!("{line}");
     }
 }
 

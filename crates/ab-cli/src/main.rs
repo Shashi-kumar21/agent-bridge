@@ -79,6 +79,16 @@ enum Command {
         /// status becomes `awaiting_ack` instead of `written`.
         #[arg(long)]
         require_ack: bool,
+        /// Wait until the target is not busy before sending. On timeout
+        /// nothing is written and the command fails.
+        #[arg(long)]
+        wait_idle: bool,
+        /// After the write, wait for output to settle and print the new lines.
+        #[arg(long, conflicts_with = "no_wait")]
+        wait_reply: bool,
+        /// Deadline for `--wait-idle` and `--wait-reply` (`0` = check once).
+        #[arg(long, default_value = "30s", value_parser = parse_timeout)]
+        timeout: Duration,
     },
     /// Spawn a new agent inside a daemon-owned PTY.
     New {
@@ -222,6 +232,9 @@ fn run(cli: Cli) -> Result<()> {
             no_wait,
             paste,
             require_ack,
+            wait_idle,
+            wait_reply,
+            timeout,
         } => {
             ensure_daemon(true)?;
             let text = message.join(" ");
@@ -235,6 +248,9 @@ fn run(cli: Cli) -> Result<()> {
                 wait: Some(!no_wait),
                 paste: Some(paste),
                 require_ack: Some(require_ack),
+                wait_idle: Some(wait_idle),
+                wait_reply: Some(wait_reply),
+                timeout_ms: Some(duration_millis(timeout)),
             })?;
             let failure = match &response {
                 Response::Sent {
@@ -251,6 +267,7 @@ fn run(cli: Cli) -> Result<()> {
                 bytes,
                 message_id,
                 status,
+                reply,
             } = &response
             {
                 if failure.is_none() {
@@ -265,6 +282,9 @@ fn run(cli: Cli) -> Result<()> {
                             "sent msg {message_id} to {target} ({})",
                             fmt::status_line(status)
                         );
+                    }
+                    if let Some(reply) = reply {
+                        fmt::print_reply(reply);
                     }
                 }
             } else {
@@ -437,6 +457,7 @@ fn emit(response: Response, json: bool) -> Result<()> {
             bytes,
             message_id,
             status,
+            ..
         } => println!(
             "sent msg {message_id} to {target} ({}, {bytes} bytes)",
             fmt::status_line(&status)
@@ -690,6 +711,9 @@ mod tests {
                 no_wait,
                 paste,
                 require_ack,
+                wait_idle,
+                wait_reply,
+                timeout,
             } => {
                 assert_eq!(target, "dev");
                 assert_eq!(message, ["hello", "world"]);
@@ -700,6 +724,9 @@ mod tests {
                 assert!(!no_wait);
                 assert_eq!(paste, PasteMode::Auto);
                 assert!(!require_ack);
+                assert!(!wait_idle);
+                assert!(!wait_reply);
+                assert_eq!(timeout, Duration::from_secs(30));
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -734,6 +761,47 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sendmessage_parses_wait_idle_and_reply() {
+        let cli = Cli::try_parse_from([
+            "agent-bridge",
+            "sendmessage",
+            "dev",
+            "--wait-idle",
+            "--wait-reply",
+            "--timeout",
+            "2s",
+            "hi",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Sendmessage {
+                wait_idle,
+                wait_reply,
+                timeout,
+                ..
+            } => {
+                assert!(wait_idle);
+                assert!(wait_reply);
+                assert_eq!(timeout, Duration::from_secs(2));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_reply_conflicts_with_no_wait() {
+        let parsed = Cli::try_parse_from([
+            "agent-bridge",
+            "sendmessage",
+            "dev",
+            "--wait-reply",
+            "--no-wait",
+            "hi",
+        ]);
+        assert!(parsed.is_err(), "wait-reply needs the write to finish");
     }
 
     #[test]
