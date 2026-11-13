@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use crossbeam_channel::select;
@@ -14,11 +14,12 @@ use interprocess::local_socket::Stream;
 use tracing::{debug, error, info};
 
 use crate::agent::{Agent, SpawnConfig};
+use crate::buffer::OutputBuffer;
 use crate::delivery::{self, JobEvent};
 use crate::error::{BridgeError, Result};
 use crate::protocol::{
     validate_name, Ack, AgentInfo, DeliveryStatus, ErrorCode, Event, Message, MessageId, Millis,
-    Request, Response, DEFAULT_COLS, DEFAULT_ROWS, PROTOCOL_VERSION,
+    Readiness, Reply, Request, Response, DEFAULT_COLS, DEFAULT_ROWS, PROTOCOL_VERSION,
 };
 use crate::transport;
 
@@ -28,6 +29,14 @@ const MAX_LOG: usize = 2000;
 /// history stays bounded.
 const MAX_ACK_NOTE: usize = 1024;
 const HEARTBEAT: Duration = Duration::from_secs(10);
+/// How long `wait_idle` sleeps between readiness checks.
+const IDLE_POLL: Duration = Duration::from_millis(25);
+/// How often the `wait_reply` collector wakes without output.
+const REPLY_POLL: Duration = Duration::from_millis(25);
+/// Retained bytes for one collected reply.
+const MAX_REPLY_BYTES: usize = 64 * 1024;
+/// Trailing lines returned for one collected reply.
+const MAX_REPLY_LINES: usize = 200;
 
 /// Bounded, id-indexed message history.
 struct MessageLog {
@@ -248,10 +257,23 @@ impl Inner {
                 wait,
                 paste,
                 require_ack,
+                wait_idle,
+                wait_reply,
+                timeout_ms,
             } => {
                 let agent = self.get(&target)?;
                 let enter = enter.unwrap_or(true);
                 let require_ack = require_ack.unwrap_or(false);
+                let wait = wait.unwrap_or(true);
+                let wait_idle = wait_idle.unwrap_or(false);
+                let wait_reply = wait_reply.unwrap_or(false);
+                if wait_reply && !wait {
+                    return Err(BridgeError::Conflict(
+                        "wait_reply requires waiting for the write".to_string(),
+                    ));
+                }
+                let wait_timeout =
+                    delivery::timeout_from_millis(timeout_ms, delivery::DEFAULT_WAIT_TIMEOUT);
                 let payload = delivery::compose_payload(
                     &message,
                     enter,
@@ -266,6 +288,11 @@ impl Inner {
                         env: delivery::MAX_MESSAGE_ENV,
                     });
                 }
+
+                if wait_idle {
+                    wait_until_ready(&agent, wait_timeout)?;
+                }
+                let reply_rx = wait_reply.then(|| agent.subscribe());
 
                 let id = delivery::next_message_id();
                 let now = crate::now_ms();
@@ -284,7 +311,6 @@ impl Inner {
                 agent.record_message(record.clone());
                 agent_publish(&agent, &record);
 
-                let wait = wait.unwrap_or(true);
                 let queue_timeout = delivery::timeout_from_millis(
                     queue_timeout_ms,
                     delivery::DEFAULT_QUEUE_TIMEOUT,
@@ -309,6 +335,7 @@ impl Inner {
                         bytes: 0,
                         message_id: id,
                         status,
+                        reply: None,
                     });
                 }
 
@@ -324,6 +351,7 @@ impl Inner {
                         bytes,
                         message_id: id,
                         status,
+                        reply: None,
                     });
                 }
 
@@ -343,12 +371,19 @@ impl Inner {
                     }
                 };
                 match waited {
-                    Ok(outcome) => Ok(Response::Sent {
-                        target,
-                        bytes: outcome.bytes(),
-                        message_id: id,
-                        status: settle(outcome.status(), require_ack),
-                    }),
+                    Ok(outcome) => {
+                        let status = settle(outcome.status(), require_ack);
+                        let reply = reply_rx.map(|rx| {
+                            collect_reply(&agent, &rx, agent.readiness_quiet(), wait_timeout)
+                        });
+                        Ok(Response::Sent {
+                            target,
+                            bytes: outcome.bytes(),
+                            message_id: id,
+                            status,
+                            reply,
+                        })
+                    }
                     Err(WaitError::Timeout) => {
                         let status =
                             settle(self.status_on_timeout(&agent, &target, id), require_ack);
@@ -364,6 +399,7 @@ impl Inner {
                             bytes,
                             message_id: id,
                             status,
+                            reply: None,
                         })
                     }
                     Err(WaitError::Closed) => {
@@ -379,6 +415,7 @@ impl Inner {
                             bytes: 0,
                             message_id: id,
                             status,
+                            reply: None,
                         })
                     }
                 }
@@ -658,6 +695,87 @@ fn apply_writing(messages: &Mutex<MessageLog>, id: MessageId, notify: StatusNoti
     record.bytes = 0;
     record.updated_at = at;
     notify(DeliveryStatus::Writing, 0, at);
+}
+
+/// Block until the target is not `busy`, or the deadline expires.
+///
+/// `unknown` (no visible line yet) counts as ready so a fresh shell is not
+/// blocked forever. A busy target that never settles fails the send instead of
+/// typing into a running command.
+fn wait_until_ready(agent: &Agent, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        match agent.readiness() {
+            Readiness::Busy => {}
+            _ => return Ok(()),
+        }
+        if started.elapsed() >= timeout {
+            return Err(BridgeError::WaitIdleTimeout {
+                target: agent.name().to_string(),
+                millis: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            });
+        }
+        if !agent.is_running() {
+            return Err(BridgeError::AgentExited(agent.name().to_string()));
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        thread::sleep(IDLE_POLL.min(remaining));
+    }
+}
+
+/// Collect output published after the write until it settles or the deadline
+/// expires. Best effort: bounded bytes and lines, ANSI stripped.
+fn collect_reply(
+    agent: &Agent,
+    rx: &crossbeam_channel::Receiver<Event>,
+    quiet: Duration,
+    timeout: Duration,
+) -> Reply {
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut buffer = OutputBuffer::new(MAX_REPLY_BYTES);
+    let mut last_output = started;
+    let mut saw_output = false;
+    let mut settled = false;
+    let mut timed_out = false;
+    loop {
+        let now = Instant::now();
+        if saw_output && now.duration_since(last_output) >= quiet {
+            settled = true;
+            break;
+        }
+        if !agent.is_running() {
+            // Exiting settles whatever was published before the wait loop.
+            settled = true;
+            break;
+        }
+        if now >= deadline {
+            timed_out = true;
+            break;
+        }
+        let wait = deadline.saturating_duration_since(now).min(REPLY_POLL);
+        match rx.recv_timeout(wait) {
+            Ok(Event::Output { data, .. }) => {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+                    buffer.push(&bytes);
+                }
+                saw_output = true;
+                last_output = Instant::now();
+            }
+            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                settled = true;
+                break;
+            }
+        }
+    }
+    let lines = buffer.tail_lines(MAX_REPLY_LINES);
+    Reply {
+        lines,
+        settled,
+        timed_out,
+        truncated: buffer.truncated(),
+    }
 }
 
 /// Final status for a completed write.

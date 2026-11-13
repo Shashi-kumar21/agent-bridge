@@ -456,6 +456,12 @@ impl Agent {
             .map_or_else(|e| e.into_inner().bytes(), |b| b.bytes())
     }
 
+    /// Configured quiet period used to classify readiness.
+    #[must_use]
+    pub fn readiness_quiet(&self) -> Duration {
+        self.readiness.quiet()
+    }
+
     /// Trailing output lines with ANSI removed.
     #[must_use]
     pub fn tail_lines(&self, lines: usize) -> (Vec<String>, bool) {

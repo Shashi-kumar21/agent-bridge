@@ -98,6 +98,18 @@ and idempotent; it reports that the integration saw the message, not that the
 application understood or completed the request. `written`, `awaiting_ack` and
 `acknowledged` are the only statuses that mean the bytes reached the PTY.
 
+`sendmessage --wait-idle` holds the message until the target reports `idle` or
+`unknown` (a fresh agent with no visible output is not blocked), so a command is
+not typed into a busy terminal. If `--timeout` (default 30s) expires while the
+target is still `busy`, nothing is written and the command fails with the
+`timeout` code. `--wait-reply` waits for output after the write to go quiet and
+prints the ANSI-stripped new lines plus whether the reply `settled` or
+`timed_out`; the daemon keeps at most 64 KiB and 200 lines and flags
+`truncated`. It is best effort: a target that never prints yields an empty
+`timed_out` reply, and a `written` status still only means the PTY accepted the
+bytes. `--wait-reply` conflicts with `--no-wait`; `--timeout 0` checks once
+instead of waiting.
+
 `listagents` shows a heuristic **READY** column: `busy`, `idle` or `unknown`
 (`listagents --json` reports `readiness`). Output that arrived within the quiet
 period is `busy`; an agent that printed a visible line and then went quiet past
@@ -131,7 +143,7 @@ argument (`sendmessage dev --no-wait "run the tests"`).
 | `agent-bridge daemon start\|stop\|restart\|status\|run` | manage the background daemon |
 | `agent-bridge listagents` | table of agents (name, status, readiness, pid, messages, queued, last output) |
 | `agent-bridge new <name> [-- <cmd...>]` | spawn an agent in a daemon-owned PTY |
-| `agent-bridge sendmessage <name> [--from L] [--paste auto\|bracketed\|plain] [--require-ack] [--queue-timeout 5s] [--write-timeout 5s] [--no-wait] <text>` | type text into another agent's terminal; prints the message id and status |
+| `agent-bridge sendmessage <name> [--from L] [--paste auto\|bracketed\|plain] [--require-ack] [--wait-idle] [--wait-reply] [--queue-timeout 5s] [--write-timeout 5s] [--timeout 30s] [--no-wait] <text>` | type text into another agent's terminal; prints the message id, status, and any collected reply |
 | `agent-bridge ack <name> <id> [--note TEXT]` | record an explicit application-level acknowledgement for a message you received (alias `acknowledge`) |
 | `agent-bridge messagestatus <id>` | delivery status of one message (alias `msg-status`) |
 | `agent-bridge pending <name>` | messages for an agent that are still queued, writing, unknown or awaiting_ack |

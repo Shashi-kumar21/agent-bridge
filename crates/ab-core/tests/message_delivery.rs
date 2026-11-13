@@ -171,6 +171,9 @@ fn send_with_paste(
         wait: Some(wait),
         paste: Some(paste),
         require_ack: None,
+        wait_idle: None,
+        wait_reply: None,
+        timeout_ms: None,
     })
     .expect("send message");
     match response {
@@ -585,6 +588,9 @@ fn send_with_paste_and_ack(
         wait: Some(true),
         paste: Some(paste),
         require_ack: Some(require_ack),
+        wait_idle: None,
+        wait_reply: None,
+        timeout_ms: None,
     })
     .expect("send message");
     match response {
@@ -929,4 +935,156 @@ fn readiness_uses_a_configured_prompt_suffix() {
 
     kill("plain");
     kill("prompt");
+}
+
+/// Send with the Phase 3B wait options and return the raw response.
+fn send_waiting(
+    target: &str,
+    message: String,
+    wait_idle: bool,
+    wait_reply: bool,
+    timeout_ms: u64,
+) -> Response {
+    client::request(&Request::Send {
+        target: target.to_string(),
+        message,
+        enter: Some(true),
+        from: Some("qa".to_string()),
+        queue_timeout_ms: Some(5_000),
+        write_timeout_ms: Some(10_000),
+        wait: Some(true),
+        paste: Some(PasteMode::Auto),
+        require_ack: None,
+        wait_idle: Some(wait_idle),
+        wait_reply: Some(wait_reply),
+        timeout_ms: Some(timeout_ms),
+    })
+    .expect("send message")
+}
+
+/// Poll the retained output until it contains `needle`.
+fn wait_for_output(name: &str, needle: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if output_text(name).contains(needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{name} never printed {needle:?} (output: {:?})",
+            output_text(name)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `--wait-idle` holds the write until output has been quiet for the configured
+/// period, then writes normally.
+#[test]
+fn wait_idle_holds_the_message_until_the_target_is_quiet() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    std::env::set_var("AGENT_BRIDGE_QUIET_MS", "1500");
+    create_agent("held");
+
+    let (_, status) = send("held", "echo warm-up".to_string(), true);
+    assert_eq!(status, DeliveryStatus::Written);
+    wait_until_readiness("held", Readiness::Busy, Duration::from_secs(10));
+
+    let started = Instant::now();
+    let response = send_waiting("held", "echo after-idle".to_string(), true, false, 15_000);
+    let elapsed = started.elapsed();
+    match response {
+        Response::Sent { status, .. } => assert_eq!(status, DeliveryStatus::Written),
+        other => panic!("expected a sent response, got {other:?}"),
+    }
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "wait-idle returned after {elapsed:?}, before the quiet period elapsed"
+    );
+    wait_for_output("held", "after-idle", Duration::from_secs(5));
+    kill("held");
+}
+
+/// A target that never becomes quiet fails `--wait-idle` with `timeout`, and
+/// nothing is written or recorded.
+#[test]
+fn wait_idle_times_out_without_writing() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    std::env::set_var("AGENT_BRIDGE_QUIET_MS", "10000");
+    create_agent("stuck");
+
+    let (_, status) = send("stuck", "echo warm-up".to_string(), true);
+    assert_eq!(status, DeliveryStatus::Written);
+    wait_until_readiness("stuck", Readiness::Busy, Duration::from_secs(10));
+    let before = agent_info("stuck").message_count;
+
+    let response = send_waiting("stuck", "echo must-not-land".to_string(), true, false, 300);
+    match response {
+        Response::Error { code, .. } => assert_eq!(code, ErrorCode::Timeout),
+        other => panic!("expected a timeout response, got {other:?}"),
+    }
+    assert_eq!(
+        agent_info("stuck").message_count,
+        before,
+        "a timed-out wait-idle must not record a message"
+    );
+    assert!(
+        !output_text("stuck").contains("must-not-land"),
+        "a timed-out wait-idle must not write the payload"
+    );
+    kill("stuck");
+}
+
+/// `--wait-reply` returns the output that settled after the write.
+#[test]
+fn wait_reply_returns_settled_output() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent("reply");
+
+    let response = send_waiting(
+        "reply",
+        "echo reply-out-4242".to_string(),
+        false,
+        true,
+        15_000,
+    );
+    match response {
+        Response::Sent { status, reply, .. } => {
+            assert_eq!(status, DeliveryStatus::Written);
+            let reply = reply.expect("wait-reply must attach a reply");
+            assert!(reply.settled, "expected settled output, got {reply:?}");
+            assert!(!reply.timed_out, "expected no timeout, got {reply:?}");
+            assert!(!reply.truncated, "the small reply must not be truncated");
+            assert!(
+                reply
+                    .lines
+                    .iter()
+                    .any(|line| line.contains("reply-out-4242")),
+                "reply did not contain the marker: {reply:?}"
+            );
+        }
+        other => panic!("expected a sent response, got {other:?}"),
+    }
+    kill("reply");
+}
+
+/// A silent target yields an explicit `timed_out` reply instead of hanging.
+#[test]
+fn wait_reply_times_out_on_a_silent_target() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent_with("mute", silent_command());
+
+    // `0` is the documented "check once" deadline, so this is deterministic
+    // even on a PTY that echoes typed input.
+    let response = send_waiting("mute", "hello".to_string(), false, true, 0);
+    match response {
+        Response::Sent { status, reply, .. } => {
+            assert_eq!(status, DeliveryStatus::Written);
+            let reply = reply.expect("wait-reply must attach a reply");
+            assert!(reply.timed_out, "expected a timeout, got {reply:?}");
+            assert!(!reply.settled, "a timeout is not settled: {reply:?}");
+        }
+        other => panic!("expected a sent response, got {other:?}"),
+    }
+    kill("mute");
 }

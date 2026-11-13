@@ -52,6 +52,9 @@ pub const DEFAULT_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default time a caller waits for one write to finish.
 pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default deadline for `wait_idle` and `wait_reply`.
+pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Upper bound for a caller-supplied timeout.
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
 
