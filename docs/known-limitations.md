@@ -340,9 +340,11 @@ lines; `truncated` only reports dropped bytes, so a reply can hold fewer than
 gap, so a target that pauses mid-task returns a partial reply, and output
 already retained before the write is not included. On a Unix PTY the terminal
 driver normally echoes the typed bytes, so a silent target usually returns a
-`settled` reply containing only that echo; only a target that stays silent
-until the deadline (or never goes quiet) reaches `timed_out` with no lines. A reply is not a protocol handshake: no output line is
-correlated with the request, and the target may ignore the message entirely.
+`settled` reply containing only that echo. Only a target that emits no bytes at
+all reaches `timed_out` with no lines; a target that never goes quiet also
+times out, but with the lines seen so far. A reply is not a protocol handshake:
+no output line is correlated with the request, and the target may ignore the
+message entirely.
 `--timeout 0` performs a single check instead of waiting. `--wait-reply`
 requires a completed write, so `--no-wait` is rejected and a failed write
 returns no reply at all rather than an empty one.

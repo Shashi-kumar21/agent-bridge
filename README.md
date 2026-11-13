@@ -105,12 +105,13 @@ target is still `busy`, nothing is written and the command fails with the
 `timeout` code. `--wait-reply` waits for output after the write to go quiet and
 prints the ANSI-stripped new lines plus whether the reply `settled` or
 `timed_out`. The daemon keeps at most 64 KiB and 200 lines; `truncated` reports
-dropped bytes. It is best effort: a target that never prints yields an empty
-`timed_out` reply (as does a target that stays silent until the deadline); a
-silent target on a Unix PTY usually returns just the terminal echo, a failed
-write leaves `reply` null, and
-a `written` status still only means the PTY accepted the bytes. `--wait-reply` conflicts with `--no-wait`; `--timeout 0` checks once
-instead of waiting.
+dropped bytes. It is best effort and not a request/response handshake. A
+target that emits no bytes at all yields an empty `timed_out` reply when the
+deadline passes; a silent target on a Unix PTY usually returns a `settled`
+reply containing only the terminal echo, and a target that never goes quiet
+times out with the lines seen so far. A failed write leaves `reply` null, and a
+`written` status still only means the PTY accepted the bytes. `--wait-reply`
+conflicts with `--no-wait`; `--timeout 0` checks once instead of waiting.
 
 `listagents` shows a heuristic **READY** column: `busy`, `idle` or `unknown`
 (`listagents --json` reports `readiness`). Output that arrived within the quiet

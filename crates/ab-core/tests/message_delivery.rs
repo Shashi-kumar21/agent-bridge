@@ -1116,7 +1116,8 @@ fn wait_reply_drains_output_from_a_target_that_exits() {
     let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
     // Force the exit path: with a long quiet period the reply cannot settle on
     // quiescence, so only draining the reader's last frames can return the
-    // marker. Repeat to cover the publish/close interleaving.
+    // marker. Repeat to cover the publish/close interleaving. Safe to mutate:
+    // the harness holds the process-wide `SERIAL` guard for this test.
     std::env::set_var("AGENT_BRIDGE_QUIET_MS", "10000");
     for round in 0..8 {
         let name = format!("one-shot-{round}");
