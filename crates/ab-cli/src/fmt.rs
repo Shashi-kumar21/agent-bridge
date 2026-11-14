@@ -1,10 +1,12 @@
 //! Terminal formatting helpers (human readable output).
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 
 use agent_bridge_core::protocol::{
-    AgentInfo, AgentStatus, DeliveryStatus, Message, Readiness, Reply,
+    AgentInfo, AgentStatus, DeliveryStatus, Message, Offset, Readiness, Reply,
 };
+use agent_bridge_core::{BridgeError, Result};
 
 /// Format a timestamp as a coarse age ("4s ago").
 #[must_use]
@@ -104,6 +106,37 @@ pub fn print_output(agent: &str, lines: &[String], truncated: bool) {
     for line in lines {
         println!("{line}");
     }
+}
+
+/// Write one raw cursor chunk and the offset to resume from.
+///
+/// The bytes are written verbatim (no ANSI stripping, no newline), so chunk
+/// boundaries cannot corrupt escape sequences or multi-byte characters and
+/// successive reads concatenate exactly. Escape sequences therefore reach the
+/// terminal; use `--json` when the exact bytes matter. The resumable offset
+/// (and any skipped gap) go to stderr, keeping stdout pipe-friendly.
+///
+/// A closed pipe (`agent-bridge read --since 0 | head`) is not an error, but
+/// any other write failure is reported instead of silently truncating output.
+pub fn print_chunk(
+    agent: &str,
+    data: &[u8],
+    offset: Offset,
+    next_offset: Offset,
+    dropped: bool,
+) -> Result<()> {
+    if dropped {
+        eprintln!("--- {agent} (gap: oldest retained byte is offset {offset}) ---");
+    }
+    let mut stdout = std::io::stdout().lock();
+    if let Err(err) = stdout.write_all(data).and_then(|()| stdout.flush()) {
+        if err.kind() == std::io::ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(BridgeError::Io(err));
+    }
+    eprintln!("next offset: {next_offset}");
+    Ok(())
 }
 
 /// Print one message record and its delivery status.

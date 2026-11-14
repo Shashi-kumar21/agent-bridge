@@ -19,7 +19,7 @@ $env:AGENT_BRIDGE_PIPE = "agent-bridge-audit" # PowerShell, Windows isolation
 ## 1. Message delivery is "written" unless the receiver acked it
 
 `sendmessage` writes bytes into the target's PTY and returns
-`Sent { bytes, message_id, status, reply }` (`daemon.rs:250-426`); `reply` is
+`Sent { bytes, message_id, status, reply }` (`daemon.rs:252-428`); `reply` is
 `null` unless `--wait-reply` is used and the write completed. The status records
 what the daemon's write path did, not what the target did: the application may
 be mid-render, waiting at a prompt, or not reading at all. A bounded queue and a
@@ -64,14 +64,14 @@ The remaining gap is the OS write itself: once `write_all` is inside the PTY
 there is no portable way to cancel it. `--write-timeout` (5 s by default, `0`
 waits forever) makes the caller return `unknown`; the writer keeps waiting and
 amends the record to `written`/`failed` when the syscall returns
-(`delivery.rs:486-500`, `daemon.rs:537-570`, `:812-838`). A target that never
+(`delivery.rs:486-500`, `daemon.rs:561-594`, `:836-862`). A target that never
 drains its PTY therefore keeps the in-flight byte reservation and the channel
 fills up behind it until the agent exits or the daemon is restarted; new
 messages to that agent
 eventually fail with `queue_full`.
 
 Urgent jobs (Ctrl-C, `attach` keystrokes) use a separate channel and may pass a
-queued message between writes; they never split a payload (`agent.rs:423-433`).
+queued message between writes; they never split a payload (`agent.rs:430-440`).
 
 ## 3. Multi-line delivery depends on the target application
 
@@ -100,7 +100,7 @@ printed the marker; the first multi-line message then falls back to plain. Wait
 for the prompt, or use `--paste bracketed`.
 
 The state is sampled when the request is handled
-(`daemon.rs:277-282`), not when the writer finally reaches the message. With a
+(`daemon.rs:279-284`), not when the writer finally reaches the message. With a
 slow queue the target may have disabled paste in between (readline does this
 while a command runs), and the wrapped text is then typed literally. Composing
 inside the writer would narrow that window but not close it, because the
@@ -130,9 +130,10 @@ fallback).
 ## 4. `read` is a line view of raw bytes, not a terminal screen
 
 `read` strips ANSI sequences from the retained byte ring and returns the last N
-lines (`buffer.rs:89-103`, `:131-171`). Cursor movement, erase-line/screen,
+lines (`buffer.rs:149-163`). Cursor movement, erase-line/screen,
 alternate screen and wrapping are discarded, so a full-screen TUI renders as a
-puzzle of redraw fragments.
+puzzle of redraw fragments. Cursor reads (`--since`) return raw bytes and the
+CLI writes them verbatim, so escape sequences reach the terminal; see §5.
 
 ```bash
 agent-bridge new tui --cwd . -- opencode     # any full-screen TUI
@@ -141,33 +142,52 @@ agent-bridge read tui --lines 40
 
 Roadmap §6 (VT screen model and snapshot).
 
-## 5. No byte offset cursor; `seq` counts chunks
+## 5. Cursor reads are bounded chunks, not a live stream
 
-`Read` returns the current `seq` (`protocol.rs:493-503`); `Attach --from-seq`
-only decides whether to replay the *whole* retained buffer (`daemon.rs:950`).
-Because `seq` increments per PTY chunk, not per byte, callers cannot resume from
-an arbitrary offset, and a replay frame carries the newest `seq` for bytes that
-may include older chunks.
+`read --since OFFSET` returns raw output bytes from an absolute per-agent byte
+offset as a `Chunk` (`protocol.rs:519-538`): `offset`, `next_offset`, `dropped`
+and the current `seq`, with the bytes base64 encoded
+(`daemon.rs:430-452`, `buffer.rs:122-145`). Each response carries at most
+64 KiB of raw bytes (`MAX_READ_CHUNK`, `daemon.rs:41`; base64 inflates the JSON
+frame), so a caller that wants everything new must loop until `next_offset`
+stops moving.
+
+A `since` older than the retained window is clamped to the oldest retained byte
+and flagged with `dropped: true`; a `since` past the newest byte is rejected
+with `bad_request` (`CursorAhead`, `error.rs:76-87`). Offsets are per agent and
+per daemon lifetime (`Offset`, `protocol.rs:24-29`): after a daemon restart or
+an agent re-creation an old offset either looks ahead (rejected) or lands in a
+different stream's window.
+
+There is no follow/stream mode, so polling `--since` cannot wait for new output.
+`attach` is still sequence-based: `seq` increments per PTY chunk, not per byte
+(`agent.rs:245`), and a replay frame carries the newest `seq` for bytes that may
+include older chunks.
 
 ```bash
-agent-bridge --json read shell --lines 5     # note "seq"
-agent-bridge attach shell --from-seq <seq>   # skips replay only when >= current
+agent-bridge --json read shell --since 0     # offset, next_offset, dropped, data
+agent-bridge read shell --since 4096         # raw bytes; next offset on stderr
 ```
 
-Roadmap §3 (`--since` byte offset, wrap detection, follow/stream).
+Only the human path decodes the base64 payload (`--json` prints the frame
+verbatim), so a corrupt payload is a `protocol` error there and passes through
+untouched in JSON mode.
+
+Roadmap §3 (follow/stream mode).
 
 ## 6. `truncated` is latched for the life of the agent
 
-Once the 256 KiB ring drops any byte (`buffer.rs:54-61`), `truncated` stays true
+Once the 256 KiB ring drops any byte (`buffer.rs:73-81`), `truncated` stays true
 for that agent even if the output since then fits entirely
-(`buffer.rs:83-85`). Consumers cannot tell whether the *requested window* was
-truncated.
+(`buffer.rs:101-105`). A line read cannot tell whether the *requested window* was
+truncated. Cursor reads are finer-grained: `dropped` reports that this request
+skipped a gap, but there is no flag for "the buffer has wrapped at some point".
 
-Roadmap §3 (cursor semantics that report what is actually available).
+Roadmap §6 (non-latched truncation reporting).
 
 ## 7. Exited agents are never removed; names cannot be reused
 
-The agent map is only inserted into (`daemon.rs:245`); there is no removal
+The agent map is only inserted into (`daemon.rs:247`); there is no removal
 path. `listagents` keeps showing exited entries with their buffers and message
 history, and `new` with that name fails with `agent '<name>' already exists`.
 
@@ -185,9 +205,9 @@ Tracked as issue
 ## 8. Daemon restart kills live agents and discards exited state
 
 Buffers, message history, PTY handles and job objects are in-memory only
-(`daemon.rs:100-106`). `daemon restart` stops the daemon, which sends Ctrl-C to
+(`daemon.rs:102-108`). `daemon restart` stops the daemon, which sends Ctrl-C to
 every agent, force-kills any that are still running after ~500 ms
-(`daemon.rs:184-193`, `agent.rs:570-597`), and then exits; the next daemon
+(`daemon.rs:186-195`, `agent.rs:606-633`), and then exits; the next daemon
 starts empty. There is no session adoption.
 
 ```bash
@@ -218,7 +238,7 @@ agent-bridge sendmessage sh "set -m; sleep 600 &"
 ## 10. Agents inherit the daemon's full environment
 
 The child gets everything the daemon has, plus `TERM` and
-`AGENT_BRIDGE_AGENT` (`agent.rs:157`). Nothing is filtered, so any secret in
+`AGENT_BRIDGE_AGENT` (`agent.rs:158`). Nothing is filtered, so any secret in
 the daemon's environment is present in every agent.
 
 ```bash
@@ -251,7 +271,7 @@ Roadmap §4 (document the endpoints, add per-instance isolation).
 Access control is the endpoint itself: socket `0600` in a `0700` directory, or a
 pipe DACL for owner/`SYSTEM`/Administrators (`transport.rs:79-98`,
 `transport.rs:41`). There is no caller authentication, no per-session policy and
-no audit trail; `from` is an unauthenticated label (`daemon.rs:250-426`).
+no audit trail; `from` is an unauthenticated label (`daemon.rs:252-428`).
 
 ```bash
 agent-bridge kill dev --force        # any local process can do this
@@ -261,20 +281,22 @@ Roadmap §4 (threat model, policy, identity, audit).
 
 ## 13. Output retention ends at 256 KiB and drops slow subscribers
 
-Retention defaults to a 256 KiB ring (`buffer.rs:6`). `AGENT_BRIDGE_BUFFER_BYTES`
-raises or lowers it per agent, clamped to 1 KiB..16 MiB (`buffer.rs:8-32`), and is
+Retention defaults to a 256 KiB ring (`buffer.rs:8`). `AGENT_BRIDGE_BUFFER_BYTES`
+raises or lowers it per agent, clamped to 1 KiB..16 MiB (`buffer.rs:10-34`), and is
 sampled at spawn, so existing agents keep their size. Even at the maximum, older
-bytes are dropped and only the `truncated` flag says so - no byte offset survives.
+bytes are dropped; the oldest retained byte keeps its absolute offset, so a
+cursor read reports the gap as `dropped`, but the dropped bytes themselves are
+gone.
 An attach client that cannot keep up with 1024 queued events is disconnected
-silently (`agent.rs:35`, `:518-532`, `:534-551`); the CLI sees the stream close,
+silently (`agent.rs:36`, `:554-568`, `:570-587`); the CLI sees the stream close,
 not an error.
 
 Roadmap §3 (explicit drop signalling, offset expiry).
 
 ## 14. Message history is per-agent and bounded at 500
 
-`record_message` keeps the newest 500 entries (`agent.rs:24`, `:484-493`), and
-the global id-indexed log keeps 2000 (`daemon.rs:26`, `:41-90`). Both are
+`record_message` keeps the newest 500 entries (`agent.rs:25`, `:520-530`), and
+the global id-indexed log keeps 2000 (`daemon.rs:26`, `:43-92`). Both are
 in-memory and vanish with the daemon. Ids are unique only for one daemon
 lifetime, so `messagestatus` returns `not_found` after a restart even though the
 id was valid before; there is no persistence.
@@ -302,7 +324,7 @@ Roadmap §6 (resize handling in the screen model).
 ## 17. Readiness is a heuristic, not a prompt detector
 
 `listagents` reports `busy`, `idle` or `unknown` from output quiescence
-(`readiness.rs:94-121`, `agent.rs:338-354`). A command that prints one visible
+(`readiness.rs:94-121`, `agent.rs:345-361`). A command that prints one visible
 line and then runs silently for longer than `AGENT_BRIDGE_QUIET_MS` (default
 500 ms) is reported `idle` even while it is still running; a command that never
 prints a visible line (terminal control sequences alone do not count) stays
@@ -319,7 +341,7 @@ Roadmap §3 (heuristic readiness with documented caveats).
 ## 18. `--wait-idle` and `--wait-reply` are best-effort heuristics
 
 `--wait-idle` polls the same readiness signal as `listagents`
-(`daemon.rs:709-727`, `readiness.rs:94-121`), so every caveat in §17 applies: a
+(`daemon.rs:733-751`, `readiness.rs:94-121`), so every caveat in §17 applies: a
 target that printed once and then runs silently looks idle, and one that keeps
 redrawing never becomes idle. `unknown` is treated as ready so a fresh shell is
 not blocked, which also means an agent whose startup produced only control
@@ -329,7 +351,7 @@ and writes nothing; the message is not queued and no id is recorded.
 `--wait-reply` subscribes before the message is queued and collects
 `Event::Output` until the agent's configured quiet period passes, the PTY reader
 closes after an exit, the channel closes, or the deadline expires
-(`daemon.rs:732-798`). When the target exits, the queued output frames are
+(`daemon.rs:756-822`). When the target exits, the queued output frames are
 drained before the reply is marked `settled`, so a marker printed just before
 the exit is still returned. If the child exits while a descendant keeps the PTY
 open, the reader never closes; the reply then ends at the first quiet gap (or at

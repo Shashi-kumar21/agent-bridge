@@ -64,6 +64,7 @@ agent-bridge sendmessage claude --from dev "tests are green, please review PR #4
 
 # 5. peek at / drive a terminal from here
 agent-bridge read dev --lines 60
+agent-bridge read dev --since 0   # raw bytes from a byte offset
 agent-bridge attach dev          # Ctrl-] detaches
 ```
 
@@ -136,6 +137,17 @@ in the default ConPTY configuration on Windows that stream is re-rendered by
 ConPTY, which consumes these markers, so `auto` behaves like `plain` there.
 `listagents --json` reports `bracketed_paste`.
 
+`read --since OFFSET` returns raw output bytes from an absolute per-agent byte
+offset instead of a line tail. Each response carries at most 64 KiB of raw bytes
+(base64 makes the JSON frame larger) plus `offset`, `next_offset` and `dropped`;
+loop from the previous `next_offset` to consume new output exactly once. A
+`since` older than the retained window is clamped to the oldest byte and flagged
+`dropped`; a `since` past the newest byte fails with `bad_request`. Offsets reset
+when the daemon restarts or the agent is re-created. Cursor reads do not wait, so
+a follower polls `--since`. The human command writes the bytes verbatim (no ANSI
+stripping), so escape sequences reach the terminal; use `--json` for the exact
+payload.
+
 Options must come **before** the message text, because the text is a trailing
 argument (`sendmessage dev --no-wait "run the tests"`).
 
@@ -150,7 +162,7 @@ argument (`sendmessage dev --no-wait "run the tests"`).
 | `agent-bridge ack <name> <id> [--note TEXT]` | record an explicit application-level acknowledgement for a message you received (alias `acknowledge`) |
 | `agent-bridge messagestatus <id>` | delivery status of one message (alias `msg-status`) |
 | `agent-bridge pending <name>` | messages for an agent that are still queued, writing, unknown or awaiting_ack |
-| `agent-bridge read <name> --lines N` | ANSI-stripped tail of its output |
+| `agent-bridge read <name> [--lines N] [--since OFFSET]` | ANSI-stripped tail, or raw bytes from a byte cursor (`--lines` is ignored with `--since`) |
 | `agent-bridge attach <name>` | live mirror + keyboard passthrough |
 | `agent-bridge kill <name>` | Ctrl-C first; `--force` kills the agent's process tree immediately (Windows: whole job; Unix: process group + best-effort tree snapshot from `ps` or `/proc`, plus a PTY fd sweep on Linux) |
 | `agent-bridge log` | global message history (id, status, sender, body) |

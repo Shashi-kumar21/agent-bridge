@@ -73,6 +73,19 @@ pub enum BridgeError {
         millis: u64,
     },
 
+    /// A read cursor is ahead of the agent's output stream.
+    #[error(
+        "read offset {since} is ahead of the {total} bytes produced by agent '{target}' (offsets reset on restart)"
+    )]
+    CursorAhead {
+        /// Target agent name.
+        target: String,
+        /// Offset the caller asked for.
+        since: u64,
+        /// Bytes produced so far by that agent.
+        total: u64,
+    },
+
     /// Generic daemon-side failure.
     #[error("{0}")]
     Daemon(String),
@@ -88,7 +101,9 @@ impl BridgeError {
                 ErrorCode::Conflict
             }
             Self::Conflict(_) => ErrorCode::Conflict,
-            Self::InvalidName(_) | Self::Protocol(_) => ErrorCode::BadRequest,
+            Self::InvalidName(_) | Self::Protocol(_) | Self::CursorAhead { .. } => {
+                ErrorCode::BadRequest
+            }
             Self::MessageTooLarge { .. } => ErrorCode::TooLarge,
             Self::WaitIdleTimeout { .. } => ErrorCode::Timeout,
             Self::DaemonNotRunning(_) | Self::Daemon(_) => ErrorCode::NotRunning,

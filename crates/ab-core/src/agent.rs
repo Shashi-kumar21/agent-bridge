@@ -12,11 +12,12 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use tracing::{debug, warn};
 
-use crate::buffer::OutputBuffer;
+use crate::buffer::{CursorChunk, OutputBuffer};
 use crate::delivery::{self, Job, WriteOutcome, WriteQueue};
 use crate::error::{BridgeError, Result};
 use crate::protocol::{
-    AgentInfo, AgentStatus, DeliveryStatus, Event, Message, MessageId, Millis, Readiness,
+    AgentInfo, AgentStatus, DeliveryStatus, Event, Message, MessageId, Millis, Offset, Readiness,
+    Seq,
 };
 use crate::readiness::{ReadinessConfig, PROMPT_SCAN_BYTES};
 use crate::reaper::{self, ProcessReaper};
@@ -233,14 +234,20 @@ impl Agent {
                     if let Some(enabled) = paste.observe(data) {
                         self.bracketed_paste.store(enabled, Ordering::SeqCst);
                     }
-                    if let Ok(mut buffer) = self.buffer.lock() {
+                    // Hold the buffer lock across the sequence bump so a
+                    // snapshot never reports bytes it does not cover in `seq`.
+                    let seq = {
+                        let mut buffer = self
+                            .buffer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         buffer.push(data);
-                    }
+                        self.seq.fetch_add(1, Ordering::SeqCst) + 1
+                    };
                     *self
                         .last_output_at
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(crate::now_ms());
-                    let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
                     self.publish(Event::Output {
                         agent: self.name.clone(),
                         seq,
@@ -471,14 +478,43 @@ impl Agent {
         self.readiness.quiet()
     }
 
-    /// Trailing output lines with ANSI removed.
-    #[must_use]
-    pub fn tail_lines(&self, lines: usize) -> (Vec<String>, bool) {
+    /// Raw output from an absolute byte cursor.
+    ///
+    /// `Err(total)` when `since` is ahead of the stream; `total` is the newest
+    /// byte count from the same snapshot, so the error reports an authoritative
+    /// bound (see [`crate::buffer::OutputBuffer::read_from`]).
+    pub fn read_since(
+        &self,
+        since: Offset,
+        max_bytes: usize,
+    ) -> std::result::Result<CursorChunk, Offset> {
         let buffer = self
             .buffer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (buffer.tail_lines(lines), buffer.truncated())
+        buffer
+            .read_from(since, max_bytes)
+            .ok_or_else(|| buffer.end_offset())
+    }
+
+    /// Trailing output lines with ANSI removed, plus the absolute offset just
+    /// past the newest retained byte and the newest sequence number.
+    ///
+    /// Lines, the `truncated` flag, the offset and `seq` come from one buffer
+    /// lock, so a caller that reads a tail and resumes from the offset cannot
+    /// skip bytes that were appended between two separate snapshots.
+    #[must_use]
+    pub fn tail_snapshot(&self, lines: usize) -> (Vec<String>, bool, Offset, Seq) {
+        let buffer = self
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            buffer.tail_lines(lines),
+            buffer.truncated(),
+            buffer.end_offset(),
+            self.seq.load(Ordering::SeqCst),
+        )
     }
 
     /// Record a delivered message (bounded history).

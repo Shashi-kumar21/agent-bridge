@@ -285,6 +285,7 @@ fn read_pid(agent: &str, marker: &str) -> u32 {
         if let Ok(Response::Output { lines, .. }) = client::request(&Request::Read {
             target: agent.to_string(),
             lines: Some(80),
+            since: None,
         }) {
             for line in &lines {
                 if let Some((_, rest)) = line.split_once(marker) {

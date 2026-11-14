@@ -114,10 +114,10 @@ permission prompt. Readiness detection is heuristic and must be documented as su
 -   [x] Expose the state in agent status as `busy`, `idle`, or `unknown`, never as a guarantee (`listagents`, `--json` `readiness`, `AgentInfo`).
 -   [x] Add `sendmessage --wait-idle [--timeout]` that holds the message until the target appears idle or the timeout expires; it is checked before the message is queued and a timeout fails with `timeout` without writing.
 -   [x] Add `--wait-reply [--timeout]` that, after a message is written, waits for output to settle and returns the new output since the write (best effort, bounded to 64 KiB / 200 lines, with explicit `timed_out` / `settled` / `truncated`).
--   [ ] Add output offsets and a cursor-based read: `read <name> --since <offset>` returns new output and the next offset, so callers do not re-read the same data.
--   [ ] Add a bounded follow/stream mode (or long-poll) suitable for MCP clients, with clear behavior when the buffer wraps and older offsets are no longer available.
+-   [x] Add output offsets and a cursor-based read: `read <name> --since <offset>` returns new output and the next offset, so callers do not re-read the same data (capped at 64 KiB of raw bytes per response; a wrapped window is reported with `dropped`).
+-   [ ] Add a bounded follow/stream mode (or long-poll) suitable for MCP clients, with clear behavior when the buffer wraps and older offsets are no longer available. (The non-blocking cursor from the previous item lands first.)
 -   [x] Make the quiet period, prompt patterns, and buffer sizes configurable, with safe defaults (`AGENT_BRIDGE_QUIET_MS`, `AGENT_BRIDGE_PROMPT_PATTERN`, `AGENT_BRIDGE_BUFFER_BYTES`).
--   [ ] Add tests using a mock agent that alternates busy/idle output, prints prompts, and goes silent; cover timeouts and offset expiry. (Readiness, wait-idle timeout/unknown, and wait-reply settled/timeout/exit-drain cases are covered; offset expiry lands with the cursor item above.)
+-   [x] Add tests using a mock agent that alternates busy/idle output, prints prompts, and goes silent; cover timeouts and offset expiry. Readiness, wait-idle timeout/unknown, wait-reply settled/timeout/exit-drain, byte-once cursor reads, and offset expiry after a buffer wrap are covered (follow/stream expiry lands with the follow item above).
 
 **Acceptance criterion:** With a deterministic mock agent, `--wait-idle` never writes
 during a scripted busy period, and `--since` returns each output byte exactly once

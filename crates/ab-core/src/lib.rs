@@ -8,8 +8,9 @@
 //! * enumerate live agents ([`protocol::Request::List`])
 //! * type a message into another agent's terminal
 //!   ([`protocol::Request::Send`])
-//! * replay or stream its output ([`protocol::Request::Read`],
-//!   [`protocol::Request::Attach`])
+//! * read its output as lines, or follow it byte by byte with a cursor
+//!   ([`protocol::Request::Read`] with `since`), and stream it live
+//!   ([`protocol::Request::Attach`])
 //!
 //! No `tmux`, no X server, no platform specific shell integration required.
 
@@ -27,8 +28,8 @@ pub mod transport;
 
 pub use error::{BridgeError, Result};
 pub use protocol::{
-    AgentInfo, AgentStatus, DeliveryStatus, ErrorCode, Event, Message, MessageId, Readiness,
-    Request, Response, PROTOCOL_VERSION,
+    AgentInfo, AgentStatus, DeliveryStatus, ErrorCode, Event, Message, MessageId, Offset,
+    Readiness, Request, Response, Seq, PROTOCOL_VERSION,
 };
 
 /// Current wall clock in milliseconds since the Unix epoch.

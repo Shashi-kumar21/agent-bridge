@@ -11,9 +11,10 @@ use agent_bridge_core::client;
 use agent_bridge_core::daemon::Daemon;
 use agent_bridge_core::paths;
 use agent_bridge_core::protocol::{
-    DeliveryStatus, PasteMode, Request, Response, DEFAULT_COLS, DEFAULT_ROWS,
+    DeliveryStatus, Offset, PasteMode, Request, Response, DEFAULT_COLS, DEFAULT_ROWS,
 };
-use agent_bridge_core::Result;
+use agent_bridge_core::{BridgeError, Result};
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -107,13 +108,17 @@ enum Command {
         #[arg(last = true)]
         command: Vec<String>,
     },
-    /// Print the tail of an agent's output.
+    /// Print the tail of an agent's output, or raw bytes from a byte offset.
     Read {
         /// Agent name.
         target: String,
         /// Number of trailing lines.
         #[arg(long, default_value_t = 40)]
         lines: usize,
+        /// Resume from an absolute byte offset instead of reading lines. The
+        /// daemon returns raw bytes; `--lines` is ignored.
+        #[arg(long, value_name = "OFFSET")]
+        since: Option<Offset>,
     },
     /// Terminate an agent.
     Kill {
@@ -325,11 +330,16 @@ fn run(cli: Cli) -> Result<()> {
                 _ => emit(response, json),
             }
         }
-        Command::Read { target, lines } => {
+        Command::Read {
+            target,
+            lines,
+            since,
+        } => {
             ensure_daemon(true)?;
             let response = client::request(&Request::Read {
                 target,
-                lines: Some(lines),
+                lines: since.is_none().then_some(lines),
+                since,
             })?;
             match (&response, json) {
                 (
@@ -452,6 +462,19 @@ fn emit(response: Response, json: bool) -> Result<()> {
             truncated,
             ..
         } => fmt::print_output(&agent, &lines, truncated),
+        Response::Chunk {
+            agent,
+            data,
+            offset,
+            next_offset,
+            dropped,
+            ..
+        } => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|err| BridgeError::Protocol(format!("invalid chunk payload: {err}")))?;
+            fmt::print_chunk(&agent, &bytes, offset, next_offset, dropped)?;
+        }
         Response::Sent {
             target,
             bytes,
@@ -675,6 +698,27 @@ mod tests {
 
         let alias = Cli::try_parse_from(["agent-bridge", "msg-status", "7"]).expect("parse alias");
         assert!(matches!(alias.command, Command::Messagestatus { id: 7 }));
+    }
+
+    #[test]
+    fn parses_read_since_and_keeps_lines() {
+        let cli =
+            Cli::try_parse_from(["agent-bridge", "read", "dev", "--since", "42"]).expect("parse");
+        match cli.command {
+            Command::Read {
+                target,
+                lines,
+                since,
+            } => {
+                assert_eq!(target, "dev");
+                assert_eq!(lines, 40);
+                assert_eq!(since, Some(42));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let plain = Cli::try_parse_from(["agent-bridge", "read", "dev"]).expect("parse");
+        assert!(matches!(plain.command, Command::Read { since: None, .. }));
     }
 
     #[test]
