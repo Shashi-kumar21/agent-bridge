@@ -1267,7 +1267,10 @@ fn output_lines_command(count: usize) -> Vec<String> {
         vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            format!("seq 1 {count} | sed 's/^/cursor-line-/'"),
+            // The suffix keeps the Windows and Unix producers byte-comparable:
+            // the cursor tests assert on `cursor-line-N-`, so both platforms
+            // must emit the dash plus the trailing alphabet.
+            format!("seq 1 {count} | sed 's/^/cursor-line-/;s/$/-abcdefghijklmnopqrstuvwxyz/'"),
         ]
     }
 }
