@@ -473,7 +473,7 @@ fn emit(response: Response, json: bool) -> Result<()> {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(data)
                 .map_err(|err| BridgeError::Protocol(format!("invalid chunk payload: {err}")))?;
-            fmt::print_chunk(&agent, &bytes, offset, next_offset, dropped);
+            fmt::print_chunk(&agent, &bytes, offset, next_offset, dropped)?;
         }
         Response::Sent {
             target,

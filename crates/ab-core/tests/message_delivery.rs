@@ -1371,6 +1371,7 @@ fn cursor_older_than_the_buffer_reports_a_gap() {
     assert!(dropped, "offset 0 should have rotated out");
     assert_eq!(offset, total - 1024, "the chunk starts at the oldest byte");
     assert_eq!(next_offset, total);
+    assert_eq!(offset + 1024, next_offset);
     assert_eq!(bytes.len(), 1024, "the whole retained window is returned");
 
     let (more, offset, after, dropped) = chunk_parts(read_chunk("wrapped", next_offset));

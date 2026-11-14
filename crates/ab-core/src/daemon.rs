@@ -450,12 +450,12 @@ impl Inner {
                         seq: agent.seq(),
                     });
                 }
-                let (lines, truncated, next_offset) = agent.tail_snapshot(lines.unwrap_or(40));
+                let (lines, truncated, next_offset, seq) = agent.tail_snapshot(lines.unwrap_or(40));
                 Ok(Response::Output {
                     agent: target,
                     lines,
                     truncated,
-                    seq: agent.seq(),
+                    seq,
                     next_offset,
                 })
             }

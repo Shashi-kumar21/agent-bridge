@@ -40,7 +40,7 @@ Module map (`crates/ab-core/src`):
 
 | File | Role |
 | --- | --- |
-| `protocol.rs` | Wire types, `PROTOCOL_VERSION`, name validation (`validate_name`, `:635`) |
+| `protocol.rs` | Wire types, `PROTOCOL_VERSION`, name validation (`validate_name`, `:637`) |
 | `delivery.rs` | Message ids, size limit, payload composition, bounded write queue, writer thread, timeouts |
 | `transport.rs` | Listener/connect, Unix socket permissions, Windows pipe DACL (`:41`) |
 | `daemon.rs` | Accept loop, request handlers, attach streaming |
@@ -60,17 +60,17 @@ Module map (`crates/ab-core/src`):
   connection pool and no request queue: concurrency is one thread per client, and
   shared state is protected by mutexes (`Inner::agents`, `Inner::messages`,
   `daemon.rs:102-108`).
-* Each agent starts three threads: a PTY reader pump (`agent.rs:213-215`), a
-  child waiter that polls `try_wait` every 120 ms (`agent.rs:218-220`,
-  `:262-304`), and one write-queue writer (`delivery.rs:368-372`). The writer exits
+* Each agent starts three threads: a PTY reader pump (`agent.rs:214-216`), a
+  child waiter that polls `try_wait` every 120 ms (`agent.rs:219-221`,
+  `:269-311`), and one write-queue writer (`delivery.rs:368-372`). The writer exits
   when the agent is marked not running or the queue is dropped.
 * Per-agent mutable state lives behind mutexes inside `Agent`
-  (`agent.rs:93-122`): PTY master (resize), child handle, output buffer, message
+  (`agent.rs:94-123`): PTY master (resize), child handle, output buffer, message
   history, subscriber list, reaper, and the write-queue handle.
 * Shutdown: `Request::Shutdown` sets an `AtomicBool` (`Inner::shutdown`, `daemon.rs:505-508`); the
   accept loop observes it, calls `Inner::stop_agents` (`daemon.rs:149`, `:179`,
   `:186-195`), which sends Ctrl-C to every agent, force-kills the ones still
-  running after ~500 ms (`agent.rs:598-625`), and then lets the process exit.
+  running after ~500 ms (`agent.rs:606-633`), and then lets the process exit.
 
 ## 3. Request lifecycle (non-streaming)
 
@@ -91,17 +91,18 @@ pipelining: a second request on the same connection is never read.
 
 ## 4. Output lifecycle
 
-1. The PTY reader pump reads up to 8 KiB per `read` (`agent.rs:225-260`).
+1. The PTY reader pump reads up to 8 KiB per `read` (`agent.rs:226-267`).
 2. The chunk is appended to the per-agent ring buffer
-   (`agent.rs:236-238`, `buffer.rs:73-81`). Capacity is 256 KiB
+   (`agent.rs:240-244`, `buffer.rs:73-81`). Capacity is 256 KiB
    (`buffer.rs:8`); the oldest bytes are dropped and `truncated` is latched.
-3. The chunk is stamped with the next sequence number (`agent.rs:243`) and
-   published to subscribers as a base64 `Event::Output` (`agent.rs:244-248`).
-4. Subscribers are bounded channels of 1024 events (`agent.rs:35`, `:541-555`). A
+3. The chunk is stamped with the next sequence number under the same buffer
+   lock (`agent.rs:239-246`) and published to subscribers as a base64
+   `Event::Output` (`agent.rs:251-255`).
+4. Subscribers are bounded channels of 1024 events (`agent.rs:36`, `:554-568`). A
    subscriber that cannot keep up is dropped and logged
-   (`agent.rs:562-579`).
+   (`agent.rs:570-587`).
 5. A plain `Read` returns ANSI-stripped tail lines plus the current `seq` and
-   `next_offset` (`daemon.rs:453-460`, `agent.rs:508-510`, `buffer.rs:149-163`);
+   `next_offset` (`daemon.rs:453-461`, `agent.rs:500-518`, `buffer.rs:149-163`);
    it is a line view of raw bytes, not a terminal screen. `Read { since }`
    returns a base64 `Chunk` of raw bytes from an absolute byte offset, at most
    64 KiB of raw bytes per response (`MAX_READ_CHUNK`, `daemon.rs:41`; base64
@@ -117,7 +118,7 @@ pipelining: a second request on the same connection is never read.
    (`daemon.rs:1003-1031`). Because the replay and the live stream can repeat a
    sequence number, clients drop non-increasing `seq` (`client.rs:79-83`).
 7. Readiness is derived per request from this stream (`Agent::readiness`,
-   `agent.rs:338-354`): output newer than `AGENT_BRIDGE_QUIET_MS` (default
+   `agent.rs:345-361`): output newer than `AGENT_BRIDGE_QUIET_MS` (default
    500 ms) is `busy`, older output is `idle`, and an optional
    `AGENT_BRIDGE_PROMPT_PATTERN` literal suffix on the newest line marks `idle`
    early (`readiness.rs:94-121`). A stopped agent, or one without a visible
@@ -153,14 +154,14 @@ restart from zero in a new daemon.
    `write_all` + `flush` per job, so jobs cannot interleave bytes. A separate
    urgent channel carries Ctrl-C from `kill` and `Input` keystrokes from
    `attach`; urgent jobs are selected between jobs, so they may pass a queued
-   message but never split one (`agent.rs:423-433`).
+   message but never split one (`agent.rs:430-440`).
 5. The status moves `queued -> writing -> written`, to
    `failed { code, detail }` on exit/queue-full/IO error, or to `unknown` when
    the caller's `--write-timeout` expires while the PTY write is still blocked.
    A message that is still `queued` at the deadline stays `queued` and keeps
    waiting; `unknown` is only used after the write started. The writer amends an
    `unknown` record to `written`/`failed` when the syscall returns
-   (`daemon.rs:561-594`, `:838-863`). When the sender asked for an
+   (`daemon.rs:561-594`, `:836-862`). When the sender asked for an
    acknowledgement, the completed write lands in `awaiting_ack` instead of
    `written` (`settle`, `daemon.rs:824-834`). `pending` lists `queued`,
    `writing`, `unknown` and `awaiting_ack` records because all four may still
@@ -187,11 +188,11 @@ restart from zero in a new daemon.
    (`apply_status`, `daemon.rs:836-862`); only `acknowledged` means the receiver
    reported that it saw the message.
 8. `--wait-idle` calls `wait_until_ready` before allocating the id
-   (`daemon.rs:294-296`, `:734-752`): it polls `Agent::readiness` every 25 ms,
+   (`daemon.rs:294-296`, `:733-751`): it polls `Agent::readiness` every 25 ms,
    proceeds on `idle` and `unknown`, and fails with
    `BridgeError::WaitIdleTimeout` (`error.rs:69-74`, code `timeout`) without
    recording or writing anything when the deadline expires. `--wait-reply`
-   subscribes to the agent's event channel before enqueueing (`agent.rs:546-560`)
+   subscribes to the agent's event channel before enqueueing (`agent.rs:554-568`)
    and, after the write completes, runs `collect_reply` until output has been
    quiet for the agent's configured period, the PTY reader closes after an exit,
    the channel closes, or the deadline expires (`daemon.rs:756-822`). On exit it
@@ -227,11 +228,11 @@ there (bracketed paste is a Unix-PTY feature in practice).
 
 ## 6. Process ownership and lifetime
 
-* Every agent is spawned by the daemon inside a fresh PTY (`agent.rs:126-223`):
+* Every agent is spawned by the daemon inside a fresh PTY (`agent.rs:127-224`):
   `openpty`, `CommandBuilder` with `TERM=xterm-256color` and
   `AGENT_BRIDGE_AGENT=<name>`, then `slave.spawn_command`.
 * The child inherits the daemon's environment and working directory (cwd falls
-  back to the daemon's cwd when `--cwd` is omitted, `agent.rs:146-154`).
+  back to the daemon's cwd when `--cwd` is omitted, `agent.rs:147-155`).
 * Windows: the child is assigned to an anonymous job object with
   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` immediately after spawn
   (`reaper.rs`, `install`), so the kernel kills the job when the daemon dies.
