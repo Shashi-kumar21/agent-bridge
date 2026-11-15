@@ -144,9 +144,13 @@ loop from the previous `next_offset` to consume new output exactly once. A
 `since` older than the retained window is clamped to the oldest byte and flagged
 `dropped`; a `since` past the newest byte fails with `bad_request`. Offsets reset
 when the daemon restarts or the agent is re-created. Cursor reads do not wait, so
-a follower polls `--since`. The human command writes the bytes verbatim (no ANSI
-stripping), so escape sequences reach the terminal; use `--json` for the exact
-payload.
+a follower polls `--since`. `--wait 5s` turns one cursor read into a long-poll
+that returns as soon as new bytes arrive or after the window expires (empty chunk
+with `timed_out`); the daemon caps the window at 60s. `--since N --follow` keeps
+long-polling and prints chunks as they come (Ctrl-C to stop), which is the
+convenience wrapper around the wire primitive. The human command writes the
+bytes verbatim (no ANSI stripping), so escape sequences reach the terminal; use
+`--json` for the exact payload (one compact frame per line with `--follow`).
 
 Options must come **before** the message text, because the text is a trailing
 argument (`sendmessage dev --no-wait "run the tests"`).
@@ -162,7 +166,7 @@ argument (`sendmessage dev --no-wait "run the tests"`).
 | `agent-bridge ack <name> <id> [--note TEXT]` | record an explicit application-level acknowledgement for a message you received (alias `acknowledge`) |
 | `agent-bridge messagestatus <id>` | delivery status of one message (alias `msg-status`) |
 | `agent-bridge pending <name>` | messages for an agent that are still queued, writing, unknown or awaiting_ack |
-| `agent-bridge read <name> [--lines N] [--since OFFSET]` | ANSI-stripped tail, or raw bytes from a byte cursor (`--lines` is ignored with `--since`) |
+| `agent-bridge read <name> [--lines N] [--since OFFSET] [--wait 5s] [--follow]` | ANSI-stripped tail, or raw bytes from a byte cursor (`--lines` is ignored with `--since`); `--wait` long-polls once, `--follow` keeps polling |
 | `agent-bridge attach <name>` | live mirror + keyboard passthrough |
 | `agent-bridge kill <name>` | Ctrl-C first; `--force` kills the agent's process tree immediately (Windows: whole job; Unix: process group + best-effort tree snapshot from `ps` or `/proc`, plus a PTY fd sweep on Linux) |
 | `agent-bridge log` | global message history (id, status, sender, body) |

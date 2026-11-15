@@ -212,6 +212,7 @@ fn output_text(target: &str) -> String {
         target: target.to_string(),
         lines: Some(10_000),
         since: None,
+        wait_ms: None,
     })
     .expect("read")
     {
@@ -1203,12 +1204,24 @@ fn read_chunk(target: &str, since: u64) -> Response {
         target: target.to_string(),
         lines: None,
         since: Some(since),
+        wait_ms: None,
     })
     .expect("cursor read")
 }
 
-/// Decode a `Chunk` response into `(bytes, offset, next_offset, dropped)`.
-fn chunk_parts(response: Response) -> (Vec<u8>, u64, u64, bool) {
+/// Request one cursor chunk, long-polling up to `wait_ms` for new bytes.
+fn read_chunk_wait(target: &str, since: u64, wait_ms: u64) -> Response {
+    client::request(&Request::Read {
+        target: target.to_string(),
+        lines: None,
+        since: Some(since),
+        wait_ms: Some(wait_ms),
+    })
+    .expect("cursor read")
+}
+
+/// Decode a `Chunk` into `(bytes, offset, next_offset, dropped, timed_out)`.
+fn chunk_parts(response: Response) -> (Vec<u8>, u64, u64, bool, bool) {
     use base64::Engine as _;
     match response {
         Response::Chunk {
@@ -1216,12 +1229,13 @@ fn chunk_parts(response: Response) -> (Vec<u8>, u64, u64, bool) {
             offset,
             next_offset,
             dropped,
+            timed_out,
             ..
         } => {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(data)
                 .expect("base64 chunk");
-            (bytes, offset, next_offset, dropped)
+            (bytes, offset, next_offset, dropped, timed_out)
         }
         other => panic!("expected a chunk response, got {other:?}"),
     }
@@ -1233,6 +1247,7 @@ fn line_read_next_offset(target: &str) -> u64 {
         target: target.to_string(),
         lines: Some(20),
         since: None,
+        wait_ms: None,
     })
     .expect("read")
     {
@@ -1301,7 +1316,7 @@ fn cursor_reads_return_each_byte_once() {
     let mut quiet_since: Option<Instant> = None;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let (bytes, offset, next_offset, dropped) = chunk_parts(read_chunk("stream", cursor));
+        let (bytes, offset, next_offset, dropped, _) = chunk_parts(read_chunk("stream", cursor));
         assert!(!dropped, "the whole stream fits in the default buffer");
         assert_eq!(offset, cursor, "a chunk started at the wrong offset");
         assert!(bytes.len() <= 64 * 1024, "chunk exceeded the 64 KiB cap");
@@ -1367,14 +1382,14 @@ fn cursor_older_than_the_buffer_reports_a_gap() {
 
     let total = line_read_next_offset("wrapped");
     assert!(total >= 1024);
-    let (bytes, offset, next_offset, dropped) = chunk_parts(read_chunk("wrapped", 0));
+    let (bytes, offset, next_offset, dropped, _) = chunk_parts(read_chunk("wrapped", 0));
     assert!(dropped, "offset 0 should have rotated out");
     assert_eq!(offset, total - 1024, "the chunk starts at the oldest byte");
     assert_eq!(next_offset, total);
     assert_eq!(offset + 1024, next_offset);
     assert_eq!(bytes.len(), 1024, "the whole retained window is returned");
 
-    let (more, offset, after, dropped) = chunk_parts(read_chunk("wrapped", next_offset));
+    let (more, offset, after, dropped, _) = chunk_parts(read_chunk("wrapped", next_offset));
     assert!(!dropped, "continuing from the newest offset has no gap");
     assert_eq!(offset, next_offset);
     assert_eq!(after, offset + more.len() as u64);
@@ -1399,11 +1414,104 @@ fn cursor_ahead_of_the_stream_is_rejected() {
         other => panic!("expected an error response, got {other:?}"),
     }
 
-    let (bytes, offset, next_offset, dropped) = chunk_parts(read_chunk("quiet-cursor", total));
+    let (bytes, offset, next_offset, dropped, _) = chunk_parts(read_chunk("quiet-cursor", total));
     assert_eq!(bytes.len(), 0);
     assert_eq!(offset, total);
     assert_eq!(next_offset, total);
     assert!(!dropped);
 
     kill("quiet-cursor");
+}
+
+/// A long-poll that sees no new bytes returns an empty `timed_out` chunk after
+/// roughly the requested window.
+#[test]
+fn long_poll_times_out_without_new_output() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent_with("idle-follow", silent_command());
+    thread::sleep(Duration::from_millis(300));
+
+    let total = line_read_next_offset("idle-follow");
+    let started = Instant::now();
+    let (bytes, offset, next, dropped, timed_out) =
+        chunk_parts(read_chunk_wait("idle-follow", total, 300));
+    let elapsed = started.elapsed();
+
+    assert!(timed_out, "an empty wait must be reported as timed_out");
+    assert_eq!(bytes.len(), 0);
+    assert_eq!(offset, total);
+    assert_eq!(next, total);
+    assert!(!dropped);
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "the daemon returned after only {elapsed:?}"
+    );
+
+    kill("idle-follow");
+}
+
+/// A long-poll returns as soon as bytes arrive, instead of waiting out the
+/// whole window.
+#[test]
+fn long_poll_returns_when_output_arrives() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent_with("late-follow", agent_command());
+    thread::sleep(Duration::from_millis(300));
+    let total = line_read_next_offset("late-follow");
+
+    let sender = thread::spawn(|| {
+        thread::sleep(Duration::from_millis(200));
+        send_with(
+            "late-follow",
+            "echo late-follow-marker\n".to_string(),
+            false,
+            0,
+            0,
+        );
+    });
+    let started = Instant::now();
+    let (bytes, offset, next, dropped, timed_out) =
+        chunk_parts(read_chunk_wait("late-follow", total, 10_000));
+    let elapsed = started.elapsed();
+    sender.join().expect("sender");
+
+    assert!(!timed_out, "bytes arrived, so the chunk must not time out");
+    assert!(!dropped);
+    assert!(elapsed < Duration::from_secs(5), "waited {elapsed:?}");
+    assert_eq!(offset, total);
+    assert_eq!(next, offset + bytes.len() as u64);
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("late-follow-marker"),
+        "missing marker in {text:?}"
+    );
+
+    kill("late-follow");
+}
+
+/// `wait_ms` only applies to cursor reads; a line read returns immediately.
+#[test]
+fn wait_is_ignored_without_since() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent_with("line-wait", silent_command());
+    thread::sleep(Duration::from_millis(300));
+
+    let started = Instant::now();
+    match client::request(&Request::Read {
+        target: "line-wait".to_string(),
+        lines: Some(20),
+        since: None,
+        wait_ms: Some(10_000),
+    })
+    .expect("read")
+    {
+        Response::Output { next_offset, .. } => assert!(next_offset < 10_000),
+        other => panic!("expected an output response, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a line read must not long-poll"
+    );
+
+    kill("line-wait");
 }

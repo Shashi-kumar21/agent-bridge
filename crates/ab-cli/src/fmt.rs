@@ -124,6 +124,7 @@ pub fn print_chunk(
     offset: Offset,
     next_offset: Offset,
     dropped: bool,
+    report_offset: bool,
 ) -> Result<()> {
     if dropped {
         eprintln!("--- {agent} (gap: oldest retained byte is offset {offset}) ---");
@@ -135,7 +136,9 @@ pub fn print_chunk(
         }
         return Err(BridgeError::Io(err));
     }
-    eprintln!("next offset: {next_offset}");
+    if report_offset {
+        eprintln!("next offset: {next_offset}");
+    }
     Ok(())
 }
 
