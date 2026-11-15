@@ -409,8 +409,8 @@ pub enum Request {
         /// [`Response::Chunk`] with `timed_out: true`. `Some(0)` checks once and
         /// returns immediately with `timed_out: false`. Ignored without `since`.
         /// A daemon caps the value at 60 s, and if the agent exits while the
-        /// request is held the daemon fails it with `exited` instead of waiting
-        /// out a window that can never fill.
+        /// request is held the daemon fails it with `conflict` instead of
+        /// waiting out a window that can never fill.
         #[serde(default)]
         wait_ms: Option<Millis>,
     },
@@ -763,6 +763,22 @@ mod tests {
             Request::Read {
                 since: Some(12),
                 wait_ms: Some(2_500),
+                ..
+            }
+        ));
+    }
+
+    /// Unknown fields from a newer daemon are ignored, so an old client still
+    /// parses the frame.
+    #[test]
+    fn unknown_response_fields_are_ignored() {
+        let frame = r#"{"kind":"chunk","agent":"dev","data":"aGk=","offset":0,"next_offset":2,"dropped":false,"timed_out":false,"future_field":7,"seq":3}"#;
+        let parsed: Response = serde_json::from_str(frame).expect("future chunk");
+        assert!(matches!(
+            parsed,
+            Response::Chunk {
+                offset: 0,
+                next_offset: 2,
                 ..
             }
         ));

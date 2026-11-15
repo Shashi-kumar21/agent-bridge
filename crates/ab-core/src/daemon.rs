@@ -439,9 +439,7 @@ impl Inner {
             } => {
                 let agent = self.get(&target)?;
                 if let Some(since) = since {
-                    let wait = wait_ms.map_or(Duration::ZERO, |ms| {
-                        Duration::from_millis(ms).min(MAX_FOLLOW_WAIT)
-                    });
+                    let wait = follow_wait(wait_ms);
                     let deadline = Instant::now() + wait;
                     loop {
                         let chunk = agent.read_since(since, MAX_READ_CHUNK).map_err(|total| {
@@ -850,6 +848,13 @@ fn settle(status: DeliveryStatus, require_ack: bool) -> DeliveryStatus {
     }
 }
 
+/// Clamp a requested long-poll window to the daemon cap.
+fn follow_wait(wait_ms: Option<Millis>) -> Duration {
+    wait_ms.map_or(Duration::ZERO, |ms| {
+        Duration::from_millis(ms).min(MAX_FOLLOW_WAIT)
+    })
+}
+
 /// Build the wire response for one cursor chunk.
 fn chunk_response(agent: &Agent, target: String, chunk: &CursorChunk, timed_out: bool) -> Response {
     Response::Chunk {
@@ -1074,9 +1079,10 @@ fn write_frame<W: Write, T: serde::Serialize>(writer: &mut W, value: &T) -> std:
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_status, apply_writing, settle, status_after_timeout, DeliveryStatus, Message,
-        MessageLog, Millis, Mutex, MAX_LOG,
+        apply_status, apply_writing, follow_wait, settle, status_after_timeout, DeliveryStatus,
+        Message, MessageLog, Millis, Mutex, MAX_FOLLOW_WAIT, MAX_LOG,
     };
+    use std::time::Duration;
 
     fn record(id: u64, target: &str, status: DeliveryStatus) -> Message {
         Message {
@@ -1090,6 +1096,14 @@ mod tests {
             status,
             ack: None,
         }
+    }
+
+    #[test]
+    fn follow_wait_clamps_to_the_cap() {
+        assert_eq!(follow_wait(None), Duration::ZERO);
+        assert_eq!(follow_wait(Some(0)), Duration::ZERO);
+        assert_eq!(follow_wait(Some(1_500)), Duration::from_millis(1_500));
+        assert_eq!(follow_wait(Some(u64::MAX)), MAX_FOLLOW_WAIT);
     }
 
     #[test]

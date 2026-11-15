@@ -1256,6 +1256,25 @@ fn line_read_next_offset(target: &str) -> u64 {
     }
 }
 
+/// Wait until the agent's live output has stopped moving, and return the
+/// current offset. Two equal reads 300 ms apart is a cheap quiescence check.
+fn wait_for_quiet_offset(target: &str) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last = line_read_next_offset(target);
+    let mut stable_since = Instant::now();
+    loop {
+        thread::sleep(Duration::from_millis(100));
+        let next = line_read_next_offset(target);
+        if next != last {
+            last = next;
+            stable_since = Instant::now();
+        } else if stable_since.elapsed() >= Duration::from_millis(300) {
+            return next;
+        }
+        assert!(Instant::now() < deadline, "output never went quiet");
+    }
+}
+
 /// Wait until the agent has produced at least `min_bytes`.
 fn wait_for_offset(target: &str, min_bytes: u64) {
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1429,9 +1448,7 @@ fn cursor_ahead_of_the_stream_is_rejected() {
 fn long_poll_times_out_without_new_output() {
     let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
     create_agent_with("idle-follow", silent_command());
-    thread::sleep(Duration::from_millis(300));
-
-    let total = line_read_next_offset("idle-follow");
+    let total = wait_for_quiet_offset("idle-follow");
     let started = Instant::now();
     let (bytes, offset, next, dropped, timed_out) =
         chunk_parts(read_chunk_wait("idle-follow", total, 300));
@@ -1456,8 +1473,7 @@ fn long_poll_times_out_without_new_output() {
 fn long_poll_returns_when_output_arrives() {
     let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
     create_agent_with("late-follow", agent_command());
-    thread::sleep(Duration::from_millis(300));
-    let total = line_read_next_offset("late-follow");
+    let total = wait_for_quiet_offset("late-follow");
 
     let sender = thread::spawn(|| {
         thread::sleep(Duration::from_millis(200));
@@ -1510,10 +1526,10 @@ fn long_poll_returns_when_output_arrives() {
 fn long_poll_fails_when_the_agent_exits() {
     let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
     create_agent_with("dead-follow", silent_command());
-    thread::sleep(Duration::from_millis(300));
+    let _ = wait_for_quiet_offset("dead-follow");
     kill("dead-follow");
-    // Let the kill echo settle, then start the wait past every buffered byte.
-    thread::sleep(Duration::from_millis(500));
+    // Wait for the exit and its echo to settle, then start past every byte.
+    wait_for_exit("dead-follow");
     let total = line_read_next_offset("dead-follow");
 
     let started = Instant::now();
@@ -1524,6 +1540,53 @@ fn long_poll_fails_when_the_agent_exits() {
         other => panic!("expected an exited error, got {other:?}"),
     }
     assert!(elapsed < Duration::from_secs(2), "waited {elapsed:?}");
+}
+
+/// A window that wraps while a request is parked reports the gap immediately
+/// instead of waiting out the poll window.
+#[test]
+fn long_poll_reports_a_gap_that_happens_during_the_wait() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    // Sampled when the agent spawns, so set it before the agent exists.
+    std::env::set_var("AGENT_BRIDGE_BUFFER_BYTES", "1024");
+    create_agent_with("wrap-follow", agent_command());
+    let total = wait_for_quiet_offset("wrap-follow");
+
+    let payload = format!(
+        "echo {}
+",
+        "x".repeat(4096)
+    );
+    let sender = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        send_with_paste("wrap-follow", payload, false, 0, 0, PasteMode::Plain);
+    });
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(10);
+    let mut cursor = total;
+    let mut saw_gap = false;
+    while Instant::now() < deadline {
+        let (bytes, offset, next, dropped, timed_out) =
+            chunk_parts(read_chunk_wait("wrap-follow", cursor, 10_000));
+        if dropped {
+            saw_gap = true;
+            assert!(!timed_out, "a gap must not be reported as a timeout");
+            assert_eq!(offset, next - bytes.len() as u64);
+            assert_eq!(offset + 1024, next, "the gap is clamped to the window");
+            break;
+        }
+        assert!(!timed_out, "no bytes arrived within the poll window");
+        assert_eq!(offset, cursor);
+        cursor = next;
+    }
+    sender.join().expect("sender");
+
+    assert!(
+        saw_gap,
+        "a 1 KiB window should report the overflow as a gap"
+    );
+    kill("wrap-follow");
 }
 
 /// `wait_ms` only applies to cursor reads; a line read returns immediately.

@@ -64,7 +64,8 @@ The remaining gap is the OS write itself: once `write_all` is inside the PTY
 there is no portable way to cancel it. `--write-timeout` (5 s by default, `0`
 waits forever) makes the caller return `unknown`; the writer keeps waiting and
 amends the record to `written`/`failed` when the syscall returns
-(`delivery.rs:486-500`, `daemon.rs:578-612`, `:860-886`). A target that never
+(`delivery.rs:486-500`, `daemon.rs:576-610`, `daemon.rs:871-897`). A target that
+never
 drains its PTY therefore keeps the in-flight byte reservation and the channel
 fills up behind it until the agent exits or the daemon is restarted; new
 messages to that agent
@@ -147,7 +148,7 @@ Roadmap §6 (VT screen model and snapshot).
 `read --since OFFSET` returns raw output bytes from an absolute per-agent byte
 offset as a `Chunk` (`protocol.rs:528-551`): `offset`, `next_offset`, `dropped`
 and the current `seq`, with the bytes base64 encoded
-(`daemon.rs:434-469`, `buffer.rs:122-145`). Each response carries at most
+(`daemon.rs:434-467`, `buffer.rs:122-145`). Each response carries at most
 64 KiB of raw bytes (`MAX_READ_CHUNK`, `daemon.rs:41`; base64 inflates the JSON
 frame), so a caller that wants everything new must loop until `next_offset`
 stops moving.
@@ -169,7 +170,10 @@ carries the newest `seq` for bytes that may include older chunks. If the agent
 exits while a request is held, no further bytes can arrive, so the daemon fails
 that request with `conflict` (dead agent) at once instead of waiting out the
 window. A zero window (`wait_ms: 0`, `--wait 0`) polls once and returns the
-current cursor with `timed_out: false`.
+current cursor with `timed_out: false`. A client that disconnects (Ctrl-C on
+`--follow`) does not cancel the daemon-side wait: that thread finishes its
+window (at most 60 s) and then fails writing the response, which is bounded but
+means a killed follower can leave one short-lived sleeping thread behind.
 
 ```bash
 agent-bridge --json read shell --since 0     # offset, next_offset, dropped, data
@@ -350,7 +354,7 @@ Roadmap §3 (heuristic readiness with documented caveats).
 ## 18. `--wait-idle` and `--wait-reply` are best-effort heuristics
 
 `--wait-idle` polls the same readiness signal as `listagents`
-(`daemon.rs:750-768`, `readiness.rs:94-121`), so every caveat in §17 applies: a
+(`daemon.rs:748-766`, `readiness.rs:94-121`), so every caveat in §17 applies: a
 target that printed once and then runs silently looks idle, and one that keeps
 redrawing never becomes idle. `unknown` is treated as ready so a fresh shell is
 not blocked, which also means an agent whose startup produced only control
@@ -360,7 +364,7 @@ and writes nothing; the message is not queued and no id is recorded.
 `--wait-reply` subscribes before the message is queued and collects
 `Event::Output` until the agent's configured quiet period passes, the PTY reader
 closes after an exit, the channel closes, or the deadline expires
-(`daemon.rs:773-839`). When the target exits, the queued output frames are
+(`daemon.rs:771-837`). When the target exits, the queued output frames are
 drained before the reply is marked `settled`, so a marker printed just before
 the exit is still returned. If the child exits while a descendant keeps the PTY
 open, the reader never closes; the reply then ends at the first quiet gap (or at

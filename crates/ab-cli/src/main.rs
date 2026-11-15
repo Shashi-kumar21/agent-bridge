@@ -345,16 +345,7 @@ fn run(cli: Cli) -> Result<()> {
             wait,
             follow,
         } => {
-            if since.is_none() && (wait.is_some() || follow) {
-                return Err(BridgeError::Usage(
-                    "--wait and --follow require --since OFFSET".to_string(),
-                ));
-            }
-            if follow && wait == Some(Duration::ZERO) {
-                return Err(BridgeError::Usage(
-                    "--follow needs a non-zero --wait window".to_string(),
-                ));
-            }
+            validate_read_flags(since, wait, follow)?;
             ensure_daemon(true)?;
             let wait = wait.or_else(|| follow.then_some(Duration::from_secs(5)));
             if let (Some(since), false) = (since, follow) {
@@ -741,6 +732,21 @@ fn parse_paste(raw: &str) -> std::result::Result<PasteMode, String> {
     }
 }
 
+/// Reject read flags that cannot be honoured, before any daemon is started.
+fn validate_read_flags(since: Option<Offset>, wait: Option<Duration>, follow: bool) -> Result<()> {
+    if since.is_none() && (wait.is_some() || follow) {
+        return Err(BridgeError::Usage(
+            "--wait and --follow require --since OFFSET".to_string(),
+        ));
+    }
+    if follow && wait == Some(Duration::ZERO) {
+        return Err(BridgeError::Usage(
+            "--follow needs a non-zero --wait window".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Decode a base64 chunk payload, treating corruption as a protocol error.
 fn decode_chunk(data: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
@@ -779,8 +785,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        decode_chunk, duration_millis, parse_paste, parse_timeout, skew_restart_is_safe, Cli,
-        Command,
+        decode_chunk, duration_millis, parse_paste, parse_timeout, skew_restart_is_safe,
+        validate_read_flags, Cli, Command,
     };
     use agent_bridge_core::error::BridgeError;
     use agent_bridge_core::protocol::PasteMode;
@@ -808,6 +814,17 @@ mod tests {
 
         let alias = Cli::try_parse_from(["agent-bridge", "msg-status", "7"]).expect("parse alias");
         assert!(matches!(alias.command, Command::Messagestatus { id: 7 }));
+    }
+
+    #[test]
+    fn read_flags_need_since_and_a_follow_window() {
+        assert!(validate_read_flags(Some(0), None, false).is_ok());
+        assert!(validate_read_flags(Some(0), Some(Duration::from_secs(1)), false).is_ok());
+        assert!(validate_read_flags(None, Some(Duration::from_secs(1)), false).is_err());
+        assert!(validate_read_flags(None, None, true).is_err());
+        assert!(validate_read_flags(Some(0), Some(Duration::ZERO), true).is_err());
+        // A zero window is fine for a single poll.
+        assert!(validate_read_flags(Some(0), Some(Duration::ZERO), false).is_ok());
     }
 
     #[test]
