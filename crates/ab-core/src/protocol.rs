@@ -406,8 +406,11 @@ pub enum Request {
         since: Option<Offset>,
         /// Long-poll window in milliseconds. With `since` set, the daemon waits
         /// up to this long for bytes after the cursor before returning an empty
-        /// [`Response::Chunk`] with `timed_out: true`. Ignored without `since`.
-        /// A daemon caps the value at 60 s.
+        /// [`Response::Chunk`] with `timed_out: true`. `Some(0)` checks once and
+        /// returns immediately with `timed_out: false`. Ignored without `since`.
+        /// A daemon caps the value at 60 s, and if the agent exits while the
+        /// request is held the daemon fails it with `exited` instead of waiting
+        /// out a window that can never fill.
         #[serde(default)]
         wait_ms: Option<Millis>,
     },
@@ -738,6 +741,28 @@ mod tests {
                 since: None,
                 wait_ms: None,
                 lines: Some(40),
+                ..
+            }
+        ));
+    }
+
+    /// A waiting cursor read keeps `wait_ms` on the wire.
+    #[test]
+    fn read_frame_round_trips_wait_ms() {
+        let request = Request::Read {
+            target: "dev".to_string(),
+            lines: None,
+            since: Some(12),
+            wait_ms: Some(2_500),
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert!(json.contains("\"wait_ms\":2500"));
+        let parsed: Request = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            parsed,
+            Request::Read {
+                since: Some(12),
+                wait_ms: Some(2_500),
                 ..
             }
         ));

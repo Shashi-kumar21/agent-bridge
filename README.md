@@ -143,14 +143,16 @@ offset instead of a line tail. Each response carries at most 64 KiB of raw bytes
 loop from the previous `next_offset` to consume new output exactly once. A
 `since` older than the retained window is clamped to the oldest byte and flagged
 `dropped`; a `since` past the newest byte fails with `bad_request`. Offsets reset
-when the daemon restarts or the agent is re-created. Cursor reads do not wait, so
-a follower polls `--since`. `--wait 5s` turns one cursor read into a long-poll
-that returns as soon as new bytes arrive or after the window expires (empty chunk
-with `timed_out`); the daemon caps the window at 60s. `--since N --follow` keeps
+when the daemon restarts or the agent is re-created. A bare cursor read returns
+only the bytes already buffered, so a follower polls `--since`. `--wait 5s`
+turns that poll into a long-poll that returns as soon as new bytes arrive or
+after the window expires (empty chunk with `timed_out`); the daemon caps the
+window at 60s. `--since N --follow` keeps
 long-polling and prints chunks as they come (Ctrl-C to stop), which is the
 convenience wrapper around the wire primitive. The human command writes the
 bytes verbatim (no ANSI stripping), so escape sequences reach the terminal; use
-`--json` for the exact payload (one compact frame per line with `--follow`).
+`--json` for the exact payload (one compact frame per line with `--follow`,
+including empty `timed_out` frames, which serve as keepalives).
 
 Options must come **before** the message text, because the text is a trailing
 argument (`sendmessage dev --no-wait "run the tests"`).

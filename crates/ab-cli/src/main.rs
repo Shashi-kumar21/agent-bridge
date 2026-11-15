@@ -345,12 +345,17 @@ fn run(cli: Cli) -> Result<()> {
             wait,
             follow,
         } => {
-            ensure_daemon(true)?;
             if since.is_none() && (wait.is_some() || follow) {
                 return Err(BridgeError::Usage(
                     "--wait and --follow require --since OFFSET".to_string(),
                 ));
             }
+            if follow && wait == Some(Duration::ZERO) {
+                return Err(BridgeError::Usage(
+                    "--follow needs a non-zero --wait window".to_string(),
+                ));
+            }
+            ensure_daemon(true)?;
             let wait = wait.or_else(|| follow.then_some(Duration::from_secs(5)));
             if let (Some(since), false) = (since, follow) {
                 // One bounded request: the chunk is printed verbatim, and a
@@ -417,11 +422,12 @@ fn run(cli: Cli) -> Result<()> {
                         timed_out,
                         ..
                     } => {
-                        let bytes = decode_chunk(data)?;
                         if json {
                             // One compact frame per line keeps the stream parseable.
+                            // The payload is passed through verbatim.
                             println!("{}", serde_json::to_string(&response)?);
                         } else if !timed_out {
+                            let bytes = decode_chunk(data)?;
                             fmt::print_chunk(
                                 &target,
                                 &bytes,
@@ -772,9 +778,21 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use std::time::Duration;
 
-    use super::{duration_millis, parse_paste, parse_timeout, skew_restart_is_safe, Cli, Command};
+    use super::{
+        decode_chunk, duration_millis, parse_paste, parse_timeout, skew_restart_is_safe, Cli,
+        Command,
+    };
+    use agent_bridge_core::error::BridgeError;
     use agent_bridge_core::protocol::PasteMode;
     use clap::Parser;
+
+    /// A corrupt chunk payload is reported as a protocol error, not a panic.
+    #[test]
+    fn decode_chunk_rejects_corrupt_base64() {
+        let err = decode_chunk("not base64!").expect_err("corrupt payload");
+        assert!(matches!(err, BridgeError::Protocol(_)));
+        assert_eq!(decode_chunk("aGk=").expect("valid payload"), b"hi");
+    }
 
     #[test]
     fn skew_restart_requires_idle_daemon() {

@@ -1470,23 +1470,60 @@ fn long_poll_returns_when_output_arrives() {
         );
     });
     let started = Instant::now();
-    let (bytes, offset, next, dropped, timed_out) =
-        chunk_parts(read_chunk_wait("late-follow", total, 10_000));
+    let deadline = started + Duration::from_secs(10);
+    let mut cursor = total;
+    let mut text = String::new();
+    let mut timed_out = false;
+    // One PTY read can split the marker, so consume chunks until it is whole.
+    while Instant::now() < deadline {
+        let (bytes, offset, next, dropped, expired) =
+            chunk_parts(read_chunk_wait("late-follow", cursor, 10_000));
+        assert!(!dropped);
+        assert_eq!(offset, cursor);
+        assert_eq!(next, offset + bytes.len() as u64);
+        if expired {
+            timed_out = true;
+            break;
+        }
+        cursor = next;
+        text.push_str(&String::from_utf8_lossy(&bytes));
+        if text.contains("late-follow-marker") {
+            break;
+        }
+    }
     let elapsed = started.elapsed();
     sender.join().expect("sender");
 
     assert!(!timed_out, "bytes arrived, so the chunk must not time out");
-    assert!(!dropped);
     assert!(elapsed < Duration::from_secs(5), "waited {elapsed:?}");
-    assert_eq!(offset, total);
-    assert_eq!(next, offset + bytes.len() as u64);
-    let text = String::from_utf8_lossy(&bytes);
     assert!(
         text.contains("late-follow-marker"),
         "missing marker in {text:?}"
     );
 
     kill("late-follow");
+}
+
+/// A wait on an agent that has exited fails at once instead of holding the
+/// connection for a window that can never fill.
+#[test]
+fn long_poll_fails_when_the_agent_exits() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent_with("dead-follow", silent_command());
+    thread::sleep(Duration::from_millis(300));
+    kill("dead-follow");
+    // Let the kill echo settle, then start the wait past every buffered byte.
+    thread::sleep(Duration::from_millis(500));
+    let total = line_read_next_offset("dead-follow");
+
+    let started = Instant::now();
+    let response = read_chunk_wait("dead-follow", total, 10_000);
+    let elapsed = started.elapsed();
+    match response {
+        Response::Error { code, .. } => assert_eq!(code, ErrorCode::Conflict),
+        other => panic!("expected an exited error, got {other:?}"),
+    }
+    assert!(elapsed < Duration::from_secs(2), "waited {elapsed:?}");
 }
 
 /// `wait_ms` only applies to cursor reads; a line read returns immediately.

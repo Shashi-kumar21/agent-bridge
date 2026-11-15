@@ -458,6 +458,12 @@ impl Inner {
                         if remaining.is_zero() {
                             return Ok(chunk_response(&agent, target, &chunk, !wait.is_zero()));
                         }
+                        if !agent.is_running() {
+                            // The process is gone, so no further bytes can arrive:
+                            // fail instead of holding the connection for a window
+                            // that can never be filled.
+                            return Err(BridgeError::AgentExited(target));
+                        }
                         thread::sleep(FOLLOW_POLL.min(remaining));
                     }
                 }
