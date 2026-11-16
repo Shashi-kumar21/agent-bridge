@@ -117,7 +117,7 @@ permission prompt. Readiness detection is heuristic and must be documented as su
 -   [x] Add output offsets and a cursor-based read: `read <name> --since <offset>` returns new output and the next offset, so callers do not re-read the same data (capped at 64 KiB of raw bytes per response; a wrapped window is reported with `dropped`).
 -   [x] Add a bounded follow/stream mode (or long-poll) suitable for MCP clients, with clear behavior when the buffer wraps and older offsets are no longer available. `read --since N --wait 5s` long-polls one chunk (60 s cap, `timed_out` on expiry); `--follow` repeats it. A wrapped window still reports `dropped` and is clamped to the oldest retained byte.
 -   [x] Make the quiet period, prompt patterns, and buffer sizes configurable, with safe defaults (`AGENT_BRIDGE_QUIET_MS`, `AGENT_BRIDGE_PROMPT_PATTERN`, `AGENT_BRIDGE_BUFFER_BYTES`).
--   [x] Add tests using a mock agent that alternates busy/idle output, prints prompts, and goes silent; cover timeouts and offset expiry. Readiness, wait-idle timeout/unknown, wait-reply settled/timeout/exit-drain, byte-once cursor reads, and offset expiry after a buffer wrap are covered (follow/stream expiry lands with the follow item above).
+-   [x] Add tests using a mock agent that alternates busy/idle output, prints prompts, and goes silent; cover timeouts and offset expiry. Readiness, wait-idle timeout/unknown, wait-reply settled/timeout/exit-drain, byte-once cursor reads, offset expiry after a buffer wrap, and long-poll timeout/early-return/gap are covered (`long_poll_*` in `message_delivery.rs`).
 
 **Acceptance criterion:** With a deterministic mock agent, `--wait-idle` never writes
 during a scripted busy period, and `--since` returns each output byte exactly once

@@ -62,8 +62,8 @@ Module map (`crates/ab-core/src`):
   `daemon.rs:106-112`).
 * Each agent starts three threads: a PTY reader pump (`agent.rs:214-216`), a
   child waiter that polls `try_wait` every 120 ms (`agent.rs:219-221`,
-  `delivery.rs:269-311`), and one write-queue writer (`delivery.rs:368-372`). The writer exits
-  when the agent is marked not running or the queue is dropped.
+  `agent.rs:269-311`), and one write-queue writer (`delivery.rs:368-372`). The
+  writer exits when the agent is marked not running or the queue is dropped.
 * Per-agent mutable state lives behind mutexes inside `Agent`
   (`agent.rs:94-123`): PTY master (resize), child handle, output buffer, message
   history, subscriber list, reaper, and the write-queue handle.
@@ -114,7 +114,9 @@ pipelining: a second request on the same connection is never read.
    (`Offset`, `protocol.rs:24-29`). With `wait_ms` the handler holds the request
    open and re-reads the buffer every 25 ms until bytes arrive or the window
    expires (capped at 60 s), then returns an empty chunk with `timed_out: true`
-   (`daemon.rs:43-45`, `daemon.rs:441-466`). This is a bounded long-poll, not a
+   (`daemon.rs:43-45`, `daemon.rs:441-466`). A window that wraps while parked
+   returns at once with `dropped: true` and `timed_out: false`, clamped to the
+   oldest retained byte. This is a bounded long-poll, not a
    push stream: each waiter occupies one connection thread, and the CLI
    `--follow` simply repeats the request. A waiter whose agent exits fails with
    `conflict` instead of sleeping out a window that can never fill.

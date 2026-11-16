@@ -65,8 +65,7 @@ there is no portable way to cancel it. `--write-timeout` (5 s by default, `0`
 waits forever) makes the caller return `unknown`; the writer keeps waiting and
 amends the record to `written`/`failed` when the syscall returns
 (`delivery.rs:486-500`, `daemon.rs:576-610`, `daemon.rs:871-897`). A target that
-never
-drains its PTY therefore keeps the in-flight byte reservation and the channel
+never drains its PTY therefore keeps the in-flight byte reservation and the channel
 fills up behind it until the agent exits or the daemon is restarted; new
 messages to that agent
 eventually fail with `queue_full`.
@@ -170,7 +169,8 @@ carries the newest `seq` for bytes that may include older chunks. If the agent
 exits while a request is held, no further bytes can arrive, so the daemon fails
 that request with `conflict` (dead agent) at once instead of waiting out the
 window. A zero window (`wait_ms: 0`, `--wait 0`) polls once and returns the
-current cursor with `timed_out: false`. A client that disconnects (Ctrl-C on
+current cursor with `timed_out: false`; `--follow --wait 0` is rejected because
+it would spin. A client that disconnects (Ctrl-C on
 `--follow`) does not cancel the daemon-side wait: that thread finishes its
 window (at most 60 s) and then fails writing the response, which is bounded but
 means a killed follower can leave one short-lived sleeping thread behind.

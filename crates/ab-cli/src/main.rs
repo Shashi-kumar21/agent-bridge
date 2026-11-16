@@ -124,7 +124,8 @@ enum Command {
         #[arg(long, value_name = "WAIT", value_parser = parse_timeout)]
         wait: Option<Duration>,
         /// Keep long-polling after `--since` and print chunks as they arrive
-        /// (Ctrl-C to stop). Uses `--wait` as the poll window (default 5s).
+        /// (Ctrl-C to stop). Uses `--wait` as the poll window (default 5s); the
+        /// window must be non-zero.
         #[arg(long)]
         follow: bool,
     },

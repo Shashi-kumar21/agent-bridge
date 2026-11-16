@@ -768,6 +768,22 @@ mod tests {
         ));
     }
 
+    /// Unknown request fields from a newer client are ignored too, so a daemon
+    /// does not reject a frame just because it learned a new option.
+    #[test]
+    fn unknown_request_fields_are_ignored() {
+        let frame = r#"{"cmd":"read","target":"dev","since":3,"wait_ms":250,"future_option":true}"#;
+        let parsed: Request = serde_json::from_str(frame).expect("future request");
+        assert!(matches!(
+            parsed,
+            Request::Read {
+                since: Some(3),
+                wait_ms: Some(250),
+                ..
+            }
+        ));
+    }
+
     /// Unknown fields from a newer daemon are ignored, so an old client still
     /// parses the frame.
     #[test]
