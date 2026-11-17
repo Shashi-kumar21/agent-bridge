@@ -212,6 +212,7 @@ fn output_text(target: &str) -> String {
         target: target.to_string(),
         lines: Some(10_000),
         since: None,
+        wait_ms: None,
     })
     .expect("read")
     {
@@ -331,14 +332,17 @@ fn wait_for_capture(path: &Path, expected: &[u8]) {
 }
 
 fn kill(name: &str) {
-    assert!(matches!(
-        client::request(&Request::Kill {
-            name: name.to_string(),
-            force: Some(true),
-        })
-        .expect("kill"),
-        Response::Ok
-    ));
+    match client::request(&Request::Kill {
+        name: name.to_string(),
+        force: Some(true),
+    })
+    .expect("kill request")
+    {
+        Response::Ok => {}
+        // A bare `assert!(matches!..)` printed no variant, so the recurring
+        // macOS failure could not be diagnosed. Name the actual response.
+        other => panic!("kill '{name}' did not succeed: {other:?}"),
+    }
 }
 
 /// The roadmap acceptance test: 8 threads x 50 sends to one agent, every
@@ -1203,12 +1207,24 @@ fn read_chunk(target: &str, since: u64) -> Response {
         target: target.to_string(),
         lines: None,
         since: Some(since),
+        wait_ms: None,
     })
     .expect("cursor read")
 }
 
-/// Decode a `Chunk` response into `(bytes, offset, next_offset, dropped)`.
-fn chunk_parts(response: Response) -> (Vec<u8>, u64, u64, bool) {
+/// Request one cursor chunk, long-polling up to `wait_ms` for new bytes.
+fn read_chunk_wait(target: &str, since: u64, wait_ms: u64) -> Response {
+    client::request(&Request::Read {
+        target: target.to_string(),
+        lines: None,
+        since: Some(since),
+        wait_ms: Some(wait_ms),
+    })
+    .expect("cursor read")
+}
+
+/// Decode a `Chunk` into `(bytes, offset, next_offset, dropped, timed_out)`.
+fn chunk_parts(response: Response) -> (Vec<u8>, u64, u64, bool, bool) {
     use base64::Engine as _;
     match response {
         Response::Chunk {
@@ -1216,12 +1232,13 @@ fn chunk_parts(response: Response) -> (Vec<u8>, u64, u64, bool) {
             offset,
             next_offset,
             dropped,
+            timed_out,
             ..
         } => {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(data)
                 .expect("base64 chunk");
-            (bytes, offset, next_offset, dropped)
+            (bytes, offset, next_offset, dropped, timed_out)
         }
         other => panic!("expected a chunk response, got {other:?}"),
     }
@@ -1233,11 +1250,31 @@ fn line_read_next_offset(target: &str) -> u64 {
         target: target.to_string(),
         lines: Some(20),
         since: None,
+        wait_ms: None,
     })
     .expect("read")
     {
         Response::Output { next_offset, .. } => next_offset,
         other => panic!("expected an output response, got {other:?}"),
+    }
+}
+
+/// Wait until the agent's live output has stopped moving, and return the
+/// current offset. Two equal reads 300 ms apart is a cheap quiescence check.
+fn wait_for_quiet_offset(target: &str) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last = line_read_next_offset(target);
+    let mut stable_since = Instant::now();
+    loop {
+        thread::sleep(Duration::from_millis(100));
+        let next = line_read_next_offset(target);
+        if next != last {
+            last = next;
+            stable_since = Instant::now();
+        } else if stable_since.elapsed() >= Duration::from_millis(300) {
+            return next;
+        }
+        assert!(Instant::now() < deadline, "output never went quiet");
     }
 }
 
@@ -1301,7 +1338,7 @@ fn cursor_reads_return_each_byte_once() {
     let mut quiet_since: Option<Instant> = None;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let (bytes, offset, next_offset, dropped) = chunk_parts(read_chunk("stream", cursor));
+        let (bytes, offset, next_offset, dropped, _) = chunk_parts(read_chunk("stream", cursor));
         assert!(!dropped, "the whole stream fits in the default buffer");
         assert_eq!(offset, cursor, "a chunk started at the wrong offset");
         assert!(bytes.len() <= 64 * 1024, "chunk exceeded the 64 KiB cap");
@@ -1367,14 +1404,14 @@ fn cursor_older_than_the_buffer_reports_a_gap() {
 
     let total = line_read_next_offset("wrapped");
     assert!(total >= 1024);
-    let (bytes, offset, next_offset, dropped) = chunk_parts(read_chunk("wrapped", 0));
+    let (bytes, offset, next_offset, dropped, _) = chunk_parts(read_chunk("wrapped", 0));
     assert!(dropped, "offset 0 should have rotated out");
     assert_eq!(offset, total - 1024, "the chunk starts at the oldest byte");
     assert_eq!(next_offset, total);
     assert_eq!(offset + 1024, next_offset);
     assert_eq!(bytes.len(), 1024, "the whole retained window is returned");
 
-    let (more, offset, after, dropped) = chunk_parts(read_chunk("wrapped", next_offset));
+    let (more, offset, after, dropped, _) = chunk_parts(read_chunk("wrapped", next_offset));
     assert!(!dropped, "continuing from the newest offset has no gap");
     assert_eq!(offset, next_offset);
     assert_eq!(after, offset + more.len() as u64);
@@ -1399,11 +1436,226 @@ fn cursor_ahead_of_the_stream_is_rejected() {
         other => panic!("expected an error response, got {other:?}"),
     }
 
-    let (bytes, offset, next_offset, dropped) = chunk_parts(read_chunk("quiet-cursor", total));
+    let (bytes, offset, next_offset, dropped, _) = chunk_parts(read_chunk("quiet-cursor", total));
     assert_eq!(bytes.len(), 0);
     assert_eq!(offset, total);
     assert_eq!(next_offset, total);
     assert!(!dropped);
 
     kill("quiet-cursor");
+}
+
+/// A long-poll that sees no new bytes returns an empty `timed_out` chunk after
+/// roughly the requested window.
+#[test]
+fn long_poll_times_out_without_new_output() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent_with("idle-follow", silent_command());
+    let total = wait_for_quiet_offset("idle-follow");
+    let started = Instant::now();
+    let (bytes, offset, next, dropped, timed_out) =
+        chunk_parts(read_chunk_wait("idle-follow", total, 300));
+    let elapsed = started.elapsed();
+
+    assert!(timed_out, "an empty wait must be reported as timed_out");
+    assert_eq!(bytes.len(), 0);
+    assert_eq!(offset, total);
+    assert_eq!(next, total);
+    assert!(!dropped);
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "the daemon returned after only {elapsed:?}"
+    );
+
+    kill("idle-follow");
+}
+
+/// A long-poll returns as soon as bytes arrive, instead of waiting out the
+/// whole window.
+#[test]
+fn long_poll_returns_when_output_arrives() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent_with("late-follow", agent_command());
+    let total = wait_for_quiet_offset("late-follow");
+
+    let sender = thread::spawn(|| {
+        thread::sleep(Duration::from_millis(200));
+        send_with(
+            "late-follow",
+            "echo late-follow-marker\n".to_string(),
+            false,
+            0,
+            0,
+        );
+    });
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(10);
+    let mut cursor = total;
+    let mut text = String::new();
+    let mut timed_out = false;
+    // One PTY read can split the marker, so consume chunks until it is whole.
+    while Instant::now() < deadline {
+        let (bytes, offset, next, dropped, expired) =
+            chunk_parts(read_chunk_wait("late-follow", cursor, 10_000));
+        assert!(!dropped);
+        assert_eq!(offset, cursor);
+        assert_eq!(next, offset + bytes.len() as u64);
+        if expired {
+            timed_out = true;
+            break;
+        }
+        cursor = next;
+        text.push_str(&String::from_utf8_lossy(&bytes));
+        if text.contains("late-follow-marker") {
+            break;
+        }
+    }
+    let elapsed = started.elapsed();
+    sender.join().expect("sender");
+
+    assert!(!timed_out, "bytes arrived, so the chunk must not time out");
+    assert!(elapsed < Duration::from_secs(5), "waited {elapsed:?}");
+    assert!(
+        text.contains("late-follow-marker"),
+        "missing marker in {text:?}"
+    );
+
+    kill("late-follow");
+}
+
+/// A wait on an agent that has exited fails at once instead of holding the
+/// connection for a window that can never fill.
+#[test]
+fn long_poll_fails_when_the_agent_exits() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent_with("dead-follow", silent_command());
+    let _ = wait_for_quiet_offset("dead-follow");
+    kill("dead-follow");
+    // Wait for the exit and its echo to settle, then start past every byte.
+    wait_for_exit("dead-follow");
+    let total = line_read_next_offset("dead-follow");
+
+    let started = Instant::now();
+    let response = read_chunk_wait("dead-follow", total, 10_000);
+    let elapsed = started.elapsed();
+    match response {
+        Response::Error { code, .. } => assert_eq!(code, ErrorCode::Conflict),
+        other => panic!("expected an exited error, got {other:?}"),
+    }
+    assert!(elapsed < Duration::from_secs(2), "waited {elapsed:?}");
+}
+
+/// A window that wraps while a request is parked reports the gap immediately
+/// instead of waiting out the poll window.
+#[test]
+fn long_poll_reports_a_gap_that_happens_during_the_wait() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    // Sampled when the agent spawns, so set it before the agent exists.
+    std::env::set_var("AGENT_BRIDGE_BUFFER_BYTES", "1024");
+    create_agent_with("wrap-follow", agent_command());
+    let total = wait_for_quiet_offset("wrap-follow");
+
+    let payload = {
+        // Every tty line must stay under the kernel's canonical input limit
+        // (4096 bytes on Linux/macOS): a longer single line wedges the PTY
+        // master write on macOS - the newline never reaches the queue, the
+        // shell never produces output, and the poll starves with zero bytes
+        // (reproduced with one 4 KiB line and with four of them in a row).
+        // Eight ~518-byte lines are the same ~4 KiB, still past the 1 KiB
+        // window, and the burst cannot drain between polls because the tty
+        // echoes it as one continuous stream.
+        (0..8).fold(String::new(), |acc, _| {
+            acc + &format!("echo {}\n", "x".repeat(512))
+        })
+    };
+    let sender = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        // `wait` plus sane timeouts so a failed admission or write surfaces
+        // here: with `wait: false` and 0/0 the response is `Sent` even when
+        // admission fails, and a writer-thread failure only flips the logged
+        // status, so the poll starved with no diagnosable cause (seen twice
+        // on macOS CI).
+        let (id, _) = send_with_paste(
+            "wrap-follow",
+            payload,
+            true,
+            5_000,
+            10_000,
+            PasteMode::Plain,
+        );
+        let status = terminal_status(id);
+        assert_eq!(
+            status,
+            DeliveryStatus::Written,
+            "the wrap payload was not written to the PTY"
+        );
+        status
+    });
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(10);
+    let mut cursor = total;
+    let mut saw_gap = false;
+    while Instant::now() < deadline {
+        let (bytes, offset, next, dropped, timed_out) =
+            chunk_parts(read_chunk_wait("wrap-follow", cursor, 10_000));
+        if dropped {
+            saw_gap = true;
+            assert!(!timed_out, "a gap must not be reported as a timeout");
+            assert_eq!(offset, next - bytes.len() as u64);
+            assert_eq!(offset + 1024, next, "the gap is clamped to the window");
+            break;
+        }
+        if timed_out {
+            // Join the sender first: a failed delivery is diagnosed by the
+            // sender's own assert, while a Written payload with no echo
+            // means the bytes truly never came back and the status names it.
+            let status = sender
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+            panic!(
+                "no bytes arrived within the poll window though the payload status is {status:?}"
+            );
+        }
+        assert_eq!(offset, cursor);
+        cursor = next;
+    }
+    // Re-raise the sender's own panic so a failed delivery assert keeps its
+    // message instead of collapsing into a bare join failure.
+    sender
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+
+    assert!(
+        saw_gap,
+        "a 1 KiB window should report the overflow as a gap"
+    );
+    kill("wrap-follow");
+}
+
+/// `wait_ms` only applies to cursor reads; a line read returns immediately.
+#[test]
+fn wait_is_ignored_without_since() {
+    let _harness = Harness::start(DEFAULT_QUEUE_LIMIT, DEFAULT_QUEUE_BYTES);
+    create_agent_with("line-wait", silent_command());
+    thread::sleep(Duration::from_millis(300));
+
+    let started = Instant::now();
+    match client::request(&Request::Read {
+        target: "line-wait".to_string(),
+        lines: Some(20),
+        since: None,
+        wait_ms: Some(10_000),
+    })
+    .expect("read")
+    {
+        Response::Output { next_offset, .. } => assert!(next_offset < 10_000),
+        other => panic!("expected an output response, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a line read must not long-poll"
+    );
+
+    kill("line-wait");
 }

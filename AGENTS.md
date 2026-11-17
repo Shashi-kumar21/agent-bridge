@@ -126,8 +126,12 @@ A PR is ready for QA only when **all** of these are true:
   daemon lifetime; a response is capped at 64 KiB of raw bytes and carries `offset`,
   `next_offset` and `dropped`. A cursor older than the retained window is
   clamped with `dropped: true`; a cursor past the newest byte is `bad_request`.
-  Never claim offsets survive a daemon restart or an agent re-creation, and never
-  describe `--since` as a blocking follow (it is a poll).
+  Never claim offsets survive a daemon restart or an agent re-creation.
+* `Read.wait_ms` is a bounded long-poll: only valid with `since`, capped at 60 s
+  in the daemon, re-reading the buffer at most every 25 ms, and it must return an
+  empty chunk with `timed_out: true` when the window expires. It must never hold
+  a lock while sleeping and must not be described as a push subscription;
+  `--follow` is the CLI loop over it. A line read ignores `wait_ms`.
 * Daemon lifecycle: a protocol-skew restart is allowed **only** when the daemon
   owns no agent sessions. Never add a path that silently kills live agents
   (a version bump is not a licence to destroy someone's terminal).

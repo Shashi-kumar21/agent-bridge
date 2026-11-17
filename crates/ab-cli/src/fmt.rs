@@ -114,29 +114,36 @@ pub fn print_output(agent: &str, lines: &[String], truncated: bool) {
 /// boundaries cannot corrupt escape sequences or multi-byte characters and
 /// successive reads concatenate exactly. Escape sequences therefore reach the
 /// terminal; use `--json` when the exact bytes matter. The resumable offset
-/// (and any skipped gap) go to stderr, keeping stdout pipe-friendly.
+/// (and any skipped gap) go to stderr, keeping stdout pipe-friendly; with
+/// `report_offset` false (`--follow`, where every chunk would repeat the noise)
+/// the offset line is suppressed.
 ///
 /// A closed pipe (`agent-bridge read --since 0 | head`) is not an error, but
 /// any other write failure is reported instead of silently truncating output.
+/// Returns `false` when stdout is closed, so a follow loop can stop instead of
+/// polling a terminal nobody reads.
 pub fn print_chunk(
     agent: &str,
     data: &[u8],
     offset: Offset,
     next_offset: Offset,
     dropped: bool,
-) -> Result<()> {
+    report_offset: bool,
+) -> Result<bool> {
     if dropped {
         eprintln!("--- {agent} (gap: oldest retained byte is offset {offset}) ---");
     }
     let mut stdout = std::io::stdout().lock();
     if let Err(err) = stdout.write_all(data).and_then(|()| stdout.flush()) {
         if err.kind() == std::io::ErrorKind::BrokenPipe {
-            return Ok(());
+            return Ok(false);
         }
         return Err(BridgeError::Io(err));
     }
-    eprintln!("next offset: {next_offset}");
-    Ok(())
+    if report_offset {
+        eprintln!("next offset: {next_offset}");
+    }
+    Ok(true)
 }
 
 /// Print one message record and its delivery status.

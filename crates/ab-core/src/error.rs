@@ -16,6 +16,10 @@ pub enum BridgeError {
     #[error("protocol error: {0}")]
     Protocol(String),
 
+    /// A command line was internally inconsistent.
+    #[error("{0}")]
+    Usage(String),
+
     /// The daemon socket could not be reached.
     #[error("daemon is not running (expected socket at {0})")]
     DaemonNotRunning(String),
@@ -101,9 +105,10 @@ impl BridgeError {
                 ErrorCode::Conflict
             }
             Self::Conflict(_) => ErrorCode::Conflict,
-            Self::InvalidName(_) | Self::Protocol(_) | Self::CursorAhead { .. } => {
-                ErrorCode::BadRequest
-            }
+            Self::InvalidName(_)
+            | Self::Protocol(_)
+            | Self::Usage(_)
+            | Self::CursorAhead { .. } => ErrorCode::BadRequest,
             Self::MessageTooLarge { .. } => ErrorCode::TooLarge,
             Self::WaitIdleTimeout { .. } => ErrorCode::Timeout,
             Self::DaemonNotRunning(_) | Self::Daemon(_) => ErrorCode::NotRunning,

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the wire shape changes. New `cmd`/`event` tags are unknown
 /// to older daemons, so additive changes bump it too; the CLI compares it for
 /// equality and restarts a daemon only when no agent is live.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Default terminal width for spawned agents.
 pub const DEFAULT_COLS: u16 = 120;
@@ -404,6 +404,15 @@ pub enum Request {
         /// raw bytes as a [`Response::Chunk`] and ignores `lines`.
         #[serde(default)]
         since: Option<Offset>,
+        /// Long-poll window in milliseconds. With `since` set, the daemon waits
+        /// up to this long for bytes after the cursor before returning an empty
+        /// [`Response::Chunk`] with `timed_out: true`. `Some(0)` checks once and
+        /// returns immediately with `timed_out: false`. Ignored without `since`.
+        /// A daemon caps the value at 60 s, and if the agent exits while the
+        /// request is held the daemon fails it with `conflict` instead of
+        /// waiting out a window that can never fill.
+        #[serde(default)]
+        wait_ms: Option<Millis>,
     },
     /// Terminate an agent.
     Kill {
@@ -531,6 +540,10 @@ pub enum Response {
         /// True when the requested offset was older than the retained window,
         /// so a gap was skipped.
         dropped: bool,
+        /// True when the request asked to wait and no new bytes arrived before
+        /// the window expired. Always false for a plain (non-waiting) read.
+        #[serde(default)]
+        timed_out: bool,
         /// Newest sequence number at response time. It counts PTY chunks and
         /// does not describe the returned byte span, so do not use it to
         /// correlate bytes.
@@ -685,8 +698,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_is_eight() {
-        assert_eq!(PROTOCOL_VERSION, 8);
+    fn protocol_is_nine() {
+        assert_eq!(PROTOCOL_VERSION, 9);
     }
 
     #[test]
@@ -697,6 +710,7 @@ mod tests {
             offset: 4,
             next_offset: 6,
             dropped: false,
+            timed_out: true,
             seq: 9,
         };
         let json = serde_json::to_string(&chunk).expect("serialize");
@@ -708,13 +722,15 @@ mod tests {
                 offset: 4,
                 next_offset: 6,
                 dropped: false,
+                timed_out: true,
                 seq: 9,
                 ..
             }
         ));
     }
 
-    /// A `read` from a daemon that predates `since` parses as line mode.
+    /// A `read` from a daemon that predates `since`/`wait_ms` parses as line
+    /// mode with no wait.
     #[test]
     fn legacy_read_frame_has_no_since() {
         let legacy = r#"{"cmd":"read","target":"dev","lines":40}"#;
@@ -723,7 +739,78 @@ mod tests {
             parsed,
             Request::Read {
                 since: None,
+                wait_ms: None,
                 lines: Some(40),
+                ..
+            }
+        ));
+    }
+
+    /// A waiting cursor read keeps `wait_ms` on the wire.
+    #[test]
+    fn read_frame_round_trips_wait_ms() {
+        let request = Request::Read {
+            target: "dev".to_string(),
+            lines: None,
+            since: Some(12),
+            wait_ms: Some(2_500),
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert!(json.contains("\"wait_ms\":2500"));
+        let parsed: Request = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            parsed,
+            Request::Read {
+                since: Some(12),
+                wait_ms: Some(2_500),
+                ..
+            }
+        ));
+    }
+
+    /// Unknown request fields from a newer client are ignored too, so a daemon
+    /// does not reject a frame just because it learned a new option.
+    #[test]
+    fn unknown_request_fields_are_ignored() {
+        let frame = r#"{"cmd":"read","target":"dev","since":3,"wait_ms":250,"future_option":true}"#;
+        let parsed: Request = serde_json::from_str(frame).expect("future request");
+        assert!(matches!(
+            parsed,
+            Request::Read {
+                since: Some(3),
+                wait_ms: Some(250),
+                ..
+            }
+        ));
+    }
+
+    /// Unknown fields from a newer daemon are ignored, so an old client still
+    /// parses the frame.
+    #[test]
+    fn unknown_response_fields_are_ignored() {
+        let frame = r#"{"kind":"chunk","agent":"dev","data":"aGk=","offset":0,"next_offset":2,"dropped":false,"timed_out":false,"future_field":7,"seq":3}"#;
+        let parsed: Response = serde_json::from_str(frame).expect("future chunk");
+        assert!(matches!(
+            parsed,
+            Response::Chunk {
+                offset: 0,
+                next_offset: 2,
+                ..
+            }
+        ));
+    }
+
+    /// A chunk from a daemon that predates `timed_out` parses as a plain chunk.
+    #[test]
+    fn legacy_chunk_frame_has_no_timed_out() {
+        let legacy = r#"{"kind":"chunk","agent":"dev","data":"aGk=","offset":0,"next_offset":2,"dropped":false,"seq":3}"#;
+        let parsed: Response = serde_json::from_str(legacy).expect("legacy chunk");
+        assert!(matches!(
+            parsed,
+            Response::Chunk {
+                offset: 0,
+                next_offset: 2,
+                timed_out: false,
                 ..
             }
         ));

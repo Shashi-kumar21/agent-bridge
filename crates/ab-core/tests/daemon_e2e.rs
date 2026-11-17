@@ -189,6 +189,7 @@ fn wait_for_echo(target: &str, needle: &str) {
             target: target.to_string(),
             lines: Some(50),
             since: None,
+            wait_ms: None,
         }) {
             if lines.iter().any(|line| line.contains(needle)) {
                 return;

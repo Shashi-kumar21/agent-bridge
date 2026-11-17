@@ -119,6 +119,16 @@ enum Command {
         /// daemon returns raw bytes; `--lines` is ignored.
         #[arg(long, value_name = "OFFSET")]
         since: Option<Offset>,
+        /// With `--since`, block up to this long for new bytes before returning
+        /// an empty chunk (the daemon caps it at 60s). Default: return at once.
+        #[arg(long, value_name = "WAIT", value_parser = parse_wait)]
+        wait: Option<Duration>,
+        /// Keep long-polling after `--since` and print chunks as they arrive
+        /// (Ctrl-C to stop). Uses `--wait` as the poll window (default 5s); the
+        /// window must be non-zero and is clamped to at least 25ms. `--lines`
+        /// is ignored.
+        #[arg(long)]
+        follow: bool,
     },
     /// Terminate an agent.
     Kill {
@@ -334,27 +344,115 @@ fn run(cli: Cli) -> Result<()> {
             target,
             lines,
             since,
+            wait,
+            follow,
         } => {
+            validate_read_flags(since, wait, follow)?;
             ensure_daemon(true)?;
-            let response = client::request(&Request::Read {
-                target,
-                lines: since.is_none().then_some(lines),
-                since,
-            })?;
-            match (&response, json) {
-                (
-                    Response::Output {
-                        agent,
-                        lines,
-                        truncated,
-                        ..
-                    },
-                    false,
-                ) => {
-                    fmt::print_output(agent, lines, *truncated);
-                    Ok(())
+            let wait = wait.or_else(|| follow.then_some(Duration::from_secs(5)));
+            let wait = if follow {
+                wait.map(|window| window.max(MIN_FOLLOW_WAIT))
+            } else {
+                wait
+            };
+            if let (Some(since), false) = (since, follow) {
+                // One bounded request: the chunk is printed verbatim. The human
+                // path prints the resumable offset on expiry; `--json` prints
+                // the empty `timed_out` frame instead.
+                let response = client::request(&Request::Read {
+                    target: target.clone(),
+                    lines: None,
+                    since: Some(since),
+                    wait_ms: wait.map(duration_millis),
+                })?;
+                if let Response::Chunk {
+                    data,
+                    offset,
+                    next_offset,
+                    dropped,
+                    ..
+                } = &response
+                {
+                    if !json {
+                        let bytes = decode_chunk(data)?;
+                        fmt::print_chunk(&target, &bytes, *offset, *next_offset, *dropped, true)?;
+                        return Ok(());
+                    }
                 }
-                _ => emit(response, json),
+                return emit(response, json);
+            }
+            let Some(mut since) = since else {
+                let response = client::request(&Request::Read {
+                    target,
+                    lines: Some(lines),
+                    since: None,
+                    wait_ms: None,
+                })?;
+                return match (&response, json) {
+                    (
+                        Response::Output {
+                            agent,
+                            lines,
+                            truncated,
+                            ..
+                        },
+                        false,
+                    ) => {
+                        fmt::print_output(agent, lines, *truncated);
+                        Ok(())
+                    }
+                    _ => emit(response, json),
+                };
+            };
+            // Follow: repeat bounded long-polls, printing each chunk.
+            loop {
+                let response = client::request(&Request::Read {
+                    target: target.clone(),
+                    lines: None,
+                    since: Some(since),
+                    wait_ms: wait.map(duration_millis),
+                })?;
+                match &response {
+                    Response::Chunk {
+                        data,
+                        offset,
+                        next_offset,
+                        dropped,
+                        timed_out,
+                        ..
+                    } => {
+                        if json {
+                            // One compact frame per line keeps the stream parseable.
+                            // The payload is passed through verbatim.
+                            if !write_json_frame(&response)? {
+                                return Ok(());
+                            }
+                        } else if !timed_out {
+                            let bytes = decode_chunk(data)?;
+                            if !fmt::print_chunk(
+                                &target,
+                                &bytes,
+                                *offset,
+                                *next_offset,
+                                *dropped,
+                                false,
+                            )? {
+                                // The consumer closed stdout; stop instead of
+                                // polling a terminal nobody reads.
+                                return Ok(());
+                            }
+                        }
+                        since = *next_offset;
+                    }
+                    Response::Error { message, .. } => {
+                        return Err(BridgeError::Daemon(message.clone()));
+                    }
+                    other => {
+                        return Err(BridgeError::Usage(format!(
+                            "unexpected response to a follow read: {other:?}"
+                        )));
+                    }
+                }
             }
         }
         Command::Kill { name, force } => {
@@ -470,10 +568,8 @@ fn emit(response: Response, json: bool) -> Result<()> {
             dropped,
             ..
         } => {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .map_err(|err| BridgeError::Protocol(format!("invalid chunk payload: {err}")))?;
-            fmt::print_chunk(&agent, &bytes, offset, next_offset, dropped)?;
+            let bytes = decode_chunk(&data)?;
+            fmt::print_chunk(&agent, &bytes, offset, next_offset, dropped, true)?;
         }
         Response::Sent {
             target,
@@ -650,6 +746,48 @@ fn parse_paste(raw: &str) -> std::result::Result<PasteMode, String> {
     }
 }
 
+/// Smallest follow window. Below the daemon's 25 ms poll a shorter window only
+/// multiplies requests, so the CLI clamps it.
+const MIN_FOLLOW_WAIT: Duration = Duration::from_millis(25);
+
+/// Print one compact JSON frame. Returns `false` when stdout is closed.
+fn write_json_frame(response: &Response) -> Result<bool> {
+    let line = serde_json::to_string(response)?;
+    let mut stdout = std::io::stdout().lock();
+    match writeln!(stdout, "{line}").and_then(|()| stdout.flush()) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(err) => Err(BridgeError::Io(err)),
+    }
+}
+
+/// Reject read flags that cannot be honoured, before any daemon is started.
+fn validate_read_flags(since: Option<Offset>, wait: Option<Duration>, follow: bool) -> Result<()> {
+    if since.is_none() && (wait.is_some() || follow) {
+        return Err(BridgeError::Usage(
+            "--wait and --follow require --since OFFSET".to_string(),
+        ));
+    }
+    if follow && wait == Some(Duration::ZERO) {
+        return Err(BridgeError::Usage(
+            "--follow needs a non-zero --wait window".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Decode a base64 chunk payload, treating corruption as a protocol error.
+fn decode_chunk(data: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|err| BridgeError::Protocol(format!("invalid chunk payload: {err}")))
+}
+
+/// Parse a `--wait` window, naming the flag in the error.
+fn parse_wait(raw: &str) -> std::result::Result<Duration, String> {
+    parse_timeout(raw).map_err(|err| err.replace("timeout", "wait window"))
+}
+
 fn parse_timeout(raw: &str) -> std::result::Result<Duration, String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -680,9 +818,21 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use std::time::Duration;
 
-    use super::{duration_millis, parse_paste, parse_timeout, skew_restart_is_safe, Cli, Command};
+    use super::{
+        decode_chunk, duration_millis, parse_paste, parse_timeout, skew_restart_is_safe,
+        validate_read_flags, Cli, Command,
+    };
+    use agent_bridge_core::error::BridgeError;
     use agent_bridge_core::protocol::PasteMode;
     use clap::Parser;
+
+    /// A corrupt chunk payload is reported as a protocol error, not a panic.
+    #[test]
+    fn decode_chunk_rejects_corrupt_base64() {
+        let err = decode_chunk("not base64!").expect_err("corrupt payload");
+        assert!(matches!(err, BridgeError::Protocol(_)));
+        assert_eq!(decode_chunk("aGk=").expect("valid payload"), b"hi");
+    }
 
     #[test]
     fn skew_restart_requires_idle_daemon() {
@@ -701,6 +851,17 @@ mod tests {
     }
 
     #[test]
+    fn read_flags_need_since_and_a_follow_window() {
+        assert!(validate_read_flags(Some(0), None, false).is_ok());
+        assert!(validate_read_flags(Some(0), Some(Duration::from_secs(1)), false).is_ok());
+        assert!(validate_read_flags(None, Some(Duration::from_secs(1)), false).is_err());
+        assert!(validate_read_flags(None, None, true).is_err());
+        assert!(validate_read_flags(Some(0), Some(Duration::ZERO), true).is_err());
+        // A zero window is fine for a single poll.
+        assert!(validate_read_flags(Some(0), Some(Duration::ZERO), false).is_ok());
+    }
+
+    #[test]
     fn parses_read_since_and_keeps_lines() {
         let cli =
             Cli::try_parse_from(["agent-bridge", "read", "dev", "--since", "42"]).expect("parse");
@@ -709,16 +870,41 @@ mod tests {
                 target,
                 lines,
                 since,
+                wait,
+                follow,
             } => {
                 assert_eq!(target, "dev");
                 assert_eq!(lines, 40);
                 assert_eq!(since, Some(42));
+                assert_eq!(wait, None);
+                assert!(!follow);
             }
             other => panic!("unexpected command: {other:?}"),
         }
 
         let plain = Cli::try_parse_from(["agent-bridge", "read", "dev"]).expect("parse");
         assert!(matches!(plain.command, Command::Read { since: None, .. }));
+
+        let follow = Cli::try_parse_from([
+            "agent-bridge",
+            "read",
+            "dev",
+            "--since",
+            "0",
+            "--wait",
+            "2s",
+            "--follow",
+        ])
+        .expect("parse follow");
+        assert!(matches!(
+            follow.command,
+            Command::Read {
+                since: Some(0),
+                wait: Some(wait),
+                follow: true,
+                ..
+            } if wait == Duration::from_secs(2)
+        ));
     }
 
     #[test]

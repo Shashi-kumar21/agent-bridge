@@ -286,6 +286,7 @@ fn read_pid(agent: &str, marker: &str) -> u32 {
             target: agent.to_string(),
             lines: Some(80),
             since: None,
+            wait_ms: None,
         }) {
             for line in &lines {
                 if let Some((_, rest)) = line.split_once(marker) {

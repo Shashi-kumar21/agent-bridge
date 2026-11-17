@@ -14,7 +14,7 @@ use interprocess::local_socket::Stream;
 use tracing::{debug, error, info};
 
 use crate::agent::{Agent, SpawnConfig};
-use crate::buffer::OutputBuffer;
+use crate::buffer::{CursorChunk, OutputBuffer};
 use crate::delivery::{self, JobEvent};
 use crate::error::{BridgeError, Result};
 use crate::protocol::{
@@ -39,6 +39,10 @@ const MAX_REPLY_BYTES: usize = 64 * 1024;
 const MAX_REPLY_LINES: usize = 200;
 /// Largest raw byte span returned by one cursor read (64 KiB).
 const MAX_READ_CHUNK: usize = 64 * 1024;
+/// Longest a single cursor request may block waiting for new bytes.
+const MAX_FOLLOW_WAIT: Duration = Duration::from_secs(60);
+/// Poll interval while a cursor request waits for new bytes.
+const FOLLOW_POLL: Duration = Duration::from_millis(25);
 
 /// Bounded, id-indexed message history.
 struct MessageLog {
@@ -431,24 +435,35 @@ impl Inner {
                 target,
                 lines,
                 since,
+                wait_ms,
             } => {
                 let agent = self.get(&target)?;
                 if let Some(since) = since {
-                    let chunk = agent.read_since(since, MAX_READ_CHUNK).map_err(|total| {
-                        BridgeError::CursorAhead {
-                            target: target.clone(),
-                            since,
-                            total,
+                    let wait = follow_wait(wait_ms);
+                    let deadline = Instant::now() + wait;
+                    loop {
+                        let chunk = agent.read_since(since, MAX_READ_CHUNK).map_err(|total| {
+                            BridgeError::CursorAhead {
+                                target: target.clone(),
+                                since,
+                                total,
+                            }
+                        })?;
+                        if !chunk.data.is_empty() || chunk.dropped {
+                            return Ok(chunk_response(&agent, target, &chunk, false));
                         }
-                    })?;
-                    return Ok(Response::Chunk {
-                        agent: target,
-                        data: base64::engine::general_purpose::STANDARD.encode(&chunk.data),
-                        offset: chunk.start_offset,
-                        next_offset: chunk.next_offset,
-                        dropped: chunk.dropped,
-                        seq: agent.seq(),
-                    });
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            return Ok(chunk_response(&agent, target, &chunk, !wait.is_zero()));
+                        }
+                        if !agent.is_running() {
+                            // The process is gone, so no further bytes can arrive:
+                            // fail instead of holding the connection for a window
+                            // that can never be filled.
+                            return Err(BridgeError::AgentExited(target));
+                        }
+                        thread::sleep(FOLLOW_POLL.min(remaining));
+                    }
                 }
                 let (lines, truncated, next_offset, seq) = agent.tail_snapshot(lines.unwrap_or(40));
                 Ok(Response::Output {
@@ -833,6 +848,26 @@ fn settle(status: DeliveryStatus, require_ack: bool) -> DeliveryStatus {
     }
 }
 
+/// Clamp a requested long-poll window to the daemon cap.
+fn follow_wait(wait_ms: Option<Millis>) -> Duration {
+    wait_ms.map_or(Duration::ZERO, |ms| {
+        Duration::from_millis(ms).min(MAX_FOLLOW_WAIT)
+    })
+}
+
+/// Build the wire response for one cursor chunk.
+fn chunk_response(agent: &Agent, target: String, chunk: &CursorChunk, timed_out: bool) -> Response {
+    Response::Chunk {
+        agent: target,
+        data: base64::engine::general_purpose::STANDARD.encode(&chunk.data),
+        offset: chunk.start_offset,
+        next_offset: chunk.next_offset,
+        dropped: chunk.dropped,
+        timed_out,
+        seq: agent.seq(),
+    }
+}
+
 /// Publish the writer's terminal status (or amend an earlier `unknown`).
 fn apply_status(
     messages: &Mutex<MessageLog>,
@@ -1044,9 +1079,10 @@ fn write_frame<W: Write, T: serde::Serialize>(writer: &mut W, value: &T) -> std:
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_status, apply_writing, settle, status_after_timeout, DeliveryStatus, Message,
-        MessageLog, Millis, Mutex, MAX_LOG,
+        apply_status, apply_writing, follow_wait, settle, status_after_timeout, DeliveryStatus,
+        Message, MessageLog, Millis, Mutex, MAX_FOLLOW_WAIT, MAX_LOG,
     };
+    use std::time::Duration;
 
     fn record(id: u64, target: &str, status: DeliveryStatus) -> Message {
         Message {
@@ -1060,6 +1096,14 @@ mod tests {
             status,
             ack: None,
         }
+    }
+
+    #[test]
+    fn follow_wait_clamps_to_the_cap() {
+        assert_eq!(follow_wait(None), Duration::ZERO);
+        assert_eq!(follow_wait(Some(0)), Duration::ZERO);
+        assert_eq!(follow_wait(Some(1_500)), Duration::from_millis(1_500));
+        assert_eq!(follow_wait(Some(u64::MAX)), MAX_FOLLOW_WAIT);
     }
 
     #[test]
