@@ -1555,30 +1555,41 @@ fn long_poll_reports_a_gap_that_happens_during_the_wait() {
     create_agent_with("wrap-follow", agent_command());
     let total = wait_for_quiet_offset("wrap-follow");
 
-    let sender = thread::spawn(|| {
+    let payload = {
+        // Every tty line must stay under the kernel's canonical input limit
+        // (4096 bytes on Linux/macOS): a longer single line wedges the PTY
+        // master write on macOS - the newline never reaches the queue, the
+        // shell never produces output, and the poll starves with zero bytes
+        // (reproduced with one 4 KiB line and with four of them in a row).
+        // Eight ~518-byte lines are the same ~4 KiB, still past the 1 KiB
+        // window, and the burst cannot drain between polls because the tty
+        // echoes it as one continuous stream.
+        (0..8).fold(String::new(), |acc, _| {
+            acc + &format!("echo {}\n", "x".repeat(512))
+        })
+    };
+    let sender = thread::spawn(move || {
         thread::sleep(Duration::from_millis(200));
-        // Repeated 4 KiB lines with `wait` and sane timeouts: one send can be
-        // drained in pieces on a slow runner, but the whole burst cannot fit
-        // in the 1 KiB ring. Waiting also surfaces a failed admission or write
-        // here instead of starving the poll with no diagnosable cause (seen
-        // once on macOS CI).
-        for _ in 0..4 {
-            let payload = format!("echo {}\n", "x".repeat(4096));
-            let (id, _) = send_with_paste(
-                "wrap-follow",
-                payload,
-                true,
-                5_000,
-                10_000,
-                PasteMode::Plain,
-            );
-            let status = terminal_status(id);
-            assert_eq!(
-                status,
-                DeliveryStatus::Written,
-                "the wrap payload was not written to the PTY"
-            );
-        }
+        // `wait` plus sane timeouts so a failed admission or write surfaces
+        // here: with `wait: false` and 0/0 the response is `Sent` even when
+        // admission fails, and a writer-thread failure only flips the logged
+        // status, so the poll starved with no diagnosable cause (seen twice
+        // on macOS CI).
+        let (id, _) = send_with_paste(
+            "wrap-follow",
+            payload,
+            true,
+            5_000,
+            10_000,
+            PasteMode::Plain,
+        );
+        let status = terminal_status(id);
+        assert_eq!(
+            status,
+            DeliveryStatus::Written,
+            "the wrap payload was not written to the PTY"
+        );
+        status
     });
 
     let started = Instant::now();
@@ -1595,12 +1606,22 @@ fn long_poll_reports_a_gap_that_happens_during_the_wait() {
             assert_eq!(offset + 1024, next, "the gap is clamped to the window");
             break;
         }
-        assert!(!timed_out, "no bytes arrived within the poll window");
+        if timed_out {
+            // Join the sender first: a failed delivery is diagnosed by the
+            // sender's own assert, while a Written payload with no echo
+            // means the bytes truly never came back and the status names it.
+            let status = sender
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+            panic!(
+                "no bytes arrived within the poll window though the payload status is {status:?}"
+            );
+        }
         assert_eq!(offset, cursor);
         cursor = next;
     }
     // Re-raise the sender's own panic so a failed delivery assert keeps its
-    // message instead of collapsing into a bare "sender" join failure.
+    // message instead of collapsing into a bare join failure.
     sender
         .join()
         .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
