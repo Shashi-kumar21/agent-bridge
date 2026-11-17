@@ -1555,32 +1555,30 @@ fn long_poll_reports_a_gap_that_happens_during_the_wait() {
     create_agent_with("wrap-follow", agent_command());
     let total = wait_for_quiet_offset("wrap-follow");
 
-    let payload = format!(
-        "echo {}
-",
-        "x".repeat(4096)
-    );
-    let sender = thread::spawn(move || {
+    let sender = thread::spawn(|| {
         thread::sleep(Duration::from_millis(200));
-        // `wait` plus sane timeouts so a failed admission or write surfaces
-        // here: with `wait: false` and 0/0 the response is `Sent` even when
-        // admission fails, and a writer-thread failure only flips the logged
-        // status, so the poll starved with no diagnosable cause (seen once
-        // on macOS CI).
-        let (id, _) = send_with_paste(
-            "wrap-follow",
-            payload,
-            true,
-            5_000,
-            10_000,
-            PasteMode::Plain,
-        );
-        let status = terminal_status(id);
-        assert_eq!(
-            status,
-            DeliveryStatus::Written,
-            "the wrap payload was not written to the PTY"
-        );
+        // Repeated 4 KiB lines with `wait` and sane timeouts: one send can be
+        // drained in pieces on a slow runner, but the whole burst cannot fit
+        // in the 1 KiB ring. Waiting also surfaces a failed admission or write
+        // here instead of starving the poll with no diagnosable cause (seen
+        // once on macOS CI).
+        for _ in 0..4 {
+            let payload = format!("echo {}\n", "x".repeat(4096));
+            let (id, _) = send_with_paste(
+                "wrap-follow",
+                payload,
+                true,
+                5_000,
+                10_000,
+                PasteMode::Plain,
+            );
+            let status = terminal_status(id);
+            assert_eq!(
+                status,
+                DeliveryStatus::Written,
+                "the wrap payload was not written to the PTY"
+            );
+        }
     });
 
     let started = Instant::now();

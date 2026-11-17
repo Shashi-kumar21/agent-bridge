@@ -120,6 +120,8 @@ pub fn print_output(agent: &str, lines: &[String], truncated: bool) {
 ///
 /// A closed pipe (`agent-bridge read --since 0 | head`) is not an error, but
 /// any other write failure is reported instead of silently truncating output.
+/// Returns `false` when stdout is closed, so a follow loop can stop instead of
+/// polling a terminal nobody reads.
 pub fn print_chunk(
     agent: &str,
     data: &[u8],
@@ -127,21 +129,21 @@ pub fn print_chunk(
     next_offset: Offset,
     dropped: bool,
     report_offset: bool,
-) -> Result<()> {
+) -> Result<bool> {
     if dropped {
         eprintln!("--- {agent} (gap: oldest retained byte is offset {offset}) ---");
     }
     let mut stdout = std::io::stdout().lock();
     if let Err(err) = stdout.write_all(data).and_then(|()| stdout.flush()) {
         if err.kind() == std::io::ErrorKind::BrokenPipe {
-            return Ok(());
+            return Ok(false);
         }
         return Err(BridgeError::Io(err));
     }
     if report_offset {
         eprintln!("next offset: {next_offset}");
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Print one message record and its delivery status.

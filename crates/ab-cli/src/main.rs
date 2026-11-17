@@ -121,11 +121,12 @@ enum Command {
         since: Option<Offset>,
         /// With `--since`, block up to this long for new bytes before returning
         /// an empty chunk (the daemon caps it at 60s). Default: return at once.
-        #[arg(long, value_name = "WAIT", value_parser = parse_timeout)]
+        #[arg(long, value_name = "WAIT", value_parser = parse_wait)]
         wait: Option<Duration>,
         /// Keep long-polling after `--since` and print chunks as they arrive
         /// (Ctrl-C to stop). Uses `--wait` as the poll window (default 5s); the
-        /// window must be non-zero.
+        /// window must be non-zero and is clamped to at least 25ms. `--lines`
+        /// is ignored.
         #[arg(long)]
         follow: bool,
     },
@@ -349,9 +350,15 @@ fn run(cli: Cli) -> Result<()> {
             validate_read_flags(since, wait, follow)?;
             ensure_daemon(true)?;
             let wait = wait.or_else(|| follow.then_some(Duration::from_secs(5)));
+            let wait = if follow {
+                wait.map(|window| window.max(MIN_FOLLOW_WAIT))
+            } else {
+                wait
+            };
             if let (Some(since), false) = (since, follow) {
-                // One bounded request: the chunk is printed verbatim, and a
-                // wait that expires prints nothing but the resumable offset.
+                // One bounded request: the chunk is printed verbatim. The human
+                // path prints the resumable offset on expiry; `--json` prints
+                // the empty `timed_out` frame instead.
                 let response = client::request(&Request::Read {
                     target: target.clone(),
                     lines: None,
@@ -417,17 +424,23 @@ fn run(cli: Cli) -> Result<()> {
                         if json {
                             // One compact frame per line keeps the stream parseable.
                             // The payload is passed through verbatim.
-                            println!("{}", serde_json::to_string(&response)?);
+                            if !write_json_frame(&response)? {
+                                return Ok(());
+                            }
                         } else if !timed_out {
                             let bytes = decode_chunk(data)?;
-                            fmt::print_chunk(
+                            if !fmt::print_chunk(
                                 &target,
                                 &bytes,
                                 *offset,
                                 *next_offset,
                                 *dropped,
                                 false,
-                            )?;
+                            )? {
+                                // The consumer closed stdout; stop instead of
+                                // polling a terminal nobody reads.
+                                return Ok(());
+                            }
                         }
                         since = *next_offset;
                     }
@@ -733,6 +746,21 @@ fn parse_paste(raw: &str) -> std::result::Result<PasteMode, String> {
     }
 }
 
+/// Smallest follow window. Below the daemon's 25 ms poll a shorter window only
+/// multiplies requests, so the CLI clamps it.
+const MIN_FOLLOW_WAIT: Duration = Duration::from_millis(25);
+
+/// Print one compact JSON frame. Returns `false` when stdout is closed.
+fn write_json_frame(response: &Response) -> Result<bool> {
+    let line = serde_json::to_string(response)?;
+    let mut stdout = std::io::stdout().lock();
+    match writeln!(stdout, "{line}").and_then(|()| stdout.flush()) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(err) => Err(BridgeError::Io(err)),
+    }
+}
+
 /// Reject read flags that cannot be honoured, before any daemon is started.
 fn validate_read_flags(since: Option<Offset>, wait: Option<Duration>, follow: bool) -> Result<()> {
     if since.is_none() && (wait.is_some() || follow) {
@@ -753,6 +781,11 @@ fn decode_chunk(data: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(data)
         .map_err(|err| BridgeError::Protocol(format!("invalid chunk payload: {err}")))
+}
+
+/// Parse a `--wait` window, naming the flag in the error.
+fn parse_wait(raw: &str) -> std::result::Result<Duration, String> {
+    parse_timeout(raw).map_err(|err| err.replace("timeout", "wait window"))
 }
 
 fn parse_timeout(raw: &str) -> std::result::Result<Duration, String> {
