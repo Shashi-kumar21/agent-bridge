@@ -332,14 +332,17 @@ fn wait_for_capture(path: &Path, expected: &[u8]) {
 }
 
 fn kill(name: &str) {
-    assert!(matches!(
-        client::request(&Request::Kill {
-            name: name.to_string(),
-            force: Some(true),
-        })
-        .expect("kill"),
-        Response::Ok
-    ));
+    match client::request(&Request::Kill {
+        name: name.to_string(),
+        force: Some(true),
+    })
+    .expect("kill request")
+    {
+        Response::Ok => {}
+        // A bare `assert!(matches!..)` printed no variant, so the recurring
+        // macOS failure could not be diagnosed. Name the actual response.
+        other => panic!("kill '{name}' did not succeed: {other:?}"),
+    }
 }
 
 /// The roadmap acceptance test: 8 threads x 50 sends to one agent, every
@@ -1559,7 +1562,25 @@ fn long_poll_reports_a_gap_that_happens_during_the_wait() {
     );
     let sender = thread::spawn(move || {
         thread::sleep(Duration::from_millis(200));
-        send_with_paste("wrap-follow", payload, false, 0, 0, PasteMode::Plain);
+        // `wait` plus sane timeouts so a failed admission or write surfaces
+        // here: with `wait: false` and 0/0 the response is `Sent` even when
+        // admission fails, and a writer-thread failure only flips the logged
+        // status, so the poll starved with no diagnosable cause (seen once
+        // on macOS CI).
+        let (id, _) = send_with_paste(
+            "wrap-follow",
+            payload,
+            true,
+            5_000,
+            10_000,
+            PasteMode::Plain,
+        );
+        let status = terminal_status(id);
+        assert_eq!(
+            status,
+            DeliveryStatus::Written,
+            "the wrap payload was not written to the PTY"
+        );
     });
 
     let started = Instant::now();
@@ -1580,7 +1601,11 @@ fn long_poll_reports_a_gap_that_happens_during_the_wait() {
         assert_eq!(offset, cursor);
         cursor = next;
     }
-    sender.join().expect("sender");
+    // Re-raise the sender's own panic so a failed delivery assert keeps its
+    // message instead of collapsing into a bare "sender" join failure.
+    sender
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
 
     assert!(
         saw_gap,
