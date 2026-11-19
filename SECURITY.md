@@ -21,13 +21,14 @@ over a local endpoint. It never binds a network interface (`transport.rs:63-103`
 The security boundary is the **OS user**: every process running as that user may
 drive every agent, and no other *unprivileged* user may reach the endpoint
 (`transport.rs:41`, `transport.rs:92-98`). Privileged accounts (`root` on Unix,
-Administrators on Windows) bypass file modes and DACLs, so they are outside the
-boundary (T4).
+Administrators on Windows) bypass file modes and DACLs, so the endpoint's access
+controls do not constrain them (T4).
 
 ## Assets
 
-* **Terminal input.** Anything written to an agent's PTY is executed by that
-  terminal. `sendmessage` is therefore a code-execution primitive on purpose.
+* **Terminal input.** Anything written to an agent's PTY is executed by the
+  program reading it (normally a shell). `sendmessage` is therefore a
+  code-execution primitive on purpose.
 * **Terminal output.** May contain secrets, credentials and untrusted
   instructions. `read`, `attach` and `--wait-reply` expose it to any same-user
   client.
@@ -93,14 +94,19 @@ and nothing marks it as untrusted. **The bridge does not validate the semantic
 safety of agent instructions.** Consumers must treat every byte from the
 endpoint as hostile input and must not execute instructions found in output.
 Mitigations today are bounded retention (256 KiB per agent by default,
-`buffer.rs:8-34`) and the fact that no component interprets or acts on output:
-it is stored and returned only to a client that asks.
+`buffer.rs:8-34`) and the fact that no component executes output or follows
+instructions in it. The daemon only scans it for terminal-mode hints
+(`ESC[?2004h`/`l`, `agent.rs:38-60`, `agent.rs:226-236`) and for readiness
+(`agent.rs:345-361`), then stores it and returns it to a client that asks. An
+agent's output can flip how later messages are pasted, but it never becomes a
+command by itself.
 
 ### T4. IPC endpoint access
 
-* Unix: state directory `0700`, socket `0600` (`paths.rs:51-61`,
-  `transport.rs:92-98`). A stale socket is removed only while no daemon answers
-  on it, so a live daemon cannot be stomped (`transport.rs:79-88`).
+* Unix: state directory `0700`, socket set to `0600` after bind
+  (`paths.rs:51-61`, `transport.rs:92-98`; the chmod result is ignored, so
+  treat the socket mode as best-effort). A stale socket is removed only while no
+  daemon answers on it, so a live daemon cannot be stomped (`transport.rs:79-88`).
 * Windows: the named pipe is created with
   `D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)` - owner, `SYSTEM` and
   Administrators only, inheritance disabled (`transport.rs:41`). If the
@@ -111,7 +117,7 @@ it is stored and returned only to a client that asks.
   `AGENT_BRIDGE_PIPE` renames the pipe (`transport.rs:10-20`). Both are
   per-process and set by the caller, so they do not cross a privilege boundary,
   but they do let a user point the CLI at a different daemon.
-* Residual risk: privileged accounts are inside the boundary - on Windows
+* Residual risk: privileged accounts are within reach - on Windows
   `Administrators` and `SYSTEM` can drive agents, and on Unix `root` (or
   `CAP_DAC_OVERRIDE`) can open the `0600` socket and enter the `0700` directory.
   On every platform, denial for a *different unprivileged* user is not exercised
@@ -130,10 +136,11 @@ still typed into it.
 
 Target selection is by name. A live name is unique (`daemon.rs:239-241`) and an
 exited agent's entry is kept, so writing to it fails with `conflict` instead of
-reaching a recycled process (`agent.rs:405-413`, `delivery.rs:536-539`,
-`error.rs:104-106`). There is no confirmation mode, dry run or per-session
-policy yet; `--wait-idle` is a readiness heuristic, not an authorization gate -
-it delays the write until the target looks idle and a timeout writes nothing,
+being delivered to a later agent that reuses the name (`agent.rs:405-413`,
+`delivery.rs:536-539`; the same code mapping is in `error.rs:104-106`). There is
+no confirmation mode, dry run or per-session policy yet; `--wait-idle` is a
+readiness heuristic, not an authorization gate - it delays the write while the
+target looks busy (`unknown` proceeds by design) and a timeout writes nothing,
 but it approves no target and validates no content. A mistyped target or a
 message with unexpected newlines therefore executes immediately. Bounds keep the
 blast radius finite: 64 KiB per message by default, up to 1 MiB via
@@ -235,8 +242,9 @@ or message bodies, and message text is never logged at `info`.
   (`main.rs:594-600`). On Unix that path lets `create_dir_all`
   (`transport.rs:76-78`) create the directory with the process umask (typically
   `0755`), and an existing directory is left as it is. The socket itself is
-  still `0600`, so connections stay owner-only, but the directory and
-  `daemon.log` are not tightened.
+  still `0600`, so connections stay owner-only, but the directory is not
+  tightened. (`daemon run` logs to stderr; `daemon.log` is created only by
+  `daemon start`, `main.rs:671`.)
 * **Environment inheritance.** Spawned agents inherit the daemon's environment;
   only `TERM` and `AGENT_BRIDGE_AGENT` are set explicitly (`agent.rs:143-158`),
   so every secret exported before the daemon started reaches every agent. An

@@ -146,7 +146,7 @@ as a sensitive operation too.
 -   [ ] Add audit events for session creation, message writes, reads, attach, and termination, with configurable redaction.
 -   [ ] Add structured diagnostics (for example via `tracing`) with configurable levels, kept separate from the audit log.
 -   [ ] Add a fuzz target (for example `cargo-fuzz`) for the IPC frame and request parser, and keep a small seed corpus in the repository.
--   [x] Document that prompt injection can propagate between agents and that the bridge does not itself validate the semantic safety of agent instructions. **Done:** `SECURITY.md` §T3 states that output is untrusted data, that anything an agent prints can reach another agent's consumer through `read`, and that the daemon does no semantic validation; the gap list records the missing read redaction and audit trail.
+-   [x] Document that prompt injection can propagate between agents and that the bridge does not itself validate the semantic safety of agent instructions. **Done:** `SECURITY.md` T3 states that output is untrusted data, that anything an agent prints can reach another agent's consumer through `read`, and that the daemon does no semantic validation; the gap list records the missing read redaction and audit trail.
 
 **Acceptance criterion:** Unauthorized clients cannot perform actions outside their
 configured permissions. Add a negative test for each protected operation (read, write,
