@@ -19,8 +19,10 @@ You should receive a response within 72 hours.
 `agent-bridge` is a **local** tool: a daemon owns PTYs and the CLI drives it
 over a local endpoint. It never binds a network interface (`transport.rs:63-103`).
 The security boundary is the **OS user**: every process running as that user may
-drive every agent, and no other user may reach the endpoint (`transport.rs:41`,
-`transport.rs:92-98`).
+drive every agent, and no other *unprivileged* user may reach the endpoint
+(`transport.rs:41`, `transport.rs:92-98`). Privileged accounts (`root` on Unix,
+Administrators on Windows) bypass file modes and DACLs, so they are outside the
+boundary (T4).
 
 ## Assets
 
@@ -40,7 +42,7 @@ drive every agent, and no other user may reach the endpoint (`transport.rs:41`,
 | Actor | Trust | Reach |
 | --- | --- | --- |
 | The owner (same OS user) | Trusted by design | Everything |
-| Other OS users | Untrusted | Nothing: denied by the socket mode / pipe DACL |
+| Other unprivileged OS users | Untrusted | Nothing: denied by the socket mode / pipe DACL (privileged accounts bypass both) |
 | An agent process | Same privileges as the user | Can open the endpoint itself, like any process |
 | Message content | Untrusted data | Executed as keystrokes in the target terminal |
 | Terminal output | Untrusted data | Rendered by consumers (CLI, editors, models) |
@@ -57,10 +59,12 @@ label. The roadmap's §4 policy layer is what would add per-session scopes.
 Any process running as the same OS user can call every request: create, send,
 read, attach, kill and shutdown (`daemon.rs:212-528`). This is accepted: the
 boundary is the account, not the socket, so malware under that account is
-equivalent to the user. What is enforced is that *other* users cannot connect -
-`0700` state directory and `0600` socket on Unix (`paths.rs:51-61`,
-`transport.rs:79-98`), an explicit owner/`SYSTEM`/Administrators DACL on
-Windows (`transport.rs:41`, `transport.rs:46-61`).
+equivalent to the user. What is enforced is that *other unprivileged* users
+cannot connect - the `0700` state directory set by `ensure_base_dir`
+(`paths.rs:51-61`) and the `0600` socket (`transport.rs:79-98`) on Unix, and an
+explicit owner/`SYSTEM`/Administrators DACL on Windows (`transport.rs:41`,
+`transport.rs:46-61`). `root` and `Administrators` bypass both, and `daemon run`
+does not apply the directory mode (see the gaps).
 
 ### T2. Compromised or malicious agent
 
@@ -88,8 +92,9 @@ print text that another agent (or a human's assistant) later reads via `read`,
 and nothing marks it as untrusted. **The bridge does not validate the semantic
 safety of agent instructions.** Consumers must treat every byte from the
 endpoint as hostile input and must not execute instructions found in output.
-Mitigations today are bounded retention (256 KiB per agent, `buffer.rs:8-34`)
-and the fact that the tool never reads output on its own.
+Mitigations today are bounded retention (256 KiB per agent by default,
+`buffer.rs:8-34`) and the fact that no component interprets or acts on output:
+it is stored and returned only to a client that asks.
 
 ### T4. IPC endpoint access
 
@@ -101,12 +106,16 @@ and the fact that the tool never reads output on its own.
   Administrators only, inheritance disabled (`transport.rs:41`). If the
   descriptor cannot be built the daemon falls back to the OS default and logs a
   warning (`transport.rs:46-61`), which is broader than this tool needs.
-* `AGENT_BRIDGE_HOME` and `AGENT_BRIDGE_PIPE` choose the endpoint. They are
-  per-process and controlled by the caller, so they do not cross a privilege
-  boundary, but they do let a user point the CLI at a different daemon.
-* Residual risk: on Windows, `Administrators` and `SYSTEM` can drive agents. On
-  every platform, denial for a *different* user is not exercised by CI yet (see
-  the gaps).
+* `AGENT_BRIDGE_HOME` moves the state directory and, on Unix, the socket
+  (`paths.rs:20-36`); on Windows the pipe name ignores it and only
+  `AGENT_BRIDGE_PIPE` renames the pipe (`transport.rs:10-20`). Both are
+  per-process and set by the caller, so they do not cross a privilege boundary,
+  but they do let a user point the CLI at a different daemon.
+* Residual risk: privileged accounts are inside the boundary - on Windows
+  `Administrators` and `SYSTEM` can drive agents, and on Unix `root` (or
+  `CAP_DAC_OVERRIDE`) can open the `0600` socket and enter the `0700` directory.
+  On every platform, denial for a *different unprivileged* user is not exercised
+  by CI yet (see the gaps).
 
 ### T5. Accidental command injection
 
@@ -121,13 +130,17 @@ still typed into it.
 
 Target selection is by name. A live name is unique (`daemon.rs:239-241`) and an
 exited agent's entry is kept, so writing to it fails with `conflict` instead of
-reaching a recycled process (`agent.rs:430-432`). There is no confirmation mode,
-dry run or per-session policy yet (`--wait-idle` is a heuristic and gates
-nothing), so a mistyped target or a message with unexpected newlines executes
-immediately. Bounds keep the blast radius finite: 64 KiB per message by default
-(`delivery.rs:19`, `delivery.rs:78-87`), 1 KiB per ack note (`daemon.rs:30`),
-2000 logged messages (`daemon.rs:26`) and 256 KiB of output per agent
-(`buffer.rs:8-34`).
+reaching a recycled process (`agent.rs:405-413`, `delivery.rs:536-539`,
+`error.rs:104-106`). There is no confirmation mode, dry run or per-session
+policy yet; `--wait-idle` is a readiness heuristic, not an authorization gate -
+it delays the write until the target looks idle and a timeout writes nothing,
+but it approves no target and validates no content. A mistyped target or a
+message with unexpected newlines therefore executes immediately. Bounds keep the
+blast radius finite: 64 KiB per message by default, up to 1 MiB via
+`AGENT_BRIDGE_MAX_MESSAGE` (`delivery.rs:19`, `delivery.rs:22`,
+`delivery.rs:78-87`), 1 KiB per ack note (`daemon.rs:30`), 2000 logged messages
+(`daemon.rs:26`) and 256 KiB of output per agent by default, up to 16 MiB via
+`AGENT_BRIDGE_BUFFER_BYTES` (`buffer.rs:8-14`).
 
 ## Process lifetime
 
@@ -192,20 +205,22 @@ or message bodies, and message text is never logged at `info`.
   another process's descriptors there needs `lsof` or FFI - and for a process
   that closed or redirected all three standard streams, which no longer carries
   the PTY anchor.
-* Unix snapshot window: the tree comes from a process snapshot, so a process forked
-  after it is not signalled, and a snapshotted pid that exits and is recycled
-  before the sweep can be signalled instead. Best-effort by design.
+* Unix snapshot window: the tree comes from a process snapshot, so a process
+  forked after it is not signalled, and a snapshotted pid that exits and is
+  recycled before the sweep can be signalled instead. Best-effort by design.
 * Unix `ps` unavailable or failing: **closed on Linux**, where the tree is read
   from `/proc/<pid>/stat` instead, so a container without procps still gets the
-  snapshot `ps` would have produced. macOS has no `/proc` (enumerating it would need `lsof` or FFI),
-  so there the snapshot is skipped and only the process-group signal runs. When
-  both sources fail - Linux with an unreadable `/proc` - `descendants()` logs one
-  warning with the `ps` failure.
+  snapshot `ps` would have produced. macOS has no `/proc` (enumerating it would
+  need `lsof` or FFI), so there the snapshot is skipped and only the
+  process-group signal runs. When both sources fail - Linux with an unreadable
+  `/proc` - `descendants()` logs one warning with the `ps` failure.
 * Unix already-detached processes: a process that daemonized (double-fork,
-  reparented to init) before `kill --force` is not in the snapshot and survives.
-  Following it needs cgroups on Linux, or a supervisor / process-enumeration
-  mechanism elsewhere; the Windows job object is the only mechanism here that
-  keeps daemonized children in the tree.
+  reparented to init) before `kill --force` is not in the snapshot. On Linux the
+  PTY sweep still reaches it while it keeps the slave on stdin/stdout/stderr
+  (`reaper.rs:389-420`); it survives only if it also closed or redirected all
+  three, and on macOS unconditionally. Following it needs cgroups on Linux, or a
+  supervisor / process-enumeration mechanism elsewhere; the Windows job object
+  is the only mechanism here that keeps daemonized children in the tree.
 * Unix daemon death: only the foreground process group gets `SIGHUP`, so a
   job-control background job survives a daemon crash. `kill --force` still reaps
   it - while the direct client is running everywhere, and after it exited on
@@ -213,16 +228,24 @@ or message bodies, and message text is never logged at `info`.
   itself would need a supervisor outside the daemon.
 * Running agents are not re-adopted after a daemon restart.
 * No optional token handshake for shared machines.
-* Denial for a *different* OS user is not exercised by CI yet; only the
-  descriptor's validity and same-user connectivity are tested.
+* Denial for a *different unprivileged* OS user is not exercised by CI yet; only
+  the descriptor's validity and same-user connectivity are tested.
+* **State directory mode when started by hand.** `ensure_base_dir` is only called
+  from `start_daemon` (`main.rs:670`); `daemon run` starts the daemon directly
+  (`main.rs:594-600`). On Unix that path lets `create_dir_all`
+  (`transport.rs:76-78`) create the directory with the process umask (typically
+  `0755`), and an existing directory is left as it is. The socket itself is
+  still `0600`, so connections stay owner-only, but the directory and
+  `daemon.log` are not tightened.
 * **Environment inheritance.** Spawned agents inherit the daemon's environment;
   only `TERM` and `AGENT_BRIDGE_AGENT` are set explicitly (`agent.rs:143-158`),
   so every secret exported before the daemon started reaches every agent. An
   allowlist or scrub is roadmap §4.
 * **Unbounded request frame.** The daemon reads one JSON line per connection
   with no length cap (`daemon.rs:952-954`). Message bodies are bounded at
-  64 KiB (`delivery.rs:19`, `delivery.rs:78-87`), but a same-user client can
-  still grow daemon memory with an oversized frame before that check runs.
+  64 KiB by default (`delivery.rs:19`, `delivery.rs:78-87`), but a same-user
+  client can still grow daemon memory with an oversized frame before that check
+  runs.
 * **No read authorization or redaction.** Any same-user client can read every
   agent's output; output that contains secrets is returned verbatim and is not
   filtered.
