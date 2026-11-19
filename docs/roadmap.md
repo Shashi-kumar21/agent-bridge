@@ -132,7 +132,7 @@ Terminal input can execute commands, and terminal output can contain secrets and
 untrusted instructions. Treat `send_message` as a high-impact action, and treat `read`
 as a sensitive operation too.
 
--   [ ] Write a threat model in `SECURITY.md` covering same-user processes, compromised agents, malicious prompt content, IPC endpoint access, and accidental command injection.
+-   [x] Write a threat model in `SECURITY.md` covering same-user processes, compromised agents, malicious prompt content, IPC endpoint access, and accidental command injection. **Done:** `SECURITY.md` now has scope, assets, an actor/trust table, threats T1-T5 (one per required case), process lifetime, explicit non-goals and tracked gaps. Most claims carry a `file:line` anchor; actors, non-goals and the platform caveats are prose.
 -   [ ] Verify Unix socket directory/file permissions and Windows named-pipe DACLs in automated platform tests where feasible.
 -   [ ] Specify the policy design **before** implementing it: file location, format (for example TOML), schema, precedence, and secure defaults. Record it in `docs/policy.md`.
 -   [ ] Add per-session authorization policies for read, write, create, attach, and terminate operations. Reads are authorized, size-bounded and labelled as untrusted content.
@@ -146,7 +146,7 @@ as a sensitive operation too.
 -   [ ] Add audit events for session creation, message writes, reads, attach, and termination, with configurable redaction.
 -   [ ] Add structured diagnostics (for example via `tracing`) with configurable levels, kept separate from the audit log.
 -   [ ] Add a fuzz target (for example `cargo-fuzz`) for the IPC frame and request parser, and keep a small seed corpus in the repository.
--   [ ] Document that prompt injection can propagate between agents and that the bridge does not itself validate the semantic safety of agent instructions.
+-   [x] Document that prompt injection can propagate between agents and that the bridge does not itself validate the semantic safety of agent instructions. **Done:** `SECURITY.md` T3 states that output is untrusted data, that anything an agent prints can reach another agent's consumer through `read`, and that the daemon does no semantic validation; the gap list records the missing read redaction and audit trail.
 
 **Acceptance criterion:** Unauthorized clients cannot perform actions outside their
 configured permissions. Add a negative test for each protected operation (read, write,
