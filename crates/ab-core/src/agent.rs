@@ -269,45 +269,61 @@ impl Agent {
     fn wait_child(&self) {
         loop {
             thread::sleep(Duration::from_millis(120));
-            let exit = {
-                let mut child = self
-                    .child
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match child.try_wait() {
-                    Ok(Some(status)) => Some(i32::try_from(status.exit_code()).unwrap_or(-1)),
-                    Ok(None) => None,
-                    Err(err) => {
-                        // Only this daemon waits on the child, so an error means
-                        // the handle is gone or the OS refused (ECHILD and
-                        // friends). Treat it as an exit so the agent does not
-                        // stay "running" forever; the reaper's pid guard is
-                        // conservative for that case.
-                        warn!(agent = %self.name, error = %err, "wait failed");
-                        Some(-1)
-                    }
-                }
-            };
-            if let Some(code) = exit {
-                if self.running.swap(false, Ordering::SeqCst) {
-                    *self
-                        .exit_code
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(code);
-                    *self
-                        .exited_at
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(crate::now_ms());
-                    self.queue.close();
-                    self.publish(Event::Exit {
-                        agent: self.name.clone(),
-                        code: Some(code),
-                    });
-                    debug!(agent = %self.name, code, "agent exited");
-                }
+            if self.poll_exit() {
                 return;
             }
         }
+    }
+
+    /// One non-blocking liveness check that performs the exit bookkeeping.
+    ///
+    /// Returns `true` once the agent has exited. [`Self::is_running`] is a
+    /// cached flag refreshed at most every 120 ms, which is fine for reporting
+    /// but too stale for the kill path: the reaper's pid-reuse guard keys on
+    /// the leader state, and a flag that lags the real exit tells it to signal
+    /// a process group whose id may already belong to a stranger (macOS CI
+    /// surfaced this as `EPERM` from `kill --force`). The kill path therefore
+    /// asks the child directly through this method.
+    fn poll_exit(&self) -> bool {
+        let exit = {
+            let mut child = self
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match child.try_wait() {
+                Ok(Some(status)) => Some(i32::try_from(status.exit_code()).unwrap_or(-1)),
+                Ok(None) => None,
+                Err(err) => {
+                    // Only this daemon waits on the child, so an error means
+                    // the handle is gone or the OS refused (ECHILD and
+                    // friends). Treat it as an exit so the agent does not
+                    // stay "running" forever; the reaper's pid guard is
+                    // conservative for that case.
+                    warn!(agent = %self.name, error = %err, "wait failed");
+                    Some(-1)
+                }
+            }
+        };
+        let Some(code) = exit else {
+            return false;
+        };
+        if self.running.swap(false, Ordering::SeqCst) {
+            *self
+                .exit_code
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(code);
+            *self
+                .exited_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(crate::now_ms());
+            self.queue.close();
+            self.publish(Event::Exit {
+                agent: self.name.clone(),
+                code: Some(code),
+            });
+            debug!(agent = %self.name, code, "agent exited");
+        }
+        true
     }
 
     /// Agent name.
@@ -640,10 +656,14 @@ impl Agent {
     fn kill_tree(&self) -> Result<()> {
         // Read the liveness state before taking the reaper: on Unix a force kill
         // after the leader exited must not signal a recycled process group.
-        let leader = if self.is_running() {
-            reaper::LeaderState::Alive
-        } else {
+        // Ask the child directly instead of the cached `running` flag, which can
+        // lag the real exit by up to the 120 ms poll interval - long enough for
+        // the pid/process group to be reused (macOS CI caught the resulting
+        // `EPERM` from the group signal).
+        let leader = if self.poll_exit() {
             reaper::LeaderState::Exited
+        } else {
+            reaper::LeaderState::Alive
         };
         let reaper = self
             .reaper
