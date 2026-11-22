@@ -180,8 +180,9 @@ Every command supports `--json` for scripting and for the Tauri UI.
 
 Newline-delimited JSON over a local socket:
 
-* Unix: `~/.agent-bridge/daemon.sock` (filesystem socket, dir `0700` / socket
-  `0600`)
+* Unix: `~/.agent-bridge/daemon.sock` (filesystem socket; dir `0700`
+  best-effort when the daemon was started via `daemon start`, socket `0600`
+  best-effort)
 * Windows: `\\.\pipe\agent-bridge-<user>` (named pipe with a DACL for
   the owner, `SYSTEM` and Administrators)
 
