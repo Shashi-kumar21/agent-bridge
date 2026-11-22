@@ -292,6 +292,13 @@ pipe DACL for owner/`SYSTEM`/Administrators (`transport.rs:79-98`,
 `transport.rs:41`). There is no caller authentication, no per-session policy and
 no audit trail; `from` is an unauthenticated label (`daemon.rs:256-432`).
 
+The mode/DACL half is automated (`crates/ab-core/tests/endpoint_permissions.rs`):
+Unix asserts the `0700` directory (`ensure_base_dir` tightens an existing `0755`
+one) and the `0600` socket, Windows asserts the exact protected DACL, the pipe's
+exclusivity and that the pipe is a namespaced endpoint, and both then connect as
+the same user. Denial for a *different* user is still manual - it needs a second
+account in CI, which the runners do not provide.
+
 ```bash
 agent-bridge kill dev --force        # any local process can do this
 ```

@@ -133,7 +133,7 @@ untrusted instructions. Treat `send_message` as a high-impact action, and treat 
 as a sensitive operation too.
 
 -   [x] Write a threat model in `SECURITY.md` covering same-user processes, compromised agents, malicious prompt content, IPC endpoint access, and accidental command injection. **Done:** `SECURITY.md` now has scope, assets, an actor/trust table, threats T1-T5 (one per required case), process lifetime, explicit non-goals and tracked gaps. Most claims carry a `file:line` anchor; actors, non-goals and the platform caveats are prose.
--   [ ] Verify Unix socket directory/file permissions and Windows named-pipe DACLs in automated platform tests where feasible.
+-   [x] Verify Unix socket directory/file permissions and Windows named-pipe DACLs in automated platform tests where feasible. **Done:** `crates/ab-core/tests/endpoint_permissions.rs` runs on every CI platform. Unix asserts the `0700` directory (including tightening a pre-existing `0755` one), the `0600` socket and that the owner can still connect; Windows asserts the exact protected DACL string and its three principals, plus that the pipe is namespaced and exclusive. Cross-user denial needs a second account, so it stays a documented gap rather than a test.
 -   [ ] Specify the policy design **before** implementing it: file location, format (for example TOML), schema, precedence, and secure defaults. Record it in `docs/policy.md`.
 -   [ ] Add per-session authorization policies for read, write, create, attach, and terminate operations. Reads are authorized, size-bounded and labelled as untrusted content.
 -   [ ] Default new sessions to the least privilege necessary.
