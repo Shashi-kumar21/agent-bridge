@@ -243,8 +243,12 @@ or message bodies, and message text is never logged at `info`.
   itself would need a supervisor outside the daemon.
 * Running agents are not re-adopted after a daemon restart.
 * No optional token handshake for shared machines.
-* Denial for a *different unprivileged* OS user is not exercised by CI yet; only
-  the descriptor's validity and same-user connectivity are tested.
+* Denial for a *different unprivileged* OS user is not exercised by CI yet - it
+  would need a second account and a Win32 ACL query (or `getfacl`) in the test
+  environment. What is tested is: the exact protected DACL and its permitted
+  principals on Windows, pipe exclusivity on Windows, and the `0700`/`0600`
+  modes on Unix including tightening a pre-existing `0755` directory, each
+  followed by a same-user connect (`crates/ab-core/tests/endpoint_permissions.rs`).
 * **State directory mode when started by hand.** `ensure_base_dir` is only called
   from `start_daemon` (`main.rs:670`); `daemon run` starts the daemon directly
   (`main.rs:594-600`). On Unix that path lets `create_dir_all`
