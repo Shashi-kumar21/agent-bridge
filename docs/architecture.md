@@ -256,8 +256,9 @@ there (bracketed paste is a Unix-PTY feature in practice).
 ## 7. Endpoint and security boundary
 
 * State directory: `~/.agent-bridge` or `AGENT_BRIDGE_HOME` (`paths.rs:20-26`).
-  Created with mode `0700` on Unix by `daemon start` (`paths.rs:51-61`);
-  `daemon run` leaves the umask default (see `SECURITY.md` known gaps).
+  Created with mode `0700` (best-effort) on Unix by `daemon start`
+  (`paths.rs:51-61`); `daemon run` leaves the umask default (see
+  `SECURITY.md` known gaps).
 * Unix socket: `daemon.sock` in that directory, set to `0600` after bind
   (best-effort: the chmod result is ignored; `paths.rs:34-36`,
   `transport.rs:92-98`).

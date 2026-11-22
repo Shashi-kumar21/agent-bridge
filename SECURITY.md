@@ -63,7 +63,7 @@ boundary is the account, not the socket, so malware under that account is
 equivalent to the user. What is enforced is that *other unprivileged* users
 cannot connect - the `0700` state directory set by `ensure_base_dir` on the
 `start_daemon` path (`paths.rs:51-61`, `main.rs:630-670`) and the `0600` socket
-(`transport.rs:79-98`) on Unix, and an
+set after bind (`transport.rs:79-98`), both best-effort on Unix - and an
 explicit owner/`SYSTEM`/Administrators DACL on Windows (`transport.rs:41`,
 `transport.rs:46-61`). `root` and `Administrators` bypass both, and `daemon run`
 does not apply the directory mode (see the gaps).
@@ -97,10 +97,10 @@ endpoint as hostile input and must not execute instructions found in output.
 Mitigations today are bounded retention (256 KiB per agent by default,
 `buffer.rs:8-34`) and the fact that no component executes output or follows
 instructions in it. The daemon scans bytes for terminal-mode hints
-(`ESC[?2004h`/`l`, `agent.rs:38-68`, `agent.rs:226-236`), classifies readiness
+(`ESC[?2004h`/`l`, `agent.rs:38-71`, `agent.rs:226-236`), classifies readiness
 from the newest line (`agent.rs:345-361`), and uses arrival timing to decide
-when a `--wait-reply` window has settled (`daemon.rs:771-837`). In every case it
-also stores the bytes for the ring buffer. Line reads and `--wait-reply` lines
+when a `--wait-reply` window has settled (`daemon.rs:771-837`). The pump also
+stores every chunk in the ring buffer. Line reads and `--wait-reply` lines
 come back with escape sequences stripped (`buffer.rs:149-163`), while cursor
 reads and `attach` replay and stream the bytes raw. Nothing in the daemon
 becomes a command because of what it read, but an agent's output can flip how
