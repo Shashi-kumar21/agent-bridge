@@ -95,18 +95,22 @@ safety of agent instructions.** Consumers must treat every byte from the
 endpoint as hostile input and must not execute instructions found in output.
 Mitigations today are bounded retention (256 KiB per agent by default,
 `buffer.rs:8-34`) and the fact that no component executes output or follows
-instructions in it. The daemon only scans it for terminal-mode hints
-(`ESC[?2004h`/`l`, `agent.rs:38-60`, `agent.rs:226-236`) and for readiness
-(`agent.rs:345-361`), then stores it and returns it to a client that asks. An
-agent's output can flip how later messages are pasted, but it never becomes a
-command by itself.
+instructions in it. The daemon scans bytes for terminal-mode hints
+(`ESC[?2004h`/`l`, `agent.rs:38-60`, `agent.rs:226-236`), classifies readiness
+from the newest line (`agent.rs:345-361`), and uses arrival timing to decide
+when a `--wait-reply` window has settled (`daemon.rs:771-837`); otherwise it
+stores the bytes, strips escape sequences for line reads, and returns them to
+clients that ask. An agent's output can flip how later messages are pasted, but
+it never becomes a command by itself.
 
 ### T4. IPC endpoint access
 
-* Unix: state directory `0700`, socket set to `0600` after bind
-  (`paths.rs:51-61`, `transport.rs:92-98`; the chmod result is ignored, so
-  treat the socket mode as best-effort). A stale socket is removed only while no
-  daemon answers on it, so a live daemon cannot be stomped (`transport.rs:79-88`).
+* Unix: state directory `0700` when created by `daemon start`, socket set to
+  `0600` after bind (`paths.rs:51-61`, `transport.rs:92-98`; the chmod result
+  is ignored, so treat the socket mode as best-effort, and `daemon run` leaves
+  the directory at the umask default - see the gaps). A stale socket is removed
+  only while no daemon answers on it, so a live daemon cannot be stomped
+  (`transport.rs:79-88`).
 * Windows: the named pipe is created with
   `D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)` - owner, `SYSTEM` and
   Administrators only, inheritance disabled (`transport.rs:41`). If the
