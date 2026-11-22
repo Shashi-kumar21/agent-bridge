@@ -285,10 +285,10 @@ Roadmap §4 (document the endpoints, add per-instance isolation).
 
 ## 12. Any same-user process can drive any agent
 
-Access control is the endpoint itself: socket `0600` in a `0700` directory (the
-directory mode is applied by `daemon start`; see `SECURITY.md` known gaps), or a
-pipe DACL for owner/`SYSTEM`/Administrators (`transport.rs:79-98`,
-`transport.rs:41`). There is no caller authentication, no per-session policy and
+Access control is the endpoint itself: socket `0600` in a `0700` directory (both
+modes come from the `start_daemon` path and the socket chmod is best-effort; see
+`SECURITY.md` known gaps), or a pipe DACL for
+owner/`SYSTEM`/Administrators (`transport.rs:79-98`, `transport.rs:41`). There is no caller authentication, no per-session policy and
 no audit trail; `from` is an unauthenticated label (`daemon.rs:256-432`).
 
 ```bash

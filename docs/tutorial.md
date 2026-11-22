@@ -342,7 +342,7 @@ scripts without parsing human-readable output.
 | State directory | `~/.agent-bridge` (`%USERPROFILE%\.agent-bridge` on Windows) |
 | Override state directory | `AGENT_BRIDGE_HOME` (any directory) |
 | Daemon log | `<state>/daemon.log` (written when the daemon is started in the background) |
-| Socket (Unix) | `<state>/daemon.sock`, directory `0700`, socket `0600` |
+| Socket (Unix) | `<state>/daemon.sock`, directory `0700` (via `daemon start`), socket `0600` (best-effort) |
 | Socket (Windows) | `\\.\pipe\agent-bridge-<user>`, DACL for the owner, `SYSTEM` and Administrators |
 | Agent name inside the child | `AGENT_BRIDGE_AGENT` |
 

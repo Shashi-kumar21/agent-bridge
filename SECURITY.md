@@ -61,8 +61,9 @@ Any process running as the same OS user can call every request: create, send,
 read, attach, kill and shutdown (`daemon.rs:212-528`). This is accepted: the
 boundary is the account, not the socket, so malware under that account is
 equivalent to the user. What is enforced is that *other unprivileged* users
-cannot connect - the `0700` state directory set by `ensure_base_dir`
-(`paths.rs:51-61`) and the `0600` socket (`transport.rs:79-98`) on Unix, and an
+cannot connect - the `0700` state directory set by `ensure_base_dir` on the
+`start_daemon` path (`paths.rs:51-61`, `main.rs:630-670`) and the `0600` socket
+(`transport.rs:79-98`) on Unix, and an
 explicit owner/`SYSTEM`/Administrators DACL on Windows (`transport.rs:41`,
 `transport.rs:46-61`). `root` and `Administrators` bypass both, and `daemon run`
 does not apply the directory mode (see the gaps).
@@ -96,16 +97,18 @@ endpoint as hostile input and must not execute instructions found in output.
 Mitigations today are bounded retention (256 KiB per agent by default,
 `buffer.rs:8-34`) and the fact that no component executes output or follows
 instructions in it. The daemon scans bytes for terminal-mode hints
-(`ESC[?2004h`/`l`, `agent.rs:38-60`, `agent.rs:226-236`), classifies readiness
+(`ESC[?2004h`/`l`, `agent.rs:38-68`, `agent.rs:226-236`), classifies readiness
 from the newest line (`agent.rs:345-361`), and uses arrival timing to decide
-when a `--wait-reply` window has settled (`daemon.rs:771-837`); otherwise it
-stores the bytes, strips escape sequences for line reads, and returns them to
-clients that ask. An agent's output can flip how later messages are pasted, but
-it never becomes a command by itself.
+when a `--wait-reply` window has settled (`daemon.rs:771-837`). In every case it
+also stores the bytes for the ring buffer. Line reads and `--wait-reply` lines
+come back with escape sequences stripped (`buffer.rs:149-163`), while cursor
+reads and `attach` replay and stream the bytes raw. Nothing in the daemon
+becomes a command because of what it read, but an agent's output can flip how
+later messages are pasted.
 
 ### T4. IPC endpoint access
 
-* Unix: state directory `0700` when created by `daemon start`, socket set to
+* Unix: state directory `0700` when created by the `start_daemon` path, socket set to
   `0600` after bind (`paths.rs:51-61`, `transport.rs:92-98`; the chmod result
   is ignored, so treat the socket mode as best-effort, and `daemon run` leaves
   the directory at the umask default - see the gaps). A stale socket is removed
@@ -156,7 +159,8 @@ blast radius finite: 64 KiB per message by default, up to 1 MiB via
 ## Process lifetime
 
 Agent lifetime is tied to the daemon, so a crashed or force-killed daemon does
-not leave hidden terminals behind (`crates/ab-core/src/reaper.rs`):
+not normally leave hidden terminals behind (`crates/ab-core/src/reaper.rs`;
+the Unix cases that still survive are in **Known gaps**):
 
 * **Windows** - each agent is assigned to an anonymous job object with
   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. When the daemon exits, crashes, or is
@@ -180,8 +184,8 @@ sends `SIGKILL` to the agent's process group, then to every descendant found in
 a process snapshot taken just before the signals (`ps`, falling back to
 `/proc/<pid>/stat` on Linux when `ps` is missing or failing), and on Linux
 finally sweeps every process that still holds the agent's PTY slave open on
-stdin/stdout/stderr. While the direct client is still running, the first two
-passes also reach the jobs an interactive shell moved into their own process
+stdin/stdout/stderr. While the direct client is still running, the snapshot
+pass also reaches the jobs an interactive shell moved into their own process
 group and children that called `setsid`. Once the client has exited its pid and
 process group may name an unrelated tree, so the snapshot is skipped - but the
 Linux PTY sweep still finds the tree, because the slave number cannot be reused
