@@ -1,6 +1,6 @@
 # Architecture
 
-Current implementation, as of `dev` after v0.1.2. Every statement below points at
+Current implementation, as of `dev` after v0.2.0. Every statement below points at
 the code that implements it (`file:line`); line numbers are for the commit that
 added this document and will drift, so treat the symbol name as the anchor.
 
