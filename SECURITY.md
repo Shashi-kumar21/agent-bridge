@@ -62,7 +62,7 @@ read, attach, kill and shutdown (`daemon.rs:212-528`). This is accepted: the
 boundary is the account, not the socket, so malware under that account is
 equivalent to the user. What is enforced is that *other unprivileged* users
 cannot connect - the `0700` state directory set by `ensure_base_dir` on the
-`start_daemon` path (`paths.rs:51-61`, `main.rs:630-670`) and the `0600` socket
+`start_daemon` path (`paths.rs:51-61`, `main.rs:666-670`) and the `0600` socket
 set after bind (`transport.rs:79-98`), both best-effort on Unix - and an
 explicit owner/`SYSTEM`/Administrators DACL on Windows (`transport.rs:41`,
 `transport.rs:46-61`). `root` and `Administrators` bypass both, and `daemon run`
@@ -249,10 +249,10 @@ or message bodies, and message text is never logged at `info`.
   from `start_daemon` (`main.rs:670`); `daemon run` starts the daemon directly
   (`main.rs:594-600`). On Unix that path lets `create_dir_all`
   (`transport.rs:76-78`) create the directory with the process umask (typically
-  `0755`), and an existing directory is left as it is. The socket itself is
-  still `0600`, so connections stay owner-only, but the directory is not
-  tightened. (`daemon run` logs to stderr; `daemon.log` is created only by
-  `daemon start`, `main.rs:671`.)
+  `0755`), and an existing directory is left as it is. The socket is still
+  usually `0600` (best-effort chmod), so connections stay owner-only, but the
+  directory is not tightened. (`daemon run` logs to stderr; `daemon.log` is
+  created only by `daemon start`, `main.rs:671`.)
 * **Environment inheritance.** Spawned agents inherit the daemon's environment;
   only `TERM` and `AGENT_BRIDGE_AGENT` are set explicitly (`agent.rs:143-158`),
   so every secret exported before the daemon started reaches every agent. An
