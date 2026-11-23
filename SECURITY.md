@@ -51,7 +51,9 @@ controls do not constrain them (T4).
 There is no authentication or authorization beyond the endpoint's access
 control. A request can name any agent, and `from` is stored exactly as supplied
 and never verified (`protocol.rs:290-291`); treat it as an unauthenticated
-label. The roadmap's §4 policy layer is what would add per-session scopes.
+label. The roadmap's §4 policy layer is what would add per-session scopes; its
+design (bearer tokens, JSON policy, deny-by-default once a file exists, and the
+same-user limits that remain) is in [`docs/policy.md`](docs/policy.md).
 
 ## Threats and mitigations
 

@@ -290,7 +290,8 @@ directory mode comes from the `start_daemon` path; both chmods are best-effort,
 and `daemon run` skips the directory one - see `SECURITY.md` known gaps), or a
 pipe DACL for owner/`SYSTEM`/Administrators (`transport.rs:79-98`,
 `transport.rs:41`). There is no caller authentication, no per-session policy and
-no audit trail; `from` is an unauthenticated label (`daemon.rs:256-432`).
+no audit trail; `from` is an unauthenticated label (`daemon.rs:256-432`). The
+designed (not implemented) policy layer is in [`policy.md`](policy.md).
 
 The mode/DACL half is automated (`crates/ab-core/tests/endpoint_permissions.rs`):
 Unix asserts the `0700` directory (`ensure_base_dir` tightens an existing `0755`
