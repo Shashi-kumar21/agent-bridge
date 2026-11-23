@@ -96,9 +96,42 @@ A PR is ready for QA only when **all** of these are true:
   `anyhow` only inside PTY plumbing.
 * Never log message bodies at `info`; they may contain sensitive prompts.
 * Wire compatibility: `PROTOCOL_VERSION` in `crates/ab-core/src/protocol.rs`
-  must change whenever `Request`/`Response` changes incompatibly.
+  must change whenever `Request`/`Response` changes incompatibly, including
+  when a new field changes behaviour and an old daemon would silently ignore it
+  (for example `Send.require_ack`).
+* `wait_idle` and `wait_reply` are best-effort heuristics, not a handshake.
+  `wait_idle` polls readiness and proceeds on `idle` or `unknown`; a timeout
+  must fail with `timeout` and write nothing. `wait_reply` subscribes just
+  before the enqueue and returns output observed around the write, bounded to
+  64 KiB / 200 lines, with explicit `settled`/`timed_out`/`truncated`; it drains
+  queued output before settling on an exit and is only attached to a successful
+  write. Never claim it proves the application processed the message. Each wait uses
+  `--timeout` (default 30 s, `0` checks once) and needs a protocol bump when
+  added to the wire.
+* Delivery statuses are deliberately narrow: `written`/`awaiting_ack` mean the
+  PTY accepted the bytes. Only an explicit `Request::Ack` from the target makes
+  a message `acknowledged`; never infer one from output. An ack is
+  target-checked, idempotent, and capped at 1 KiB of note.
+* Readiness is a heuristic and must always be documented as one. `idle` comes
+  from output quiescence (`AGENT_BRIDGE_QUIET_MS`, default 500 ms) or an optional
+  literal `AGENT_BRIDGE_PROMPT_PATTERN` suffix (truncated to 128 characters) on
+  the newest visible line; a stopped agent or one with no visible line is
+  `unknown`. Never gate a destructive action on
+  `idle` alone, and never describe it as a prompt detector. Both variables and
+  `AGENT_BRIDGE_BUFFER_BYTES` (1 KiB..16 MiB, default 256 KiB) are sampled in
+  `Agent::spawn`, so they affect only new agents.
 * Attach streams replay buffered output and then continue live, so the same
   `seq` can arrive twice; clients must drop non-increasing `seq` frames.
+* `read --since` is the byte cursor: offsets are absolute, per agent and per
+  daemon lifetime; a response is capped at 64 KiB of raw bytes and carries `offset`,
+  `next_offset` and `dropped`. A cursor older than the retained window is
+  clamped with `dropped: true`; a cursor past the newest byte is `bad_request`.
+  Never claim offsets survive a daemon restart or an agent re-creation.
+* `Read.wait_ms` is a bounded long-poll: only valid with `since`, capped at 60 s
+  in the daemon, re-reading the buffer at most every 25 ms, and it must return an
+  empty chunk with `timed_out: true` when the window expires. It must never hold
+  a lock while sleeping and must not be described as a push subscription;
+  `--follow` is the CLI loop over it. A line read ignores `wait_ms`.
 * Daemon lifecycle: a protocol-skew restart is allowed **only** when the daemon
   owns no agent sessions. Never add a path that silently kills live agents
   (a version bump is not a licence to destroy someone's terminal).
@@ -108,11 +141,12 @@ A PR is ready for QA only when **all** of these are true:
   closing the ConPTY only reaps the direct client, not grandchildren that
   opened their own console. On Unix the PTY hangup covers daemon death and
   `ProcessReaper::terminate` signals the agent's process group, then the
-  descendants in a `ps` snapshot taken first, and on Linux finally every process
-  that still holds the PTY slave - so job-control jobs are reaped while the
-  direct client is alive, and on Linux also after it exited. macOS keeps that
-  after-exit gap, and a process that already detached (daemonized) is a known gap
-  everywhere (see `SECURITY.md`).
+  descendants in a `ps` snapshot taken first (Linux falls back to
+  `/proc/<pid>/stat` when `ps` is missing or failing), and on Linux finally
+  every process that still holds the PTY slave - so job-control jobs are reaped
+  while the direct client is alive, and on Linux also after it exited. macOS
+  keeps that after-exit gap, and a process that already detached (daemonized) is
+  a known gap everywhere (see `SECURITY.md`).
   `kill --force` tears the tree down through the same hook - do not replace it
   with a bare `child.kill()`, and do not replace the crates with raw FFI. On
   Linux the PTY fd sweep (`pty_path` / `pty_members` in `reaper.rs`) is what
@@ -129,8 +163,11 @@ A PR is ready for QA only when **all** of these are true:
 
 ```
 crates/ab-core/src/protocol.rs  wire types (single source of truth)
+crates/ab-core/src/delivery.rs  message ids, size limit, payload composition, bounded write queue
 crates/ab-core/src/daemon.rs    accept loop, request handling, attach streams
-crates/ab-core/src/agent.rs     PTY spawn, output pump, resize, kill
+crates/ab-core/src/agent.rs     PTY spawn, output pump, resize, kill, readiness snapshot
+crates/ab-core/src/buffer.rs    bounded output ring, ANSI stripping, capacity from env
+crates/ab-core/src/readiness.rs quiet period + prompt-suffix heuristic
 crates/ab-core/src/reaper.rs    agent lifetime + `kill --force` tree teardown
 crates/ab-core/src/transport.rs local socket / named pipe
 crates/ab-core/src/client.rs    blocking client used by CLI and UI
@@ -200,6 +237,7 @@ agent-bridge kill smoke --force
 agent-bridge daemon stop
 ```
 
-If a 0.9.x release passes, upgrade, delete the advisory ignore from
-`deny.toml`, delete the dependabot ignore and the CI pin step, and confirm
-`serial` is gone from `Cargo.lock`.
+If a 0.9.x release passes, upgrade, delete both advisory ignores from
+`deny.toml` (`RUSTSEC-2017-0008`, `RUSTSEC-2026-0441`), delete the dependabot
+ignore and the CI pin step, and confirm `serial` and `pin-utils` are gone from
+`Cargo.lock`.

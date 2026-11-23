@@ -14,57 +14,203 @@ Please email the maintainer instead of opening a public issue. Include:
 
 You should receive a response within 72 hours.
 
-## Threat model
+## Scope
 
-`agent-bridge` is a **local** tool:
+`agent-bridge` is a **local** tool: a daemon owns PTYs and the CLI drives it
+over a local endpoint. It never binds a network interface (`transport.rs:63-103`).
+The security boundary is the **OS user**: every process running as that user may
+drive every agent, and no other *unprivileged* user may reach the endpoint
+(`transport.rs:41`, `transport.rs:92-98`). Privileged accounts (`root` on Unix,
+Administrators on Windows) bypass file modes and DACLs, so the endpoint's access
+controls do not constrain them (T4).
 
-* The daemon listens only on a local endpoint (filesystem socket on Unix,
-  named pipe on Windows). It never binds a network interface.
-* Anyone running as the same OS user can talk to the daemon by design; the
-  security boundary is the OS user, not the socket.
-* Endpoint hardening on startup:
-  * Unix: state directory `0700`, socket `0600` (owner only). A stale socket is
-    only removed after proving no daemon answers on it.
-  * Windows: the named pipe is created with an explicit DACL,
-    `D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)` - owner, `SYSTEM` and
-    Administrators only, inheritance disabled. If the descriptor cannot be
-    built the daemon falls back to the OS default and logs a warning.
-* Messages are written verbatim into another agent's PTY. Treat `sendmessage`
-  input as code execution in that terminal - that is the point of the tool.
-* Output buffers are kept in memory only (256 KiB per agent) and are never
-  written to disk unless the daemon log is enabled.
-* Agent lifetime is tied to the daemon, so a crashed or force-killed daemon does
-  not leave hidden terminals behind (`crates/ab-core/src/reaper.rs`):
-  * **Windows** - each agent is assigned to an anonymous job object with
-    `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. When the daemon exits, crashes, or is
-    terminated from Task Manager, the kernel kills the agent and every
-    descendant in the job, including processes that opened their own console.
-    Two caveats: the assignment happens right after `CreateProcessW`, so a
-    process forked in that brief window is outside the job; and the
-    job does not set `JOB_OBJECT_LIMIT_BREAKAWAY_OK`, so a child that asks for
-    `CREATE_BREAKAWAY_FROM_JOB` now fails with `ERROR_ACCESS_DENIED` instead of
-    escaping (some installers/launchers do this).
-  * **Unix** - `portable-pty` makes the agent a session leader with the PTY as
-    its controlling terminal. Closing the master on daemon death makes the
-    kernel send `SIGHUP` to the foreground process group.
-  * If the OS refuses the link (for example a restricted job object on a locked
-    down host), the daemon logs a warning and spawns the agent anyway; refusing
-    to run a terminal would be worse than running it without the safety net.
-* `agent-bridge kill --force` tears the agent's process tree down while the
-  daemon stays up: Windows drops the job handle (the kernel terminates the job),
-  Unix sends `SIGKILL` to the agent's process group, then to every descendant
-  found in a `ps` snapshot taken just before the signals, and on Linux finally
-  sweeps every process that still holds the agent's PTY slave open on
-  stdin/stdout/stderr. While the direct client is still running, the first two
-  passes also reach the jobs an interactive shell moved into their own process
-  group and children that called `setsid`. Once the client has exited its pid and
-  process group may name an unrelated tree, so the snapshot is skipped - but the
-  Linux PTY sweep still finds the tree, because the slave number cannot be reused
-  while the daemon holds the master and a background job keeps the terminal on
-  its standard streams. macOS has no `/proc`, so a job-control job left behind
-  there survives (see the known gaps). `kill` without `--force` still tries
-  Ctrl-C first and then only terminates the PTY client, so children of a stubborn
-  agent survive that path by design.
+## Assets
+
+* **Terminal input.** Anything written to an agent's PTY is executed by the
+  program reading it (normally a shell). `sendmessage` is therefore a
+  code-execution primitive on purpose.
+* **Terminal output.** May contain secrets, credentials and untrusted
+  instructions. `read`, `attach` and `--wait-reply` expose it to any same-user
+  client.
+* **Message records.** Text, target, sender label and delivery status for the
+  last 2000 messages (`daemon.rs:26`), plus the newest 500 records held per agent
+  (`agent.rs:25`). Memory only.
+* **The daemon process** and the agents it owns. They run with the user's full
+  privileges, and agents inherit the daemon's environment (see the gaps).
+
+## Actors and trust boundaries
+
+| Actor | Trust | Reach |
+| --- | --- | --- |
+| The owner (same OS user) | Trusted by design | Everything |
+| Other unprivileged OS users | Untrusted | Nothing: denied by the socket mode / pipe DACL (privileged accounts bypass both) |
+| An agent process | Same privileges as the user | Can open the endpoint itself, like any process |
+| Message content | Untrusted data | Executed as keystrokes in the target terminal |
+| Terminal output | Untrusted data | Rendered by consumers (CLI, editors, models) |
+
+There is no authentication or authorization beyond the endpoint's access
+control. A request can name any agent, and `from` is stored exactly as supplied
+and never verified (`protocol.rs:290-291`); treat it as an unauthenticated
+label. The roadmap's §4 policy layer is what would add per-session scopes.
+
+## Threats and mitigations
+
+### T1. Same-user processes
+
+Any process running as the same OS user can call every request: create, send,
+read, attach, kill and shutdown (`daemon.rs:212-528`). This is accepted: the
+boundary is the account, not the socket, so malware under that account is
+equivalent to the user. What is enforced is that *other unprivileged* users
+cannot connect - the `0700` state directory set by `ensure_base_dir` on the
+`start_daemon` path (`paths.rs:51-61`, `main.rs:666-670`) and the `0600` socket
+set after bind (`transport.rs:79-98`), both best-effort on Unix - and an
+explicit owner/`SYSTEM`/Administrators DACL on Windows (`transport.rs:41`,
+`transport.rs:46-61`). `root` and `Administrators` bypass both, and `daemon run`
+does not apply the directory mode (see the gaps).
+
+### T2. Compromised or malicious agent
+
+An agent is a normal process under the same user, so it can connect to the
+endpoint and drive every other agent, read their output, or shut the daemon
+down. There is no per-agent token or scoped credential; `AGENT_BRIDGE_AGENT` is
+a convenience label, not identity (`agent.rs:143-158`), and nothing separates an
+agent's requests from the user's. The containment that does exist is process
+lifetime: `kill --force` tears a tree down and `daemon stop` ends every terminal
+(see **Process lifetime**). Per-session authorization is roadmap §4 and is not
+implemented.
+
+### T3. Malicious prompt content
+
+Output is raw terminal data. Line reads strip escape sequences, but cursor
+reads return the raw bytes and `--json` returns the fields verbatim, so a
+consumer that renders them in a terminal (or feeds them to a model) can be
+driven by the content: control sequences, fake prompts, and prompt-injection
+instructions all pass through. The daemon never interprets output as
+instructions and performs no semantic validation - it cannot tell safe text
+from hostile text.
+
+Prompt injection propagates between agents and their consumers: an agent can
+print text that another agent (or a human's assistant) later reads via `read`,
+and nothing marks it as untrusted. **The bridge does not validate the semantic
+safety of agent instructions.** Consumers must treat every byte from the
+endpoint as hostile input and must not execute instructions found in output.
+Mitigations today are bounded retention (256 KiB per agent by default,
+`buffer.rs:8-34`) and the fact that no component executes output or follows
+instructions in it. The daemon scans bytes for terminal-mode hints
+(`ESC[?2004h`/`l`, `agent.rs:38-71`, `agent.rs:226-236`), classifies readiness
+from the newest line (`agent.rs:345-361`), and uses arrival timing to decide
+when a `--wait-reply` window has settled (`daemon.rs:771-837`). The pump also
+stores every chunk in the ring buffer. Line reads and `--wait-reply` lines
+come back with escape sequences stripped (`buffer.rs:149-163`), while cursor
+reads and `attach` replay and stream the bytes raw. Nothing in the daemon
+becomes a command because of what it read, but an agent's output can flip how
+later messages are pasted.
+
+### T4. IPC endpoint access
+
+* Unix: state directory `0700` when created by the `start_daemon` path, socket set to
+  `0600` after bind (`paths.rs:51-61`, `transport.rs:92-98`; the chmod result
+  is ignored, so treat the socket mode as best-effort, and `daemon run` leaves
+  the directory at the umask default - see the gaps). A stale socket is removed
+  only while no daemon answers on it, so a live daemon cannot be stomped
+  (`transport.rs:79-88`).
+* Windows: the named pipe is created with
+  `D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)` - owner, `SYSTEM` and
+  Administrators only, inheritance disabled (`transport.rs:41`). If the
+  descriptor cannot be built the daemon falls back to the OS default and logs a
+  warning (`transport.rs:46-61`), which is broader than this tool needs.
+* `AGENT_BRIDGE_HOME` moves the state directory and, on Unix, the socket
+  (`paths.rs:20-36`); on Windows the pipe name ignores it and only
+  `AGENT_BRIDGE_PIPE` renames the pipe (`transport.rs:10-20`). Both are
+  per-process and set by the caller, so they do not cross a privilege boundary,
+  but they do let a user point the CLI at a different daemon.
+* Residual risk: privileged accounts are within reach - on Windows
+  `Administrators` and `SYSTEM` can drive agents, and on Unix `root` (or
+  `CAP_DAC_OVERRIDE`) can open the `0600` socket and enter the `0700` directory.
+  On every platform, denial for a *different unprivileged* user is not exercised
+  by CI yet (see the gaps).
+
+### T5. Accidental command injection
+
+The daemon writes the message bytes plus a trailing Enter by default; it never
+interprets them through a shell (`daemon.rs:256-432`, `delivery::compose_payload`).
+The risk is semantic: the bytes are typed into a live terminal. Newlines submit
+commands, and with bracketed paste disabled each line executes as it arrives;
+`--paste` forces the bracketed form even for one line, while the default `auto`
+wraps only multi-line text and only when the target enabled bracketed paste
+(`delivery.rs:121-123`). A message sent to a shell that is not at a prompt is
+still typed into it.
+
+Target selection is by name. A live name is unique (`daemon.rs:239-241`) and an
+exited agent's entry is kept, so writing to it fails with `conflict` instead of
+being delivered to a later agent that reuses the name (`agent.rs:405-413`,
+`delivery.rs:536-539`; the same code mapping is in `error.rs:104-106`). There is
+no confirmation mode, dry run or per-session policy yet; `--wait-idle` is a
+readiness heuristic, not an authorization gate - it delays the write while the
+target looks busy (`unknown` proceeds by design) and a timeout writes nothing,
+but it approves no target and validates no content. A mistyped target or a
+message with unexpected newlines therefore executes immediately. Bounds keep the
+blast radius finite: 64 KiB per message by default, up to 1 MiB via
+`AGENT_BRIDGE_MAX_MESSAGE` (`delivery.rs:19`, `delivery.rs:22`,
+`delivery.rs:78-87`), 1 KiB per ack note (`daemon.rs:30`), 2000 logged messages
+(`daemon.rs:26`) and 256 KiB of output per agent by default, up to 16 MiB via
+`AGENT_BRIDGE_BUFFER_BYTES` (`buffer.rs:8-14`).
+
+## Process lifetime
+
+Agent lifetime is tied to the daemon, so a crashed or force-killed daemon does
+not normally leave hidden terminals behind (`crates/ab-core/src/reaper.rs`;
+the Unix cases that still survive are in **Known gaps**):
+
+* **Windows** - each agent is assigned to an anonymous job object with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. When the daemon exits, crashes, or is
+  terminated from Task Manager, the kernel kills the agent and every descendant
+  in the job, including processes that opened their own console. Two caveats:
+  the assignment happens right after `CreateProcessW`, so a process forked in
+  that brief window is outside the job; and the job does not set
+  `JOB_OBJECT_LIMIT_BREAKAWAY_OK`, so a child that asks for
+  `CREATE_BREAKAWAY_FROM_JOB` now fails with `ERROR_ACCESS_DENIED` instead of
+  escaping (some installers/launchers do this).
+* **Unix** - `portable-pty` makes the agent a session leader with the PTY as its
+  controlling terminal. Closing the master on daemon death makes the kernel
+  send `SIGHUP` to the foreground process group.
+* If the OS refuses the link (for example a restricted job object on a locked
+  down host), the daemon logs a warning and spawns the agent anyway; refusing to
+  run a terminal would be worse than running it without the safety net.
+
+`agent-bridge kill --force` tears the agent's process tree down while the daemon
+stays up: Windows drops the job handle (the kernel terminates the job), Unix
+sends `SIGKILL` to the agent's process group, then to every descendant found in
+a process snapshot taken just before the signals (`ps`, falling back to
+`/proc/<pid>/stat` on Linux when `ps` is missing or failing), and on Linux
+finally sweeps every process that still holds the agent's PTY slave open on
+stdin/stdout/stderr. While the direct client is still running, the snapshot
+pass also reaches the jobs an interactive shell moved into their own process
+group and children that called `setsid`. Once the client has exited its pid and
+process group may name an unrelated tree, so the snapshot is skipped - but the
+Linux PTY sweep still finds the tree, because the slave number cannot be reused
+while the daemon holds the master and a background job keeps the terminal on its
+standard streams. macOS has no `/proc`, so a job-control job left behind there
+survives (see the known gaps). `kill` without `--force` still tries Ctrl-C first
+and then only terminates the PTY client, so children of a stubborn agent survive
+that path by design.
+
+Output buffers and message bodies are memory only: they are never written to
+disk. The daemon log records lifecycle events and errors, not terminal contents
+or message bodies, and message text is never logged at `info`.
+
+## Non-goals
+
+* Defending against malware or an attacker who already controls the same OS
+  user account (T1).
+* Remote or multi-user access, which would need an authenticated transport
+  (roadmap §10).
+* Sandboxing agents. They run with the user's full privileges; environment
+  inheritance is a known gap below.
+* Validating prompt semantics or guaranteeing that an agent obeys an
+  instruction (T3).
+* Per-session authorization, confirmation of sensitive actions and an audit
+  trail. These are roadmap §4 and are not implemented yet.
 
 ## Known gaps (tracked, not yet implemented)
 
@@ -74,17 +220,22 @@ You should receive a response within 72 hours.
   another process's descriptors there needs `lsof` or FFI - and for a process
   that closed or redirected all three standard streams, which no longer carries
   the PTY anchor.
-* Unix snapshot window: the tree comes from a `ps` snapshot, so a process forked
-  after it is not signalled, and a snapshotted pid that exits and is recycled
-  before the sweep can be signalled instead. Best-effort by design.
-* Unix `ps` unavailable or failing: `descendants()` logs a warning (with the
-  status and stderr) and the snapshot is skipped, so only the process-group
-  signal and (on Linux) the PTY fd sweep run.
+* Unix snapshot window: the tree comes from a process snapshot, so a process
+  forked after it is not signalled, and a snapshotted pid that exits and is
+  recycled before the sweep can be signalled instead. Best-effort by design.
+* Unix `ps` unavailable or failing: **closed on Linux**, where the tree is read
+  from `/proc/<pid>/stat` instead, so a container without procps still gets the
+  snapshot `ps` would have produced. macOS has no `/proc` (enumerating it would
+  need `lsof` or FFI), so there the snapshot is skipped and only the
+  process-group signal runs. When both sources fail - Linux with an unreadable
+  `/proc` - `descendants()` logs one warning with the `ps` failure.
 * Unix already-detached processes: a process that daemonized (double-fork,
-  reparented to init) before `kill --force` is not in the snapshot and survives.
-  Following it needs cgroups on Linux, or a supervisor / process-enumeration
-  mechanism elsewhere; the Windows job object is the only mechanism here that
-  keeps daemonized children in the tree.
+  reparented to init) before `kill --force` is not in the snapshot. On Linux the
+  PTY sweep still reaches it while it keeps the slave on stdin/stdout/stderr
+  (`reaper.rs:389-420`); it survives only if it also closed or redirected all
+  three, and on macOS unconditionally. Following it needs cgroups on Linux, or a
+  supervisor / process-enumeration mechanism elsewhere; the Windows job object
+  is the only mechanism here that keeps daemonized children in the tree.
 * Unix daemon death: only the foreground process group gets `SIGHUP`, so a
   job-control background job survives a daemon crash. `kill --force` still reaps
   it - while the direct client is running everywhere, and after it exited on
@@ -92,6 +243,31 @@ You should receive a response within 72 hours.
   itself would need a supervisor outside the daemon.
 * Running agents are not re-adopted after a daemon restart.
 * No optional token handshake for shared machines.
-* Denial for a *different* OS user is not exercised by CI yet; only the
-  descriptor's validity and same-user connectivity are tested.
-
+* Denial for a *different unprivileged* OS user is not exercised by CI yet - it
+  would need a second account and a Win32 ACL query (or `getfacl`) in the test
+  environment. What is tested is: the exact protected DACL and its permitted
+  principals on Windows, pipe exclusivity on Windows, and the `0700`/`0600`
+  modes on Unix including tightening a pre-existing `0755` directory, each
+  followed by a same-user connect (`crates/ab-core/tests/endpoint_permissions.rs`).
+* **State directory mode when started by hand.** `ensure_base_dir` is only called
+  from `start_daemon` (`main.rs:670`); `daemon run` starts the daemon directly
+  (`main.rs:594-600`). On Unix that path lets `create_dir_all`
+  (`transport.rs:76-78`) create the directory with the process umask (typically
+  `0755`), and an existing directory is left as it is. The socket is still
+  usually `0600` (best-effort chmod), so connections stay owner-only, but the
+  directory is not tightened. (`daemon run` logs to stderr; `daemon.log` is
+  created only by `daemon start`, `main.rs:671`.)
+* **Environment inheritance.** Spawned agents inherit the daemon's environment;
+  only `TERM` and `AGENT_BRIDGE_AGENT` are set explicitly (`agent.rs:143-158`),
+  so every secret exported before the daemon started reaches every agent. An
+  allowlist or scrub is roadmap §4.
+* **Unbounded request frame.** The daemon reads one JSON line per connection
+  with no length cap (`daemon.rs:952-954`). Message bodies are bounded at
+  64 KiB by default (`delivery.rs:19`, `delivery.rs:78-87`), but a same-user
+  client can still grow daemon memory with an oversized frame before that check
+  runs.
+* **No read authorization or redaction.** Any same-user client can read every
+  agent's output; output that contains secrets is returned verbatim and is not
+  filtered.
+* **No audit trail.** Session creation, writes, reads, attach and termination
+  are not recorded with a caller identity, and there is no redaction policy.

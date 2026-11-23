@@ -47,6 +47,14 @@ pub fn run(target: &str, from_seq: Option<u64>) -> Result<()> {
                     );
                     let _ = stdout.flush();
                 }
+                Ok(Some(Event::MessageStatus { id, status, .. })) => {
+                    let _ = write!(
+                        stdout,
+                        "\r\n\x1b[2m[bridge]\x1b[0m message {id} {}\r\n",
+                        crate::fmt::status_line(&status)
+                    );
+                    let _ = stdout.flush();
+                }
                 Ok(Some(Event::Exit { code, .. })) => {
                     let code = code.map_or_else(|| "-".to_string(), |value| value.to_string());
                     let _ = write!(

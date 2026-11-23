@@ -16,6 +16,10 @@ pub enum BridgeError {
     #[error("protocol error: {0}")]
     Protocol(String),
 
+    /// A command line was internally inconsistent.
+    #[error("{0}")]
+    Usage(String),
+
     /// The daemon socket could not be reached.
     #[error("daemon is not running (expected socket at {0})")]
     DaemonNotRunning(String),
@@ -36,6 +40,56 @@ pub enum BridgeError {
     #[error("agent '{0}' has already exited")]
     AgentExited(String),
 
+    /// The message exceeds the configured size limit.
+    #[error("message is {bytes} bytes, limit is {limit} bytes (raise {env})")]
+    MessageTooLarge {
+        /// Payload size including the trailing carriage return.
+        bytes: usize,
+        /// Active limit.
+        limit: usize,
+        /// Environment variable that controls the limit.
+        env: &'static str,
+    },
+
+    /// No message is registered under that id.
+    #[error("message '{0}' not found (ids are per daemon; a restart clears history)")]
+    MessageNotFound(u64),
+
+    /// A message was accepted but the daemon could not write it.
+    #[error("message {id} failed: {detail}")]
+    DeliveryFailed {
+        /// Message identifier.
+        id: u64,
+        /// Cause reported by the write path.
+        detail: String,
+    },
+
+    /// The request is valid but the object is in a state that forbids it.
+    #[error("{0}")]
+    Conflict(String),
+
+    /// A `--wait-idle` deadline expired while the target was still busy.
+    #[error("agent '{target}' stayed busy for {millis} ms")]
+    WaitIdleTimeout {
+        /// Target agent name.
+        target: String,
+        /// Deadline that expired.
+        millis: u64,
+    },
+
+    /// A read cursor is ahead of the agent's output stream.
+    #[error(
+        "read offset {since} is ahead of the {total} bytes produced by agent '{target}' (offsets reset on restart)"
+    )]
+    CursorAhead {
+        /// Target agent name.
+        target: String,
+        /// Offset the caller asked for.
+        since: u64,
+        /// Bytes produced so far by that agent.
+        total: u64,
+    },
+
     /// Generic daemon-side failure.
     #[error("{0}")]
     Daemon(String),
@@ -46,9 +100,17 @@ impl BridgeError {
     #[must_use]
     pub fn code(&self) -> ErrorCode {
         match self {
-            Self::AgentNotFound(_) => ErrorCode::NotFound,
-            Self::AgentExists(_) | Self::AgentExited(_) => ErrorCode::Conflict,
-            Self::InvalidName(_) | Self::Protocol(_) => ErrorCode::BadRequest,
+            Self::AgentNotFound(_) | Self::MessageNotFound(_) => ErrorCode::NotFound,
+            Self::AgentExists(_) | Self::AgentExited(_) | Self::DeliveryFailed { .. } => {
+                ErrorCode::Conflict
+            }
+            Self::Conflict(_) => ErrorCode::Conflict,
+            Self::InvalidName(_)
+            | Self::Protocol(_)
+            | Self::Usage(_)
+            | Self::CursorAhead { .. } => ErrorCode::BadRequest,
+            Self::MessageTooLarge { .. } => ErrorCode::TooLarge,
+            Self::WaitIdleTimeout { .. } => ErrorCode::Timeout,
             Self::DaemonNotRunning(_) | Self::Daemon(_) => ErrorCode::NotRunning,
             Self::Io(_) => ErrorCode::Internal,
         }

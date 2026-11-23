@@ -213,6 +213,14 @@ fn send(target: &str, message: &str) {
         message: message.to_string(),
         enter: Some(true),
         from: Some("qa".to_string()),
+        queue_timeout_ms: None,
+        write_timeout_ms: None,
+        wait: None,
+        paste: None,
+        require_ack: None,
+        wait_idle: None,
+        wait_reply: None,
+        timeout_ms: None,
     })
     .expect("send message");
     assert!(matches!(sent, Response::Sent { .. }), "got {sent:?}");
@@ -277,6 +285,8 @@ fn read_pid(agent: &str, marker: &str) -> u32 {
         if let Ok(Response::Output { lines, .. }) = client::request(&Request::Read {
             target: agent.to_string(),
             lines: Some(80),
+            since: None,
+            wait_ms: None,
         }) {
             for line in &lines {
                 if let Some((_, rest)) = line.split_once(marker) {
