@@ -55,8 +55,8 @@ agent-bridge daemon start
 It prints the daemon details, so you can confirm what is running:
 
 ```
-protocol : 1
-daemon   : 0.1.2
+protocol : 9
+daemon   : 0.2.0
 pid      : 11228
 teardown : windows job object (kill on job close)
 socket   : \\.\pipe\agent-bridge-<user>
@@ -263,8 +263,9 @@ that handle interrupts.
 * **Windows**: the agent's job object is dropped and the kernel terminates every
   process in it, including grandchildren that opened their own console.
 * **macOS/Linux**: `SIGKILL` to the agent's process group, plus every descendant
-  found in a `ps` snapshot taken first, so jobs moved into their own process
-  group are reached too.
+  found in a `ps` snapshot taken first (Linux falls back to `/proc` when `ps` is
+  missing or failing), so jobs moved into their own process group are reached
+  too.
 * **Linux additionally**: every process that still holds the agent's PTY slave
   on stdin/stdout/stderr is killed, which also reaches a background job after
   the direct client has exited.
@@ -341,7 +342,7 @@ scripts without parsing human-readable output.
 | State directory | `~/.agent-bridge` (`%USERPROFILE%\.agent-bridge` on Windows) |
 | Override state directory | `AGENT_BRIDGE_HOME` (any directory) |
 | Daemon log | `<state>/daemon.log` (written when the daemon is started in the background) |
-| Socket (Unix) | `<state>/daemon.sock`, directory `0700`, socket `0600` |
+| Socket (Unix) | `<state>/daemon.sock`, directory `0700` best-effort (via `daemon start`), socket `0600` best-effort |
 | Socket (Windows) | `\\.\pipe\agent-bridge-<user>`, DACL for the owner, `SYSTEM` and Administrators |
 | Agent name inside the child | `AGENT_BRIDGE_AGENT` |
 

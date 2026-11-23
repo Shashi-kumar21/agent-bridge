@@ -25,12 +25,19 @@ Unix-only. `agent-bridge` owns the terminals itself through a PTY
 (`ConPTY` on Windows, `openpty` on Unix) via [`portable-pty`], and exposes a
 single local-socket protocol. One implementation, three operating systems.
 
-## Tutorial
+## Documentation
 
-New here? **[Tutorial to use](docs/tutorial.md)** walks through install, the
-daemon, spawning agents, messaging between terminals, `read`/`attach`/`kill`,
-scripting with `--json` and troubleshooting - with copy-pasteable commands for
-Windows, macOS and Linux.
+- **[Tutorial](docs/tutorial.md)** - hands-on walkthrough: install, the daemon,
+  spawning agents, messaging between terminals, `read`/`attach`/`kill`,
+  scripting with `--json` and troubleshooting, with copy-pasteable commands for
+  Windows, macOS and Linux.
+- **[Architecture](docs/architecture.md)** - how the pieces fit, anchored to the
+  code with `file:line` references.
+- **[Known limitations](docs/known-limitations.md)** - confirmed gaps, with
+  reproductions.
+- **[Roadmap](docs/roadmap.md)** - the phased plan.
+
+New here? Start with the **[tutorial](docs/tutorial.md)**.
 
 ## Install
 
@@ -57,24 +64,114 @@ agent-bridge sendmessage claude --from dev "tests are green, please review PR #4
 
 # 5. peek at / drive a terminal from here
 agent-bridge read dev --lines 60
+agent-bridge read dev --since 0   # raw bytes from a byte offset
 agent-bridge attach dev          # Ctrl-] detaches
 ```
 
 `sendmessage` writes into the target PTY exactly as if a human typed it, so any
 interactive CLI works: Claude Code, OpenCode, a shell, a REPL, an editor.
 
+Every message gets a daemon-wide id and a delivery status: `queued`, `writing`,
+`written`, `failed` or `unknown`. `written` only means the daemon's PTY write
+returned; it is not an acknowledgement from the target application. Payloads
+are limited to 64 KiB by default; export `AGENT_BRIDGE_MAX_MESSAGE` (1 KiB..1
+MiB) before `daemon start`/`restart`, because the daemon reads it.
+
+Each agent has a bounded write queue (128 jobs / 2 MiB by default,
+`AGENT_BRIDGE_QUEUE_LIMIT` and `AGENT_BRIDGE_QUEUE_BYTES`, read when the agent
+spawns) and one writer thread, so concurrent senders cannot interleave bytes.
+`sendmessage` waits for the terminal status by default; `--queue-timeout` (5s),
+`--write-timeout` (5s, `0` waits forever) and `--no-wait` control the wait. A
+write that is still blocked when `--write-timeout` expires returns `unknown`
+and is amended when the syscall returns; a message that has not started yet
+stays `queued` and is still delivered later. Note that `0` means fail fast for
+`--queue-timeout` but wait forever for `--write-timeout`. `sendmessage` exits 0
+for `queued`/`unknown` too. `written` and `awaiting_ack` are confirmed PTY
+writes; `acknowledged` additionally means the receiving integration reported
+that it saw the message. `listagents` shows the queue depth.
+
+Add `--require-ack` when you need the receiving side to confirm it saw the
+message: the status then becomes `awaiting_ack` after the write, and an
+integration that received it runs `agent-bridge ack <name> <id> [--note "..."]`
+to record `acknowledged`. `pending <name>` lists the ids still awaiting an ack
+alongside the queued/writing/unknown ones. The ack is explicit, target-checked
+and idempotent; it reports that the integration saw the message, not that the
+application understood or completed the request. `written`, `awaiting_ack` and
+`acknowledged` are the only statuses that mean the bytes reached the PTY.
+
+`sendmessage --wait-idle` holds the message until the target reports `idle` or
+`unknown` (a fresh agent with no visible output is not blocked), so a command is
+not typed into a busy terminal. If `--timeout` (default 30s) expires while the
+target is still `busy`, nothing is written and the command fails with the
+`timeout` code. `--wait-reply` waits for output after the write to go quiet and
+prints the ANSI-stripped new lines plus whether the reply `settled` or
+`timed_out`. The daemon keeps at most 64 KiB and 200 lines; `truncated` reports
+dropped bytes. It is best effort and not a request/response handshake. A
+target that emits no bytes at all yields an empty `timed_out` reply when the
+deadline passes; a silent target on a Unix PTY usually returns a `settled`
+reply containing only the terminal echo, and a target that never goes quiet
+times out with the lines seen so far. A failed write leaves `reply` null, and a
+`written` status still only means the PTY accepted the bytes. `--wait-reply`
+conflicts with `--no-wait`; `--timeout 0` checks once instead of waiting.
+
+`listagents` shows a heuristic **READY** column: `busy`, `idle` or `unknown`
+(`listagents --json` reports `readiness`). Output that arrived within the quiet
+period is `busy`; an agent that printed a visible line and then went quiet past
+it is `idle`; a stopped agent, or one that never printed a visible line, is
+`unknown`. An optional literal prompt suffix (max 128 characters) on the newest
+line can mark `idle` early. The state is a hint, never a guarantee: a command
+that printed once and then runs silently is reported `idle`.
+Tune it with `AGENT_BRIDGE_QUIET_MS` (default `500`, clamped 50..60000) and
+`AGENT_BRIDGE_PROMPT_PATTERN`. Retained output is 256 KiB per agent;
+`AGENT_BRIDGE_BUFFER_BYTES` overrides it (clamped 1 KiB..16 MiB). All three are
+read by the daemon when it spawns an agent, so export them before
+`daemon start`/`restart`; an already-running daemon will not see a later
+change.
+
+Multi-line text is bracket-pasted (`ESC[200~`..`ESC[201~`) when the target
+application announced support with `ESC[?2004h`; this is `--paste auto`, the
+default. Use `--paste plain` for applications that print the markers as literal
+text, or `--paste bracketed` to force the markers for an application that
+supports paste without announcing it. Detection reads the daemon's PTY stream;
+in the default ConPTY configuration on Windows that stream is re-rendered by
+ConPTY, which consumes these markers, so `auto` behaves like `plain` there.
+`listagents --json` reports `bracketed_paste`.
+
+`read --since OFFSET` returns raw output bytes from an absolute per-agent byte
+offset instead of a line tail. Each response carries at most 64 KiB of raw bytes
+(base64 makes the JSON frame larger) plus `offset`, `next_offset` and `dropped`;
+loop from the previous `next_offset` to consume new output exactly once. A
+`since` older than the retained window is clamped to the oldest byte and flagged
+`dropped`; a `since` past the newest byte fails with `bad_request`. Offsets reset
+when the daemon restarts or the agent is re-created. A bare cursor read returns
+only the bytes already buffered, so a follower polls `--since`. `--wait 5s`
+turns that poll into a long-poll that returns as soon as new bytes arrive or
+after the window expires (empty chunk with `timed_out`); the daemon caps the
+window at 60s. `--since N --follow` keeps
+long-polling and prints chunks as they come (Ctrl-C to stop), which is the
+convenience wrapper around the wire primitive. The human command writes the
+bytes verbatim (no ANSI stripping), so escape sequences reach the terminal; use
+`--json` for the exact payload (one compact frame per line with `--follow`,
+including empty `timed_out` frames, which serve as keepalives).
+
+Options must come **before** the message text, because the text is a trailing
+argument (`sendmessage dev --no-wait "run the tests"`).
+
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
 | `agent-bridge daemon start\|stop\|restart\|status\|run` | manage the background daemon |
-| `agent-bridge listagents` | table of agents (name, status, pid, messages, last output) |
+| `agent-bridge listagents` | table of agents (name, status, readiness, pid, messages, queued, last output) |
 | `agent-bridge new <name> [-- <cmd...>]` | spawn an agent in a daemon-owned PTY |
-| `agent-bridge sendmessage <name> <text>` | type text into another agent's terminal |
-| `agent-bridge read <name> --lines N` | ANSI-stripped tail of its output |
+| `agent-bridge sendmessage <name> [--from L] [--paste auto\|bracketed\|plain] [--require-ack] [--wait-idle] [--wait-reply] [--queue-timeout 5s] [--write-timeout 5s] [--timeout 30s] [--no-wait] <text>` | type text into another agent's terminal; prints the message id, status, and any collected reply |
+| `agent-bridge ack <name> <id> [--note TEXT]` | record an explicit application-level acknowledgement for a message you received (alias `acknowledge`) |
+| `agent-bridge messagestatus <id>` | delivery status of one message (alias `msg-status`) |
+| `agent-bridge pending <name>` | messages for an agent that are still queued, writing, unknown or awaiting_ack |
+| `agent-bridge read <name> [--lines N] [--since OFFSET] [--wait 5s] [--follow]` | ANSI-stripped tail, or raw bytes from a byte cursor (`--lines` is ignored with `--since`); `--wait` long-polls once, `--follow` keeps polling |
 | `agent-bridge attach <name>` | live mirror + keyboard passthrough |
-| `agent-bridge kill <name>` | Ctrl-C first; `--force` kills the agent's process tree immediately (Windows: whole job; Unix: process group + best-effort tree snapshot, plus a PTY fd sweep on Linux) |
-| `agent-bridge log` | global message history |
+| `agent-bridge kill <name>` | Ctrl-C first; `--force` kills the agent's process tree immediately (Windows: whole job; Unix: process group + best-effort tree snapshot from `ps` or `/proc`, plus a PTY fd sweep on Linux) |
+| `agent-bridge log` | global message history (id, status, sender, body) |
 | `agent-bridge ping` / `version` | health, protocol details, daemon pid and teardown mechanism |
 
 Every command supports `--json` for scripting and for the Tauri UI.
@@ -83,8 +180,9 @@ Every command supports `--json` for scripting and for the Tauri UI.
 
 Newline-delimited JSON over a local socket:
 
-* Unix: `~/.agent-bridge/daemon.sock` (filesystem socket, dir `0700` / socket
-  `0600`)
+* Unix: `~/.agent-bridge/daemon.sock` (filesystem socket; dir `0700`
+  best-effort when the daemon was started via `daemon start`, socket `0600`
+  best-effort)
 * Windows: `\\.\pipe\agent-bridge-<user>` (named pipe with a DACL for
   the owner, `SYSTEM` and Administrators)
 

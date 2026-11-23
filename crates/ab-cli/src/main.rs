@@ -10,8 +10,11 @@ use std::time::{Duration, Instant};
 use agent_bridge_core::client;
 use agent_bridge_core::daemon::Daemon;
 use agent_bridge_core::paths;
-use agent_bridge_core::protocol::{Request, Response, DEFAULT_COLS, DEFAULT_ROWS};
-use agent_bridge_core::Result;
+use agent_bridge_core::protocol::{
+    DeliveryStatus, Offset, PasteMode, Request, Response, DEFAULT_COLS, DEFAULT_ROWS,
+};
+use agent_bridge_core::{BridgeError, Result};
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -49,7 +52,8 @@ enum Command {
     Sendmessage {
         /// Target agent name.
         target: String,
-        /// Message body. Pass `--` first if it starts with a dash.
+        /// Message body. Options must come before it; pass `--` first if the
+        /// body itself starts with a dash.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         message: Vec<String>,
         /// Sender label recorded in the message log.
@@ -58,6 +62,34 @@ enum Command {
         /// Do not press Enter after typing the message.
         #[arg(long)]
         no_enter: bool,
+        /// Maximum wait for a free queue slot (`0` = fail fast).
+        #[arg(long, default_value = "5s", value_parser = parse_timeout)]
+        queue_timeout: Duration,
+        /// Maximum wait for the PTY write (`0` = wait forever).
+        #[arg(long, default_value = "5s", value_parser = parse_timeout)]
+        write_timeout: Duration,
+        /// Return after the message is queued instead of waiting for the write.
+        #[arg(long)]
+        no_wait: bool,
+        /// How line breaks are delivered: `auto` (bracket-paste multi-line text
+        /// when the target supports it), `bracketed` (force the markers), or
+        /// `plain` (send raw bytes; the documented fallback).
+        #[arg(long, default_value = "auto", value_parser = parse_paste)]
+        paste: PasteMode,
+        /// Ask the receiving integration to acknowledge the message; the
+        /// status becomes `awaiting_ack` instead of `written`.
+        #[arg(long)]
+        require_ack: bool,
+        /// Wait until the target is not busy before sending. On timeout
+        /// nothing is written and the command fails.
+        #[arg(long)]
+        wait_idle: bool,
+        /// After the write, wait for output to settle and print the new lines.
+        #[arg(long, conflicts_with = "no_wait")]
+        wait_reply: bool,
+        /// Deadline for `--wait-idle` and `--wait-reply` (`0` = check once).
+        #[arg(long, default_value = "30s", value_parser = parse_timeout)]
+        timeout: Duration,
     },
     /// Spawn a new agent inside a daemon-owned PTY.
     New {
@@ -76,13 +108,27 @@ enum Command {
         #[arg(last = true)]
         command: Vec<String>,
     },
-    /// Print the tail of an agent's output.
+    /// Print the tail of an agent's output, or raw bytes from a byte offset.
     Read {
         /// Agent name.
         target: String,
         /// Number of trailing lines.
         #[arg(long, default_value_t = 40)]
         lines: usize,
+        /// Resume from an absolute byte offset instead of reading lines. The
+        /// daemon returns raw bytes; `--lines` is ignored.
+        #[arg(long, value_name = "OFFSET")]
+        since: Option<Offset>,
+        /// With `--since`, block up to this long for new bytes before returning
+        /// an empty chunk (the daemon caps it at 60s). Default: return at once.
+        #[arg(long, value_name = "WAIT", value_parser = parse_wait)]
+        wait: Option<Duration>,
+        /// Keep long-polling after `--since` and print chunks as they arrive
+        /// (Ctrl-C to stop). Uses `--wait` as the poll window (default 5s); the
+        /// window must be non-zero and is clamped to at least 25ms. `--lines`
+        /// is ignored.
+        #[arg(long)]
+        follow: bool,
     },
     /// Terminate an agent.
     Kill {
@@ -105,6 +151,32 @@ enum Command {
     },
     /// Show the global message history.
     Log {
+        /// Maximum entries.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Show the delivery status of one message.
+    #[command(visible_alias = "msg-status")]
+    Messagestatus {
+        /// Message id printed by `sendmessage` or `log`.
+        id: u64,
+    },
+    /// Acknowledge a message you received (explicit application-level ack).
+    #[command(visible_alias = "acknowledge")]
+    Ack {
+        /// Agent name that received the message.
+        target: String,
+        /// Message id from `sendmessage`, `pending` or `log`.
+        id: u64,
+        /// Optional note recorded with the acknowledgement.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// List messages that may still change: queued, writing, unknown or
+    /// `awaiting_ack`.
+    Pending {
+        /// Agent name.
+        target: String,
         /// Maximum entries.
         #[arg(long, default_value_t = 50)]
         limit: usize,
@@ -170,6 +242,14 @@ fn run(cli: Cli) -> Result<()> {
             message,
             from,
             no_enter,
+            queue_timeout,
+            write_timeout,
+            no_wait,
+            paste,
+            require_ack,
+            wait_idle,
+            wait_reply,
+            timeout,
         } => {
             ensure_daemon(true)?;
             let text = message.join(" ");
@@ -178,13 +258,58 @@ fn run(cli: Cli) -> Result<()> {
                 message: text,
                 enter: Some(!no_enter),
                 from,
+                queue_timeout_ms: Some(duration_millis(queue_timeout)),
+                write_timeout_ms: Some(duration_millis(write_timeout)),
+                wait: Some(!no_wait),
+                paste: Some(paste),
+                require_ack: Some(require_ack),
+                wait_idle: Some(wait_idle),
+                wait_reply: Some(wait_reply),
+                timeout_ms: Some(duration_millis(timeout)),
             })?;
-            match (&response, json) {
-                (Response::Sent { bytes, .. }, false) => {
-                    println!("sent {bytes} bytes to {target}");
-                    Ok(())
+            let failure = match &response {
+                Response::Sent {
+                    message_id,
+                    status: DeliveryStatus::Failed { detail, .. },
+                    ..
+                } => Some((*message_id, detail.clone())),
+                _ => None,
+            };
+            if json {
+                emit(response, json)?;
+            } else if let Response::Sent {
+                target,
+                bytes,
+                message_id,
+                status,
+                reply,
+            } = &response
+            {
+                if failure.is_none() {
+                    if status.is_written() {
+                        println!(
+                            "sent msg {message_id} to {target} ({}, {bytes} bytes)",
+                            fmt::status_line(status)
+                        );
+                    } else {
+                        // `queued`/`unknown` have no confirmed byte count.
+                        println!(
+                            "sent msg {message_id} to {target} ({})",
+                            fmt::status_line(status)
+                        );
+                    }
+                    if let Some(reply) = reply {
+                        fmt::print_reply(reply);
+                    }
                 }
-                _ => emit(response, json),
+            } else {
+                emit(response, json)?;
+            }
+            match failure {
+                Some((id, detail)) => {
+                    Err(agent_bridge_core::BridgeError::DeliveryFailed { id, detail })
+                }
+                None => Ok(()),
             }
         }
         Command::New {
@@ -215,26 +340,119 @@ fn run(cli: Cli) -> Result<()> {
                 _ => emit(response, json),
             }
         }
-        Command::Read { target, lines } => {
+        Command::Read {
+            target,
+            lines,
+            since,
+            wait,
+            follow,
+        } => {
+            validate_read_flags(since, wait, follow)?;
             ensure_daemon(true)?;
-            let response = client::request(&Request::Read {
-                target,
-                lines: Some(lines),
-            })?;
-            match (&response, json) {
-                (
-                    Response::Output {
-                        agent,
-                        lines,
-                        truncated,
-                        ..
-                    },
-                    false,
-                ) => {
-                    fmt::print_output(agent, lines, *truncated);
-                    Ok(())
+            let wait = wait.or_else(|| follow.then_some(Duration::from_secs(5)));
+            let wait = if follow {
+                wait.map(|window| window.max(MIN_FOLLOW_WAIT))
+            } else {
+                wait
+            };
+            if let (Some(since), false) = (since, follow) {
+                // One bounded request: the chunk is printed verbatim. The human
+                // path prints the resumable offset on expiry; `--json` prints
+                // the empty `timed_out` frame instead.
+                let response = client::request(&Request::Read {
+                    target: target.clone(),
+                    lines: None,
+                    since: Some(since),
+                    wait_ms: wait.map(duration_millis),
+                })?;
+                if let Response::Chunk {
+                    data,
+                    offset,
+                    next_offset,
+                    dropped,
+                    ..
+                } = &response
+                {
+                    if !json {
+                        let bytes = decode_chunk(data)?;
+                        fmt::print_chunk(&target, &bytes, *offset, *next_offset, *dropped, true)?;
+                        return Ok(());
+                    }
                 }
-                _ => emit(response, json),
+                return emit(response, json);
+            }
+            let Some(mut since) = since else {
+                let response = client::request(&Request::Read {
+                    target,
+                    lines: Some(lines),
+                    since: None,
+                    wait_ms: None,
+                })?;
+                return match (&response, json) {
+                    (
+                        Response::Output {
+                            agent,
+                            lines,
+                            truncated,
+                            ..
+                        },
+                        false,
+                    ) => {
+                        fmt::print_output(agent, lines, *truncated);
+                        Ok(())
+                    }
+                    _ => emit(response, json),
+                };
+            };
+            // Follow: repeat bounded long-polls, printing each chunk.
+            loop {
+                let response = client::request(&Request::Read {
+                    target: target.clone(),
+                    lines: None,
+                    since: Some(since),
+                    wait_ms: wait.map(duration_millis),
+                })?;
+                match &response {
+                    Response::Chunk {
+                        data,
+                        offset,
+                        next_offset,
+                        dropped,
+                        timed_out,
+                        ..
+                    } => {
+                        if json {
+                            // One compact frame per line keeps the stream parseable.
+                            // The payload is passed through verbatim.
+                            if !write_json_frame(&response)? {
+                                return Ok(());
+                            }
+                        } else if !timed_out {
+                            let bytes = decode_chunk(data)?;
+                            if !fmt::print_chunk(
+                                &target,
+                                &bytes,
+                                *offset,
+                                *next_offset,
+                                *dropped,
+                                false,
+                            )? {
+                                // The consumer closed stdout; stop instead of
+                                // polling a terminal nobody reads.
+                                return Ok(());
+                            }
+                        }
+                        since = *next_offset;
+                    }
+                    Response::Error { message, .. } => {
+                        return Err(BridgeError::Daemon(message.clone()));
+                    }
+                    other => {
+                        return Err(BridgeError::Usage(format!(
+                            "unexpected response to a follow read: {other:?}"
+                        )));
+                    }
+                }
             }
         }
         Command::Kill { name, force } => {
@@ -256,7 +474,43 @@ fn run(cli: Cli) -> Result<()> {
             let response = client::request(&Request::Log { limit: Some(limit) })?;
             match (&response, json) {
                 (Response::Messages { messages }, false) => {
-                    fmt::print_messages(messages);
+                    fmt::print_messages(messages, "no messages yet");
+                    Ok(())
+                }
+                _ => emit(response, json),
+            }
+        }
+        Command::Messagestatus { id } => {
+            ensure_daemon(true)?;
+            let response = client::request(&Request::MessageStatus { id })?;
+            match (&response, json) {
+                (Response::Message { message }, false) => {
+                    fmt::print_message(message);
+                    Ok(())
+                }
+                _ => emit(response, json),
+            }
+        }
+        Command::Ack { target, id, note } => {
+            ensure_daemon(true)?;
+            let response = client::request(&Request::Ack { target, id, note })?;
+            match (&response, json) {
+                (Response::Message { message }, false) => {
+                    fmt::print_message(message);
+                    Ok(())
+                }
+                _ => emit(response, json),
+            }
+        }
+        Command::Pending { target, limit } => {
+            ensure_daemon(true)?;
+            let response = client::request(&Request::Pending {
+                target,
+                limit: Some(limit),
+            })?;
+            match (&response, json) {
+                (Response::Messages { messages }, false) => {
+                    fmt::print_messages(messages, "no pending messages");
                     Ok(())
                 }
                 _ => emit(response, json),
@@ -306,8 +560,29 @@ fn emit(response: Response, json: bool) -> Result<()> {
             truncated,
             ..
         } => fmt::print_output(&agent, &lines, truncated),
-        Response::Sent { target, bytes } => println!("sent {bytes} bytes to {target}"),
-        Response::Messages { messages } => fmt::print_messages(&messages),
+        Response::Chunk {
+            agent,
+            data,
+            offset,
+            next_offset,
+            dropped,
+            ..
+        } => {
+            let bytes = decode_chunk(&data)?;
+            fmt::print_chunk(&agent, &bytes, offset, next_offset, dropped, true)?;
+        }
+        Response::Sent {
+            target,
+            bytes,
+            message_id,
+            status,
+            ..
+        } => println!(
+            "sent msg {message_id} to {target} ({}, {bytes} bytes)",
+            fmt::status_line(&status)
+        ),
+        Response::Message { message } => fmt::print_message(&message),
+        Response::Messages { messages } => fmt::print_messages(&messages, "no messages yet"),
         Response::Error { .. } => unreachable!("handled above"),
     }
     Ok(())
@@ -459,14 +734,389 @@ fn skew_restart_is_safe(live_agents: usize) -> bool {
     live_agents == 0
 }
 
+/// Parse a CLI timeout: `500` / `500ms`, `5s`, `2m`; `0` means "no wait".
+fn parse_paste(raw: &str) -> std::result::Result<PasteMode, String> {
+    match raw.trim() {
+        "auto" => Ok(PasteMode::Auto),
+        "bracketed" => Ok(PasteMode::Bracketed),
+        "plain" => Ok(PasteMode::Plain),
+        other => Err(format!(
+            "invalid paste mode '{other}' (use auto, bracketed or plain)"
+        )),
+    }
+}
+
+/// Smallest follow window. Below the daemon's 25 ms poll a shorter window only
+/// multiplies requests, so the CLI clamps it.
+const MIN_FOLLOW_WAIT: Duration = Duration::from_millis(25);
+
+/// Print one compact JSON frame. Returns `false` when stdout is closed.
+fn write_json_frame(response: &Response) -> Result<bool> {
+    let line = serde_json::to_string(response)?;
+    let mut stdout = std::io::stdout().lock();
+    match writeln!(stdout, "{line}").and_then(|()| stdout.flush()) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(err) => Err(BridgeError::Io(err)),
+    }
+}
+
+/// Reject read flags that cannot be honoured, before any daemon is started.
+fn validate_read_flags(since: Option<Offset>, wait: Option<Duration>, follow: bool) -> Result<()> {
+    if since.is_none() && (wait.is_some() || follow) {
+        return Err(BridgeError::Usage(
+            "--wait and --follow require --since OFFSET".to_string(),
+        ));
+    }
+    if follow && wait == Some(Duration::ZERO) {
+        return Err(BridgeError::Usage(
+            "--follow needs a non-zero --wait window".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Decode a base64 chunk payload, treating corruption as a protocol error.
+fn decode_chunk(data: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|err| BridgeError::Protocol(format!("invalid chunk payload: {err}")))
+}
+
+/// Parse a `--wait` window, naming the flag in the error.
+fn parse_wait(raw: &str) -> std::result::Result<Duration, String> {
+    parse_timeout(raw).map_err(|err| err.replace("timeout", "wait window"))
+}
+
+fn parse_timeout(raw: &str) -> std::result::Result<Duration, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("empty timeout (use e.g. 5s, 500ms, 0)".to_string());
+    }
+    let (number, multiplier) = if let Some(value) = raw.strip_suffix("ms") {
+        (value, 1_u64)
+    } else if let Some(value) = raw.strip_suffix('s') {
+        (value, 1000)
+    } else if let Some(value) = raw.strip_suffix('m') {
+        (value, 60_000)
+    } else {
+        (raw, 1)
+    };
+    let value: u64 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid timeout '{raw}' (use e.g. 5s, 500ms, 0)"))?;
+    Ok(Duration::from_millis(value.saturating_mul(multiplier))
+        .min(agent_bridge_core::delivery::MAX_TIMEOUT))
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::skew_restart_is_safe;
+    use std::time::Duration;
+
+    use super::{
+        decode_chunk, duration_millis, parse_paste, parse_timeout, skew_restart_is_safe,
+        validate_read_flags, Cli, Command,
+    };
+    use agent_bridge_core::error::BridgeError;
+    use agent_bridge_core::protocol::PasteMode;
+    use clap::Parser;
+
+    /// A corrupt chunk payload is reported as a protocol error, not a panic.
+    #[test]
+    fn decode_chunk_rejects_corrupt_base64() {
+        let err = decode_chunk("not base64!").expect_err("corrupt payload");
+        assert!(matches!(err, BridgeError::Protocol(_)));
+        assert_eq!(decode_chunk("aGk=").expect("valid payload"), b"hi");
+    }
 
     #[test]
     fn skew_restart_requires_idle_daemon() {
         assert!(skew_restart_is_safe(0));
         assert!(!skew_restart_is_safe(1));
         assert!(!skew_restart_is_safe(7));
+    }
+
+    #[test]
+    fn parses_message_status_and_alias() {
+        let cli = Cli::try_parse_from(["agent-bridge", "messagestatus", "42"]).expect("parse");
+        assert!(matches!(cli.command, Command::Messagestatus { id: 42 }));
+
+        let alias = Cli::try_parse_from(["agent-bridge", "msg-status", "7"]).expect("parse alias");
+        assert!(matches!(alias.command, Command::Messagestatus { id: 7 }));
+    }
+
+    #[test]
+    fn read_flags_need_since_and_a_follow_window() {
+        assert!(validate_read_flags(Some(0), None, false).is_ok());
+        assert!(validate_read_flags(Some(0), Some(Duration::from_secs(1)), false).is_ok());
+        assert!(validate_read_flags(None, Some(Duration::from_secs(1)), false).is_err());
+        assert!(validate_read_flags(None, None, true).is_err());
+        assert!(validate_read_flags(Some(0), Some(Duration::ZERO), true).is_err());
+        // A zero window is fine for a single poll.
+        assert!(validate_read_flags(Some(0), Some(Duration::ZERO), false).is_ok());
+    }
+
+    #[test]
+    fn parses_read_since_and_keeps_lines() {
+        let cli =
+            Cli::try_parse_from(["agent-bridge", "read", "dev", "--since", "42"]).expect("parse");
+        match cli.command {
+            Command::Read {
+                target,
+                lines,
+                since,
+                wait,
+                follow,
+            } => {
+                assert_eq!(target, "dev");
+                assert_eq!(lines, 40);
+                assert_eq!(since, Some(42));
+                assert_eq!(wait, None);
+                assert!(!follow);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let plain = Cli::try_parse_from(["agent-bridge", "read", "dev"]).expect("parse");
+        assert!(matches!(plain.command, Command::Read { since: None, .. }));
+
+        let follow = Cli::try_parse_from([
+            "agent-bridge",
+            "read",
+            "dev",
+            "--since",
+            "0",
+            "--wait",
+            "2s",
+            "--follow",
+        ])
+        .expect("parse follow");
+        assert!(matches!(
+            follow.command,
+            Command::Read {
+                since: Some(0),
+                wait: Some(wait),
+                follow: true,
+                ..
+            } if wait == Duration::from_secs(2)
+        ));
+    }
+
+    #[test]
+    fn parses_pending_with_limit() {
+        let cli =
+            Cli::try_parse_from(["agent-bridge", "pending", "dev", "--limit", "5"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Pending { target, limit: 5 } if target == "dev"
+        ));
+    }
+
+    #[test]
+    fn sendmessage_keeps_its_flags() {
+        let cli = Cli::try_parse_from([
+            "agent-bridge",
+            "sendmessage",
+            "dev",
+            "--from",
+            "qa",
+            "--no-enter",
+            "hello",
+            "world",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Sendmessage {
+                target,
+                message,
+                from,
+                no_enter,
+                queue_timeout,
+                write_timeout,
+                no_wait,
+                paste,
+                require_ack,
+                wait_idle,
+                wait_reply,
+                timeout,
+            } => {
+                assert_eq!(target, "dev");
+                assert_eq!(message, ["hello", "world"]);
+                assert_eq!(from.as_deref(), Some("qa"));
+                assert!(no_enter);
+                assert_eq!(queue_timeout, Duration::from_secs(5));
+                assert_eq!(write_timeout, Duration::from_secs(5));
+                assert!(!no_wait);
+                assert_eq!(paste, PasteMode::Auto);
+                assert!(!require_ack);
+                assert!(!wait_idle);
+                assert!(!wait_reply);
+                assert_eq!(timeout, Duration::from_secs(30));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sendmessage_parses_timeouts_and_no_wait() {
+        let cli = Cli::try_parse_from([
+            "agent-bridge",
+            "sendmessage",
+            "dev",
+            "--queue-timeout",
+            "0",
+            "--write-timeout",
+            "250ms",
+            "--no-wait",
+            "hi",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Sendmessage {
+                queue_timeout,
+                write_timeout,
+                no_wait,
+                paste,
+                ..
+            } => {
+                assert_eq!(queue_timeout, Duration::ZERO);
+                assert_eq!(write_timeout, Duration::from_millis(250));
+                assert!(no_wait);
+                assert_eq!(paste, PasteMode::Auto);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sendmessage_parses_wait_idle_and_reply() {
+        let cli = Cli::try_parse_from([
+            "agent-bridge",
+            "sendmessage",
+            "dev",
+            "--wait-idle",
+            "--wait-reply",
+            "--timeout",
+            "2s",
+            "hi",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Sendmessage {
+                wait_idle,
+                wait_reply,
+                timeout,
+                ..
+            } => {
+                assert!(wait_idle);
+                assert!(wait_reply);
+                assert_eq!(timeout, Duration::from_secs(2));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_reply_conflicts_with_no_wait() {
+        let parsed = Cli::try_parse_from([
+            "agent-bridge",
+            "sendmessage",
+            "dev",
+            "--wait-reply",
+            "--no-wait",
+            "hi",
+        ]);
+        assert!(parsed.is_err(), "wait-reply needs the write to finish");
+    }
+
+    #[test]
+    fn timeouts_reject_garbage_and_clamp() {
+        assert_eq!(parse_timeout("5s").expect("5s"), Duration::from_secs(5));
+        assert_eq!(parse_timeout("2m").expect("2m"), Duration::from_secs(120));
+        assert_eq!(
+            parse_timeout("500").expect("plain ms"),
+            Duration::from_millis(500)
+        );
+        assert!(parse_timeout("soon").is_err());
+        assert_eq!(
+            parse_timeout("999999m").expect("clamp"),
+            agent_bridge_core::delivery::MAX_TIMEOUT
+        );
+        assert_eq!(duration_millis(Duration::from_millis(250)), 250);
+    }
+
+    #[test]
+    fn sendmessage_parses_require_ack() {
+        let cli = Cli::try_parse_from([
+            "agent-bridge",
+            "sendmessage",
+            "dev",
+            "--require-ack",
+            "--no-wait",
+            "run the tests",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Sendmessage {
+                require_ack: true,
+                no_wait: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ack_command_parses_target_id_and_note() {
+        let cli =
+            Cli::try_parse_from(["agent-bridge", "ack", "dev", "7", "--note", "ran the tests"])
+                .expect("parse");
+        match cli.command {
+            Command::Ack { target, id, note } => {
+                assert_eq!(target, "dev");
+                assert_eq!(id, 7);
+                assert_eq!(note.as_deref(), Some("ran the tests"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let alias =
+            Cli::try_parse_from(["agent-bridge", "acknowledge", "qa", "3"]).expect("alias parse");
+        assert!(matches!(
+            alias.command,
+            Command::Ack { target, id: 3, note: None } if target == "qa"
+        ));
+    }
+
+    #[test]
+    fn paste_mode_parses_and_rejects_unknown_values() {
+        assert_eq!(parse_paste("auto").expect("auto"), PasteMode::Auto);
+        assert_eq!(
+            parse_paste("bracketed").expect("bracketed"),
+            PasteMode::Bracketed
+        );
+        assert_eq!(parse_paste(" plain ").expect("plain"), PasteMode::Plain);
+        assert!(parse_paste("paste").is_err());
+
+        let cli = Cli::try_parse_from([
+            "agent-bridge",
+            "sendmessage",
+            "dev",
+            "--paste",
+            "plain",
+            "hi",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Sendmessage {
+                paste: PasteMode::Plain,
+                ..
+            }
+        ));
     }
 }

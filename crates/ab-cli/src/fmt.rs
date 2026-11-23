@@ -1,8 +1,12 @@
 //! Terminal formatting helpers (human readable output).
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 
-use agent_bridge_core::protocol::{AgentInfo, AgentStatus, Message};
+use agent_bridge_core::protocol::{
+    AgentInfo, AgentStatus, DeliveryStatus, Message, Offset, Readiness, Reply,
+};
+use agent_bridge_core::{BridgeError, Result};
 
 /// Format a timestamp as a coarse age ("4s ago").
 #[must_use]
@@ -24,11 +28,13 @@ pub fn print_agents(agents: &[AgentInfo]) {
         println!("no agents. create one with: agent-bridge new <name>");
         return;
     }
-    let mut rows: Vec<[String; 6]> = vec![[
+    let mut rows: Vec<[String; 8]> = vec![[
         "NAME".to_string(),
         "STATUS".to_string(),
+        "READY".to_string(),
         "PID".to_string(),
         "MSGS".to_string(),
+        "QUEUED".to_string(),
         "LAST OUTPUT".to_string(),
         "COMMAND".to_string(),
     ]];
@@ -39,10 +45,12 @@ pub fn print_agents(agents: &[AgentInfo]) {
                 AgentStatus::Running => "running".to_string(),
                 AgentStatus::Exited => "exited".to_string(),
             },
+            readiness_label(agent.readiness).to_string(),
             agent
                 .pid
                 .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
             agent.message_count.to_string(),
+            agent.queued.to_string(),
             agent
                 .last_output_at
                 .map_or_else(|| "-".to_string(), human_age),
@@ -63,6 +71,7 @@ pub fn print_agent(agent: &AgentInfo) {
             AgentStatus::Exited => "exited",
         }
     );
+    println!("readiness  : {}", readiness_label(agent.readiness));
     println!(
         "pid        : {}",
         agent
@@ -77,6 +86,15 @@ pub fn print_agent(agent: &AgentInfo) {
         println!("exit code  : {code}");
     }
     println!("messages   : {}", agent.message_count);
+    println!("queued     : {}", agent.queued);
+    println!(
+        "paste      : {}",
+        if agent.bracketed_paste {
+            "bracketed"
+        } else {
+            "plain"
+        }
+    );
     println!("subscribers: {}", agent.subscribers);
 }
 
@@ -90,25 +108,121 @@ pub fn print_output(agent: &str, lines: &[String], truncated: bool) {
     }
 }
 
+/// Write one raw cursor chunk and the offset to resume from.
+///
+/// The bytes are written verbatim (no ANSI stripping, no newline), so chunk
+/// boundaries cannot corrupt escape sequences or multi-byte characters and
+/// successive reads concatenate exactly. Escape sequences therefore reach the
+/// terminal; use `--json` when the exact bytes matter. The resumable offset
+/// (and any skipped gap) go to stderr, keeping stdout pipe-friendly; with
+/// `report_offset` false (`--follow`, where every chunk would repeat the noise)
+/// the offset line is suppressed.
+///
+/// A closed pipe (`agent-bridge read --since 0 | head`) is not an error, but
+/// any other write failure is reported instead of silently truncating output.
+/// Returns `false` when stdout is closed, so a follow loop can stop instead of
+/// polling a terminal nobody reads.
+pub fn print_chunk(
+    agent: &str,
+    data: &[u8],
+    offset: Offset,
+    next_offset: Offset,
+    dropped: bool,
+    report_offset: bool,
+) -> Result<bool> {
+    if dropped {
+        eprintln!("--- {agent} (gap: oldest retained byte is offset {offset}) ---");
+    }
+    let mut stdout = std::io::stdout().lock();
+    if let Err(err) = stdout.write_all(data).and_then(|()| stdout.flush()) {
+        if err.kind() == std::io::ErrorKind::BrokenPipe {
+            return Ok(false);
+        }
+        return Err(BridgeError::Io(err));
+    }
+    if report_offset {
+        eprintln!("next offset: {next_offset}");
+    }
+    Ok(true)
+}
+
+/// Print one message record and its delivery status.
+pub fn print_message(message: &Message) {
+    let from = message.from.as_deref().unwrap_or("owner");
+    println!("id       : {}", message.id);
+    println!("target   : {}", message.target);
+    println!("from     : {from}");
+    println!("status   : {}", status_line(&message.status));
+    println!("bytes    : {}", message.bytes);
+    println!("queued   : {}", human_age(message.at));
+    println!("updated  : {}", human_age(message.updated_at));
+    if let Some(ack) = &message.ack {
+        println!("acked    : {}", human_age(ack.at));
+        if let Some(note) = &ack.note {
+            println!("ack note : {note}");
+        }
+    }
+    println!("text     : {}", message.text);
+}
+
+/// `label (detail)` for a delivery status.
+#[must_use]
+pub fn status_line(status: &DeliveryStatus) -> String {
+    match status {
+        DeliveryStatus::Failed { code, detail } => {
+            format!("failed ({}): {detail}", code.label())
+        }
+        other => other.label().to_string(),
+    }
+}
+
+/// Print the output collected by `sendmessage --wait-reply`.
+pub fn print_reply(reply: &Reply) {
+    let state = if reply.timed_out {
+        "timed out"
+    } else if reply.settled {
+        "settled"
+    } else {
+        "unsettled"
+    };
+    let truncated = if reply.truncated { ", truncated" } else { "" };
+    println!("reply ({state}, {} lines{truncated}):", reply.lines.len());
+    for line in &reply.lines {
+        println!("{line}");
+    }
+}
+
+/// Short label for the heuristic readiness state.
+#[must_use]
+pub fn readiness_label(readiness: Readiness) -> &'static str {
+    match readiness {
+        Readiness::Busy => "busy",
+        Readiness::Idle => "idle",
+        Readiness::Unknown => "unknown",
+    }
+}
+
 /// Print the global message log.
-pub fn print_messages(messages: &[Message]) {
+pub fn print_messages(messages: &[Message], empty: &str) {
     if messages.is_empty() {
-        println!("no messages yet");
+        println!("{empty}");
         return;
     }
     for message in messages {
         let from = message.from.as_deref().unwrap_or("owner");
+        let status = match &message.status {
+            DeliveryStatus::Failed { code, .. } => format!("failed ({})", code.label()),
+            other => other.label().to_string(),
+        };
         println!(
-            "{}  {from} -> {}: {}",
-            human_age(message.at),
-            message.target,
-            message.text
+            "#{} {:<8} {from} -> {}: {}",
+            message.id, status, message.target, message.text
         );
     }
 }
 
-fn print_table(rows: &[[String; 6]]) {
-    let mut widths = [0_usize; 6];
+fn print_table<const N: usize>(rows: &[[String; N]]) {
+    let mut widths = [0_usize; N];
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
             widths[index] = widths[index].max(cell.chars().count());

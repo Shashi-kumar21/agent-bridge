@@ -131,4 +131,29 @@ mod tests {
         let sddl = widestring::U16CString::from_str(super::PIPE_SDDL).expect("sddl");
         SecurityDescriptor::deserialize(&sddl).expect("the pipe DACL must be a valid descriptor");
     }
+
+    /// The constant is the security policy, so widening it must fail a test.
+    ///
+    /// `D:P` marks the DACL protected, which disables inheritance from a
+    /// permissive parent; the only ACEs grant full access to the owner,
+    /// `SYSTEM` and Administrators. Everyone, Authenticated Users, Builtin
+    /// Users and Anonymous must never appear.
+    #[test]
+    fn pipe_sddl_grants_only_owner_system_and_administrators() {
+        let sddl = super::PIPE_SDDL;
+        assert_eq!(sddl, "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)");
+        assert!(
+            sddl.starts_with("D:P"),
+            "the DACL must be protected, not inherited from a broader parent"
+        );
+        for granted in ["GA;;;OW", "GA;;;SY", "GA;;;BA"] {
+            assert!(sddl.contains(granted), "{granted} must be granted");
+        }
+        for broader in [";;;WD", ";;;AU", ";;;BU", ";;;AN", ";;;BG"] {
+            assert!(
+                !sddl.contains(broader),
+                "{broader} must not be granted full access to the pipe"
+            );
+        }
+    }
 }
