@@ -270,7 +270,8 @@ there (bracketed paste is a Unix-PTY feature in practice).
 * There is no authentication or authorization beyond the endpoint's access
   control: any process that can open the socket/pipe can send, read, kill and
   shut down. Caller identity is not derived from the OS; `from` is a label
-  (see `roadmap.md` §4 for the planned policy layer).
+  (see [`policy.md`](policy.md) for the planned per-session policy layer and
+  `roadmap.md` §4 for its place in the plan).
 
 ## 8. CLI daemon management
 
@@ -300,6 +301,7 @@ there (bracketed paste is a Unix-PTY feature in practice).
 
 * [`tutorial.md`](tutorial.md) - user-facing walkthrough.
 * [`../SECURITY.md`](../SECURITY.md) - mechanism, threat notes, known gaps.
+* [`policy.md`](policy.md) - authorization design (tokens, schema, precedence).
 * [`roadmap.md`](roadmap.md) - phased plan.
 * [`known-limitations.md`](known-limitations.md) - confirmed limitations with
   reproductions.
